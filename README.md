@@ -10,7 +10,7 @@ A desktop traffic and transit simulation of two connected signalized intersectio
 - Signal sequencing with green, yellow, and all-red clearance intervals.
 - Transit Signal Priority (TSP) and Dynamic Bus Lane (DBL) requests through a node-specific safety arbiter.
 - Automatic or operator-selected network discharge for gridlock recovery.
-- Live telemetry summaries, session-only trend charts, and phase-cycle visualization.
+- Resizable, two-axis scrollable telemetry with session-only trends and phase-cycle visualization.
 - Regression tests for routes, callbacks, collision prevention, priority, telemetry, and discharge behavior.
 
 The LLM selector and **RUN LLM** control are intentional UI placeholders; they do not call an external model or alter signal policy.
@@ -48,7 +48,7 @@ The control panel can:
 - pause, resume, and reset the simulation; and
 - start automatic or manually selected gridlock discharge.
 
-The telemetry dashboard reads the latest atomic JSON snapshot and maintains bounded time-series history only in memory. Closing the dashboard clears that history. `traffic_state_telemetry.json` and the `runtime/` directory are generated locally and intentionally excluded from Git.
+The telemetry dashboard reads the latest atomic JSON snapshot and maintains bounded time-series history only in memory. It can be resized from any edge; use the mouse wheel for vertical scrolling and Shift+wheel for horizontal scrolling on either tab. Closing the dashboard clears its history. `traffic_state_telemetry.json` and the `runtime/` directory are generated locally and intentionally excluded from Git.
 
 ## Tests
 

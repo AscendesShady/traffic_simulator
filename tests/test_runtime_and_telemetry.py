@@ -152,6 +152,48 @@ def test_dashboard_history_is_bounded_in_memory():
     assert len(dashboard.queue_history) == 20
 
 
+def test_dashboard_initial_window_fits_smaller_screens_and_remains_useful():
+    assert TelemetryDashboard.initial_window_size(1920, 1080) == (900, 780)
+    assert TelemetryDashboard.initial_window_size(1366, 768) == (900, 628)
+    assert TelemetryDashboard.initial_window_size(640, 480) == (560, 360)
+
+
+def test_dashboard_mousewheel_scrolls_selected_tab_on_both_axes():
+    class FakeNotebook:
+        @staticmethod
+        def select():
+            return ".summary"
+
+    class FakeCanvas:
+        def __init__(self):
+            self.vertical_calls = []
+            self.horizontal_calls = []
+
+        def yview_scroll(self, units, mode):
+            self.vertical_calls.append((units, mode))
+
+        def xview_scroll(self, units, mode):
+            self.horizontal_calls.append((units, mode))
+
+    class WheelEvent:
+        def __init__(self, delta, state=0, num=None):
+            self.delta = delta
+            self.state = state
+            self.num = num
+
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.notebook = FakeNotebook()
+    canvas = FakeCanvas()
+    dashboard.scroll_canvases = {".summary": canvas}
+
+    assert dashboard.on_mousewheel(WheelEvent(-120)) == "break"
+    assert canvas.vertical_calls == [(1, "units")]
+    assert dashboard.on_mousewheel(WheelEvent(120, state=0x0001)) == "break"
+    assert canvas.horizontal_calls == [(-1, "units")]
+    assert TelemetryDashboard.mousewheel_units(WheelEvent(0, num=4)) == -1
+    assert TelemetryDashboard.mousewheel_units(WheelEvent(0, num=5)) == 1
+
+
 def test_dashboard_line_chart_renders_sampled_series_without_gui():
     class FakeCanvas:
         def __init__(self):

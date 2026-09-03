@@ -25,20 +25,45 @@ TELEMETRY_FILE = BASE_DIR / "traffic_state_telemetry.json"
 STALE_AFTER_SECONDS = 2.0
 HISTORY_SAMPLE_SECONDS = 1.0
 HISTORY_MAX_POINTS = 600
+WINDOW_DEFAULT_WIDTH = 900
+WINDOW_DEFAULT_HEIGHT = 780
+WINDOW_MIN_WIDTH = 480
+WINDOW_MIN_HEIGHT = 360
+WINDOW_SCREEN_MARGIN_X = 80
+WINDOW_SCREEN_MARGIN_Y = 140
+DASHBOARD_CONTENT_MIN_WIDTH = 720
 
 
 class TelemetryDashboard:
     def __init__(self, root):
         self.root = root
         self.root.title("Live Network Telemetry")
-        self.root.geometry("900x780")
-        self.root.minsize(760, 600)
+        window_width, window_height = self.initial_window_size(
+            self.root.winfo_screenwidth(),
+            self.root.winfo_screenheight(),
+        )
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        self.root.resizable(True, True)
         self.root.configure(bg=COLOR_BG)
         self.initialize_history_state()
         self.latest_telemetry = None
         self.last_read_error = None
         self.build_ui()
         self.poll_telemetry()
+
+    @staticmethod
+    def initial_window_size(screen_width, screen_height):
+        """Fit the initial dashboard inside the screen while allowing resizing."""
+        width = min(
+            WINDOW_DEFAULT_WIDTH,
+            max(WINDOW_MIN_WIDTH, int(screen_width) - WINDOW_SCREEN_MARGIN_X),
+        )
+        height = min(
+            WINDOW_DEFAULT_HEIGHT,
+            max(WINDOW_MIN_HEIGHT, int(screen_height) - WINDOW_SCREEN_MARGIN_Y),
+        )
+        return width, height
 
     def initialize_history_state(self):
         """Create bounded, process-local history containers.
@@ -93,12 +118,26 @@ class TelemetryDashboard:
             style="Telemetry.TNotebook",
         )
         self.notebook.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-        self.summary_tab = tk.Frame(self.notebook, bg=COLOR_BG)
-        self.trends_tab = tk.Frame(self.notebook, bg=COLOR_BG)
+        self.scroll_canvases = {}
+        (
+            self.summary_tab,
+            self.summary_content,
+            self.summary_scroll_canvas,
+        ) = self.create_scrollable_tab()
+        (
+            self.trends_tab,
+            self.trends_content,
+            self.trends_scroll_canvas,
+        ) = self.create_scrollable_tab()
         self.notebook.add(self.summary_tab, text="SUMMARY")
         self.notebook.add(self.trends_tab, text="SESSION TRENDS")
+        self.scroll_canvases[str(self.summary_tab)] = self.summary_scroll_canvas
+        self.scroll_canvases[str(self.trends_tab)] = self.trends_scroll_canvas
+        self.root.bind("<MouseWheel>", self.on_mousewheel, add="+")
+        self.root.bind("<Button-4>", self.on_mousewheel, add="+")
+        self.root.bind("<Button-5>", self.on_mousewheel, add="+")
 
-        self.metrics_frame = tk.Frame(self.summary_tab, bg=COLOR_BG)
+        self.metrics_frame = tk.Frame(self.summary_content, bg=COLOR_BG)
         self.metrics_frame.pack(fill="x", padx=20, pady=5)
         self.vars = {}
         metrics_layout = [
@@ -135,7 +174,7 @@ class TelemetryDashboard:
                 self.vars[key] = value
 
         recovery_card = tk.Frame(
-            self.summary_tab,
+            self.summary_content,
             bg=COLOR_CARD,
             highlightbackground=COLOR_DANGER,
             highlightthickness=1,
@@ -190,13 +229,13 @@ class TelemetryDashboard:
         self.build_phase_cycle_ui()
 
         tk.Label(
-            self.summary_tab,
+            self.summary_content,
             text="INTERSECTION PHASE STATES",
             font=(FONT_FAMILY, 11, "bold"),
             bg=COLOR_BG,
             fg=COLOR_TEXT_PRIMARY,
         ).pack(anchor="w", padx=20, pady=(15, 5))
-        diagram_frame = tk.Frame(self.summary_tab, bg=COLOR_BG)
+        diagram_frame = tk.Frame(self.summary_content, bg=COLOR_BG)
         diagram_frame.pack(fill="both", expand=True, padx=20, pady=5)
         self.node_a_canvas = self.create_node_canvas(diagram_frame, "NODE A (x=300)")
         self.node_a_canvas.pack(side="left", fill="both", expand=True, padx=(0, 5))
@@ -204,9 +243,84 @@ class TelemetryDashboard:
         self.node_b_canvas.pack(side="left", fill="both", expand=True, padx=(5, 0))
         self.build_trends_ui()
 
+    def create_scrollable_tab(self):
+        """Return a notebook tab with two-axis scrolling and a content frame."""
+        tab = tk.Frame(self.notebook, bg=COLOR_BG)
+        tab.grid_rowconfigure(0, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        viewport = tk.Canvas(
+            tab,
+            bg=COLOR_BG,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        vertical = ttk.Scrollbar(tab, orient="vertical", command=viewport.yview)
+        horizontal = ttk.Scrollbar(tab, orient="horizontal", command=viewport.xview)
+        viewport.configure(
+            yscrollcommand=vertical.set,
+            xscrollcommand=horizontal.set,
+        )
+        viewport.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+
+        content = tk.Frame(viewport, bg=COLOR_BG)
+        window_id = viewport.create_window((0, 0), window=content, anchor="nw")
+        content.bind(
+            "<Configure>",
+            lambda _event, canvas=viewport: self.update_scroll_region(canvas),
+        )
+        viewport.bind(
+            "<Configure>",
+            lambda event, canvas=viewport, item=window_id: self.resize_scroll_content(
+                canvas, item, event.width
+            ),
+        )
+        return tab, content, viewport
+
+    @staticmethod
+    def update_scroll_region(canvas):
+        """Keep both scrollbars synchronized with the complete content area."""
+        bounds = canvas.bbox("all")
+        if bounds:
+            canvas.configure(scrollregion=bounds)
+
+    def resize_scroll_content(self, canvas, window_id, viewport_width):
+        """Fill wide viewports, retaining a scrollable minimum on narrow ones."""
+        content_width = max(DASHBOARD_CONTENT_MIN_WIDTH, int(viewport_width))
+        canvas.itemconfigure(window_id, width=content_width)
+        self.update_scroll_region(canvas)
+
+    @staticmethod
+    def mousewheel_units(event):
+        """Normalize Windows/macOS wheel deltas and Linux wheel buttons."""
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta:
+            steps = max(1, abs(delta) // 120)
+            return -steps if delta > 0 else steps
+        button = getattr(event, "num", None)
+        if button == 4:
+            return -1
+        if button == 5:
+            return 1
+        return 0
+
+    def on_mousewheel(self, event):
+        """Scroll the selected tab; Shift+wheel scrolls horizontally."""
+        canvas = self.scroll_canvases.get(self.notebook.select())
+        units = self.mousewheel_units(event)
+        if canvas is None or units == 0:
+            return None
+        if int(getattr(event, "state", 0) or 0) & 0x0001:
+            canvas.xview_scroll(units, "units")
+        else:
+            canvas.yview_scroll(units, "units")
+        return "break"
+
     def build_phase_cycle_ui(self):
         card = tk.Frame(
-            self.summary_tab,
+            self.summary_content,
             bg=COLOR_CARD,
             highlightbackground=COLOR_CARD_BORDER,
             highlightthickness=1,
@@ -251,7 +365,7 @@ class TelemetryDashboard:
         )
 
     def build_trends_ui(self):
-        controls = tk.Frame(self.trends_tab, bg=COLOR_BG)
+        controls = tk.Frame(self.trends_content, bg=COLOR_BG)
         controls.pack(fill="x", padx=20, pady=(12, 6))
         tk.Label(
             controls,
@@ -277,7 +391,7 @@ class TelemetryDashboard:
             pady=4,
         ).pack(side="right")
 
-        charts = tk.Frame(self.trends_tab, bg=COLOR_BG)
+        charts = tk.Frame(self.trends_content, bg=COLOR_BG)
         charts.pack(fill="both", expand=True, padx=20, pady=(0, 12))
         self.trend_charts = []
         self.create_trend_chart(

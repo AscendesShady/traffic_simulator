@@ -15,6 +15,10 @@ A desktop traffic and transit simulation of two connected signalized intersectio
 
 The LLM selector and **RUN LLM** control are intentional UI placeholders; they do not call an external model or alter signal policy.
 
+## Signal-controller architecture
+
+The application creates one `SignalController`, which owns two distinct per-node state objects. Node A and Node B independently maintain their phase, timer, clearance, reservations, and TSP/DBL requests; they may start aligned but can diverge under node-local traffic or priority. The legacy `controller.phase` and `controller.timer` assignment properties broadcast setup values to both nodes, but normal production updates operate per node. Historical specifications that describe the shared-clock versus independent-clock choice as unresolved are superseded by the current implementation.
+
 ## Requirements
 
 - Python 3 with Tkinter support

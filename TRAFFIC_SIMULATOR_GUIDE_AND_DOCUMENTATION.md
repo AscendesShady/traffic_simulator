@@ -11,6 +11,12 @@ Companion documents:
 
 This guide is a source-synchronized description of the traffic simulator. `main.py` is the executable entry point; the remaining files are imported modules except `telemetry_dashboard.py`, which `main.py` launches as a child process.
 
+### Canonical signal-controller architecture
+
+The architecture decision is closed: the current simulator uses independent per-node state (the former Option B). There is one `SignalController` network-coordinator object, but `controller.nodes[300]` and `controller.nodes[700]` are distinct `NodeState` objects with independent phase, timer, request queue, active priority request, clearance, reservation, and terminal-history state. Both nodes start aligned by default, but node-local occupancy or priority may make their clocks and signals diverge. `get_all_signals()` computes a separate signal map for each node.
+
+The compatibility properties `controller.phase` and `controller.timer` do not represent shared runtime storage. Their getters expose Node A, while their setters broadcast a setup value into both distinct node objects for legacy callers and tests. Current production updates iterate and update the nodes independently. Any `tsp_dbl_hardcoding_spec.md` copy that presents shared versus independent clocks as an unresolved choice is a superseded pre-F-13 planning artifact and is not authoritative for this checkout.
+
 The network has Node A at x=300, Node B at x=700, horizontal center y=300, three 22-pixel lanes per direction, 132-pixel roads, and a 10-pixel stop offset. `canvas_gemini.py` is the authoritative geometry/rendering boundary.
 
 Communication flow:
@@ -2101,8 +2107,10 @@ class SignalController:
         }
         self._publish_discharge_status()
 
-    # Backward-compatible Node A accessors. Production callers should use
-    # get_node_status() because Node A and Node B are intentionally independent.
+    # Backward-compatible Node A getters plus broadcast setup setters.
+    # Assigning phase/timer writes the same initial value into both distinct
+    # NodeState objects; it does not create shared storage. Production callers
+    # should use get_node_status() because runtime updates are per-node.
     @property
     def phase(self):
         return self.nodes[INT_X[0]].phase

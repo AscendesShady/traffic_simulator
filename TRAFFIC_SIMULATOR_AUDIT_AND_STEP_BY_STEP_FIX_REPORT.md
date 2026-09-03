@@ -1,5 +1,39 @@
 # Traffic Simulator Audit and Step-by-Step Fix Report
 
+> [!IMPORTANT]
+> **Canonical current-state verdict (2026-09-03): the design decision is
+> closed.** The simulator uses one `SignalController` object as the network
+> coordinator, but that object owns a distinct `NodeState` for Node A and a
+> distinct `NodeState` for Node B. Phase, timer, priority request/queue,
+> clearance, reservation, and terminal history are maintained per node.
+> `get_all_signals()` derives each node's signals from that node's state. The
+> nodes start with aligned default values, but local clearance or priority can
+> make them diverge.
+>
+> The old Option A/Option B question is therefore **not open**: the current
+> implementation uses Option B, independent per-node state. Any copy of
+> `tsp_dbl_hardcoding_spec.md` describing one shared phase/clock is a
+> **superseded pre-F-13 planning artifact** and is not authoritative for this
+> checkout. That file is not part of the current repository.
+>
+> Compatibility caveat: reading `controller.phase` or `controller.timer`
+> returns Node A's value, while assigning either property deliberately writes
+> the supplied setup value to both node objects. Those legacy broadcast
+> setters do not create shared storage; current production updates operate on
+> each `NodeState` independently. Current source and passing tests take
+> precedence over all historical planning prose.
+
+### Documentation authority and reading order
+
+When two statements appear to conflict, use this order:
+
+1. Current production source plus passing regression tests.
+2. `TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md`, which is regenerated from
+   current production source.
+3. Part II and the implementation-completion record in Part I of this report.
+4. Historical baseline evidence and implementation instructions in Part I.
+5. Superseded planning artifacts such as `tsp_dbl_hardcoding_spec.md`.
+
 This consolidated document combines the original defect audit and ordered
 remediation plan with the later post-fix verification audit. Read it in this
 order:
@@ -23,7 +57,13 @@ may be listed as fixed in a later completion or post-fix section. The newest
 verified disposition takes precedence, while the earlier evidence remains as a
 regression target.
 
-## Part I — Baseline Audit and Ordered Remediation
+## Part I — HISTORICAL Baseline Audit and Ordered Remediation
+
+> [!CAUTION]
+> Sections 1–7 below describe the pre-fix checkout. Present-tense words such
+> as "currently," "still," and "current production interfaces" in those
+> preserved findings refer only to that historical snapshot. They are not
+> claims about the current code. Section 8 records the completed implementation.
 
 ## 1. Objective and non-negotiable scope
 
@@ -112,7 +152,10 @@ main.py --------------------------------------------------+
 - Dashboard and telemetry paths depend on the caller's working directory.
 - Dashboard metric constants disagree with the vehicle model.
 
-## 3. Verified defects and required outcomes
+## 3. HISTORICAL verified defects and required outcomes
+
+The defects in this section were verified against the pre-fix baseline. See
+Section 8 and Part II for their later/current dispositions.
 
 | ID | Severity | Verified defect | Required outcome |
 |---|---|---|---|
@@ -128,7 +171,7 @@ main.py --------------------------------------------------+
 | F-10 | Medium | A car in another lane blocks bus dispatch | Bus entry clearance must be lane-aware |
 | F-11 | Medium | Simulation time depends on Tk callback count, not elapsed time | Physics accumulator must use monotonic elapsed time with bounded catch-up |
 | F-12 | Medium | Bus model uses 45 passengers; dashboard uses 40 | Passenger data must have one authoritative source |
-| F-13 | Medium | One bus at Node A extends green at Node B | TSP state and requests must be node-specific |
+| F-13 | Medium | HISTORICAL PRE-FIX: one bus at Node A extended green at Node B | TSP state and requests had to become node-specific; completed in Section 8 |
 | F-14 | Low | `approaching_buses` includes departed buses with negative distance | Separate active buses from genuinely approaching buses |
 | F-15 | Low | Headway OFF freezes rather than resets accumulated time | Choose, implement, and document explicit OFF semantics |
 | F-16 | Low | Teaching guide contains outdated embedded source and omits the dashboard | Regenerate documentation only after production fixes pass |
@@ -185,9 +228,9 @@ DBL eligible=true
 lane-2 car stopped=true
 ```
 
-#### F-17: DBL/TSP can preserve or extend the conflicting phase
+#### F-17: DBL/TSP could preserve or extend the conflicting phase — HISTORICAL
 
-Fresh 2026-08-25 probes against the current production interfaces produced:
+Fresh probes against the 2026-08-25 pre-fix production interfaces produced:
 
 ```text
 TSP request: route=R2_EB_B_NB, target node=300, approach=EB
@@ -207,7 +250,7 @@ R2 straight leg at Node A: lane=1, DBL eligible=false
 This confirms three separate defects:
 
 1. TSP is direction-blind. An EB request can lengthen a conflicting NS green.
-2. TSP is global. A request for Node A changes the shared timer used by Node B.
+2. In that pre-fix checkout, TSP was global. A request for Node A changed the shared timer used by Node B. This is fixed in Section 8.
 3. DBL is only a lane-state predicate/lamp. It has no signal request or interlock, and its hardcoded `lane_index == 2` rejects valid straight route legs.
 
 #### F-18: the current test result is not a passing safety gate
@@ -219,7 +262,7 @@ pytest -q result: xxX
 
 The F-01 mock replaces `is_bus_dbl_eligible` with a two-argument lambda while production can call it with three arguments. The F-02 test supplies RGB tuples even though production now consumes semantic strings. F-05 unexpectedly passes only because DBL was hardcoded to lane 2; that does not validate the required per-route-leg behavior. There are no tests for the six route priority transitions, node isolation, yellow/all-red clearance, rear-clear release, or simultaneous requests.
 
-### 2026-08-25 pre-implementation re-audit status
+### 2026-08-25 pre-implementation re-audit status — HISTORICAL/SUPERSEDED
 
 | Finding | Current status | Fresh evidence or source result |
 |---|---|---|
@@ -235,7 +278,7 @@ The F-01 mock replaces `is_bus_dbl_eligible` with a two-argument lambda while pr
 | F-10 | Open | General spawning is lane-aware, but bus entry clearance checks direction and longitudinal distance only |
 | F-11 | Open | The accumulator still adds a constant `1/60 * sim_speed` per Tk callback rather than monotonic elapsed time |
 | F-12 | Open | `Bus.passengers=45`; dashboard estimates each bus as 40 passengers |
-| F-13 | Open and prerequisite for F-17 | The controller still owns one global phase, timer, and TSP extension for both nodes |
+| F-13 | HISTORICAL: open and prerequisite for F-17 | The pre-fix controller owned one global phase, timer, and TSP extension for both nodes; fixed in Section 8 |
 | F-14 | Open | Exporter still places every active bus in `approaching_buses`, including negative stop-bar distances |
 | F-15 | Open | A zero headway neither increments nor explicitly resets its retained counter |
 | F-16 | Open | The guide omits `telemetry_dashboard.py` and embeds older controller source |
@@ -506,7 +549,7 @@ Acceptance tests:
 - When a safe gap opens, the bus merges, turns, and completes its route.
 - The merge does not overlap a vehicle in either the source or target lane.
 
-### Step 7 — Make signals and TSP node-specific
+### Step 7 — Make signals and TSP node-specific — HISTORICAL/COMPLETED
 
 Files:
 
@@ -978,7 +1021,7 @@ The final response must contain:
 
 Do not report the project as complete if any critical or high-severity acceptance test is failing.
 
-## 8. Implementation completion record — 2026-08-25
+## 8. Implementation completion record — 2026-08-25 — CURRENT F-01–F-18 DISPOSITION
 
 The plan above has now been applied to the production modules while preserving the existing GUI and intentional LLM placeholders.
 

@@ -168,8 +168,10 @@ class SignalController:
         }
         self._publish_discharge_status()
 
-    # Backward-compatible Node A accessors. Production callers should use
-    # get_node_status() because Node A and Node B are intentionally independent.
+    # Backward-compatible Node A getters plus broadcast setup setters.
+    # Assigning phase/timer writes the same initial value into both distinct
+    # NodeState objects; it does not create shared storage. Production callers
+    # should use get_node_status() because runtime updates are per-node.
     @property
     def phase(self):
         return self.nodes[INT_X[0]].phase

@@ -43,6 +43,46 @@ def advance_to_priority(controller, vehicles, node_x, limit=30):
     raise AssertionError(f"Priority was not granted: {observed}")
 
 
+def test_nodes_own_independent_state_despite_legacy_broadcast_setters():
+    controller = SignalController(
+        {"green_time": 100}, yellow_time=2, red_clearance_time=2
+    )
+    node_a = controller.nodes[300]
+    node_b = controller.nodes[700]
+
+    assert node_a is not node_b
+
+    # Legacy assignments intentionally initialize both distinct states.
+    controller.phase = 2
+    controller.timer = 7
+    assert (node_a.phase, node_a.timer) == (2, 7)
+    assert (node_b.phase, node_b.timer) == (2, 7)
+
+    # Direct per-node/runtime mutation does not leak to the other node.
+    node_a.phase = 3
+    node_a.timer = 1
+    assert (node_b.phase, node_b.timer) == (2, 7)
+    assert controller.get_all_signals()[300] != controller.get_all_signals()[700]
+
+
+def test_node_local_clearance_can_diverge_initially_aligned_clocks():
+    controller = SignalController(
+        {"green_time": 100}, yellow_time=2, red_clearance_time=2
+    )
+    controller.phase = 2
+    controller.timer = 1
+    node_a_blocker = Vehicle(300, H_Y, "NB")
+
+    controller.update([node_a_blocker])
+
+    assert controller.get_node_status(300)["phase_index"] == 2
+    assert controller.get_node_status(700)["phase_index"] == 3
+    assert set(controller.get_all_signals()[300].values()) == {"RED"}
+    assert controller.get_all_signals()[700] == {
+        "EB": "RED", "WB": "RED", "NB": "GREEN", "SB": "GREEN"
+    }
+
+
 @pytest.mark.parametrize("route_id,node_x,approach,movement,lane", ROUTE_LEGS)
 @pytest.mark.parametrize("feature_mode", ["DBL", "TSP", "COMBINED"])
 def test_every_route_leg_gets_exclusive_conflict_safe_priority(

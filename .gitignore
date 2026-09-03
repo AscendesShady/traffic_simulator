@@ -1,0 +1,28 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+myenv/
+.venv/
+venv/
+
+# Runtime-generated simulator data
+runtime/
+traffic_state_telemetry.json
+*.log
+*.tmp
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# IDE and operating-system files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

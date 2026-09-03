@@ -1,0 +1,10 @@
+# Traffic Simulator dependencies
+#
+# Tkinter is part of the standard Windows Python installation and must not be
+# installed from PyPI. The remaining imports use Python's standard library.
+
+# Application runtime
+pygame>=2.5,<3
+
+# Regression and safety test suite
+pytest>=8,<10

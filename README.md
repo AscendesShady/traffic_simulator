@@ -93,6 +93,7 @@ Compile-check the application modules:
 - [Simulator guide and complete source documentation](TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md)
 - [Audit and step-by-step fix report](TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)
 - [Gridlock incident report](TRAFFIC_SIMULATOR_GRIDLOCK_INCIDENT_REPORT.md)
+- [Callback and placeholder audit](TRAFFIC_SIMULATOR_CALLBACK_AND_PLACEHOLDER_AUDIT.md)
 
 ## Scope
 

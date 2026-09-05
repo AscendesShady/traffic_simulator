@@ -36,7 +36,7 @@ SECTIONS = [
     (
         "7. Telemetry subsystem — Export and dashboard",
         ["telemetry_exporter.py", "telemetry_dashboard.py"],
-        "The exporter builds schema-versioned per-node state, exports the controller's exact normal signal timing, separates pending/active/clearing priority, exports per-source congestion demand and the complete network-discharge status, and atomically replaces a source-relative JSON file. The dashboard validates that schema, distinguishes LIVE/PAUSED/STALE/ERROR, always reschedules polling, displays road/demand queues and active/pending grants separately, renders each node independently, and shows the recovery selection, status, reason, recommendation, stage, and discharge count. Both notebook tabs use responsive two-axis scroll containers, and the dashboard chooses a screen-fitting initial size while remaining freely resizable; the mouse wheel scrolls vertically and Shift+wheel scrolls horizontally. Below the summary cards, a three-band nominal phase-cycle diagram shows east-west, Node A north-south, and Node B north-south timing, outlined all-red intervals, a wrapping time marker, and authoritative live-state dots that expose priority or discharge divergence. Its Session Trends tab samples only advancing LIVE frames into bounded process memory and plots occupancy, queue pressure, and congestion without creating a history file; reset, manual clear, or dashboard close discards the samples.",
+        "The exporter builds schema-versioned per-node state, exports the controller's exact normal signal timing, separates pending/active/clearing priority, exports per-source congestion demand and the complete network-discharge status, and atomically replaces a source-relative JSON file. The dashboard validates that schema, distinguishes LIVE/PAUSED/STALE/ERROR, always reschedules polling, displays road/demand queues and active/pending grants separately, renders each node independently, and shows the recovery selection, status, reason, recommendation, stage, and discharge count. Both notebook tabs are scrollbar-free and responsive: debounced resize handling scales fonts, cards, diagrams, and charts to the available window, while a uniform 3-by-3 grid keeps all summary metric cards equal. Below the summary cards, a three-band nominal phase-cycle diagram shows east-west, Node A north-south, and Node B north-south timing, outlined all-red intervals, a wrapping time marker, and authoritative live-state dots that expose priority or discharge divergence. Its Session Trends tab samples only advancing LIVE frames into bounded process memory and plots occupancy, queue pressure, and congestion without creating a history file; reset, manual clear, or dashboard close discards the samples.",
     ),
 ]
 
@@ -54,8 +54,8 @@ def build_guide():
         "",
         "Companion documents:",
         "",
-        "- [Audit and Step-by-Step Fix Report](TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)",
-        "- [Gridlock Incident Report](TRAFFIC_SIMULATOR_GRIDLOCK_INCIDENT_REPORT.md)",
+        "- [Audit and Step-by-Step Fix Report](audits/TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)",
+        "- [Gridlock Incident Report](audits/TRAFFIC_SIMULATOR_GRIDLOCK_INCIDENT_REPORT.md)",
         "",
         "## 1. General overview",
         "",
@@ -102,7 +102,8 @@ def build_guide():
         "- The latest telemetry JSON remains a snapshot rather than JSONL; no time-series history is persisted to disk.",
         "- Telemetry exports green, yellow, all-red, and nominal-cycle frame counts so the dashboard phase diagram stays synchronized with the controller's configured timing.",
         "- The phase-cycle background is the nominal plan. Its marker dots are the authoritative live states; blue indicates mixed approaches or node divergence during priority operation.",
-        "- The telemetry dashboard starts within the available screen, remains freely resizable, and provides vertical plus horizontal scrolling on both tabs; the wheel scrolls vertically and Shift+wheel scrolls horizontally.",
+        "- The telemetry dashboard starts within the available screen, remains freely resizable, and automatically compacts fonts, cards, diagrams, and charts without adding dashboard scrollbars.",
+        "- The nine summary metric cards use a uniform three-column by three-row grid, so their widths and heights remain equal at every supported window size.",
         "- Runtime and telemetry paths are resolved from the source directory, not the caller's working directory.",
         "- The control panel uses normal window stacking rather than forced topmost behavior, so the canvas can be raised or overlapped normally.",
         "- Catch-up work is capped per Tk callback so a delayed simulation update does not make native window dragging unresponsive.",

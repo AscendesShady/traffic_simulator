@@ -4,8 +4,8 @@
 
 Companion documents:
 
-- [Audit and Step-by-Step Fix Report](TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)
-- [Gridlock Incident Report](TRAFFIC_SIMULATOR_GRIDLOCK_INCIDENT_REPORT.md)
+- [Audit and Step-by-Step Fix Report](audits/TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)
+- [Gridlock Incident Report](audits/TRAFFIC_SIMULATOR_GRIDLOCK_INCIDENT_REPORT.md)
 
 ## 1. General overview
 
@@ -52,7 +52,8 @@ Safety contracts:
 - The latest telemetry JSON remains a snapshot rather than JSONL; no time-series history is persisted to disk.
 - Telemetry exports green, yellow, all-red, and nominal-cycle frame counts so the dashboard phase diagram stays synchronized with the controller's configured timing.
 - The phase-cycle background is the nominal plan. Its marker dots are the authoritative live states; blue indicates mixed approaches or node divergence during priority operation.
-- The telemetry dashboard starts within the available screen, remains freely resizable, and provides vertical plus horizontal scrolling on both tabs; the wheel scrolls vertically and Shift+wheel scrolls horizontally.
+- The telemetry dashboard starts within the available screen, remains freely resizable, and automatically compacts fonts, cards, diagrams, and charts without adding dashboard scrollbars.
+- The nine summary metric cards use a uniform three-column by three-row grid, so their widths and heights remain equal at every supported window size.
 - Runtime and telemetry paths are resolved from the source directory, not the caller's working directory.
 - The control panel uses normal window stacking rather than forced topmost behavior, so the canvas can be raised or overlapped normally.
 - Catch-up work is capped per Tk callback so a delayed simulation update does not make native window dragging unresponsive.
@@ -509,8 +510,13 @@ Owns the shared global, approach, six-route, and network-discharge configuration
 
 ```python
 # control_panel.py
+import json
+import os
+from pathlib import Path
+import subprocess
 import tkinter as tk
 from tkinter import ttk
+import tempfile
 import sys
 
 # ==========================================================
@@ -529,6 +535,9 @@ COLOR_TEXT_SECONDARY = "#94A3B8"# Soft light blue-gray
 
 FONT_FAMILY = "Segoe UI"      # Clean UI font
 
+BASE_DIR = Path(__file__).resolve().parent
+AI_CONTROL_PATH = BASE_DIR / "ai_control.json"
+
 SYM_DOT = "\u25cf"            # ●
 SYM_PAUSE = "\u23f8"          # ⏸
 SYM_PLAY = "\u25b6"           # ▶
@@ -545,6 +554,10 @@ DISCHARGE_OPTIONS = (
     "Node B Northbound",
     "Node B Southbound",
 )
+
+# Live widget references used by the periodic repaint poller. The data in
+# bus_routes_config remains authoritative whether a human or the LLM changed it.
+route_flag_buttons = {}
 
 # ==========================================================
 # SHARED STATE DICTIONARIES (Accessed by main.py)
@@ -566,6 +579,13 @@ global_config = {
         "recommendation": "Select Auto or a corridor, then start discharge",
         "stage": "",
         "vehicles_discharged": 0,
+    },
+    "ai_runtime": {
+        "armed": False,
+        "model": "None",
+        "tick_seconds": 5,
+        "last_status": "INACTIVE",
+        "last_turn": 0,
     },
 }
 
@@ -665,7 +685,86 @@ APPROACH_NAMES = {
     "B_SB": "Node B (SB)"
 }
 
+
+def repaint_route_flag_buttons():
+    """Repaint TSP/DBL controls from the authoritative route configuration."""
+    for route_id, buttons in route_flag_buttons.items():
+        config = bus_routes_config.get(route_id, {})
+        tsp_on = bool(config.get("tsp_enabled", False))
+        dbl_on = bool(config.get("dbl_enabled", False))
+        buttons["tsp"].config(
+            text="TSP ACTIVE" if tsp_on else "TSP OFF",
+            fg=COLOR_SUCCESS if tsp_on else COLOR_DANGER,
+        )
+        buttons["dbl"].config(
+            text="DBL ACTIVE" if dbl_on else "DBL OFF",
+            fg=COLOR_ACCENT if dbl_on else COLOR_DANGER,
+        )
+
+
+def get_ollama_models():
+    """Return locally installed Ollama tags, with safe offline fallbacks."""
+    fallback = [
+        "None",
+        "gemma4:12b",
+        "llama3.1:8b",
+        "deepseek-r1:32b",
+        "qwen3.6:latest",
+    ]
+    try:
+        result = subprocess.run(
+            ["ollama", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return fallback
+        names = [
+            line.split()[0]
+            for line in result.stdout.strip().splitlines()[1:]
+            if line.split()
+        ]
+        return ["None"] + list(dict.fromkeys(names))
+    except Exception:
+        return fallback
+
+
+def write_ai_control(path=None):
+    """Atomically mirror in-process AI controls for the agent subprocess."""
+    runtime = global_config["ai_runtime"]
+    payload = {
+        "armed": bool(runtime.get("armed", False)),
+        "model": str(runtime.get("model", "None")),
+        "tick_seconds": min(15, max(2, int(runtime.get("tick_seconds", 5)))),
+    }
+    destination = AI_CONTROL_PATH if path is None else Path(path)
+    temp_name = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=destination.parent,
+            delete=False,
+        ) as temp_file:
+            json.dump(payload, temp_file, indent=2)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_name = Path(temp_file.name)
+        os.replace(temp_name, destination)
+        return True
+    except Exception:
+        if temp_name and temp_name.exists():
+            try:
+                temp_name.unlink()
+            except OSError:
+                pass
+        runtime["last_status"] = "CONTROL_WRITE_ERROR"
+        return False
+
 def create_dashboard_window():
+    route_flag_buttons.clear()
     root = tk.Tk()
     root.title("Traffic & Transit Control Dashboard")
     # Increased height slightly to accommodate the new AI control section
@@ -674,6 +773,7 @@ def create_dashboard_window():
     # underneath this window and also made focus/drag interaction feel sticky.
     root.attributes("-topmost", False)
     root.configure(bg=COLOR_BG)
+    write_ai_control()
 
     def on_close():
         global_config["is_running"] = False
@@ -995,23 +1095,39 @@ def create_dashboard_window():
     llm_lbl = tk.Label(ai_row1, text="LLM Engine", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     llm_lbl.pack(side="left", padx=(0, 8))
 
+    available_models = get_ollama_models()
+    selected_model = str(global_config["ai_runtime"].get("model", "None"))
+    if selected_model not in available_models:
+        selected_model = "None"
+        global_config["ai_runtime"]["model"] = selected_model
+
     llm_engine_box = ttk.Combobox(
         ai_row1,
-        values=["None", "gemma4:12b", "deepseek-r1:32b", "qwen3.6:latest", "llama3:latest", "gemma4:latest"],
+        values=available_models,
         width=22, state="readonly", style="Modern.TCombobox"
     )
-    llm_engine_box.set("None")
+    llm_engine_box.set(selected_model)
     llm_engine_box.pack(side="left", padx=(0, 16))
 
     def on_llm_engine_selected(event):
-        # UI-only update
-        selected_val_lbl.config(text=llm_engine_box.get())
+        selected_model_name = llm_engine_box.get()
+        selected_val_lbl.config(text=selected_model_name)
+        global_config["ai_runtime"]["model"] = selected_model_name
+        if global_config["ai_runtime"].get("armed", False):
+            global_config["ai_runtime"]["last_status"] = "MODEL_CHANGED_WAITING"
+        write_ai_control()
 
     llm_engine_box.bind("<<ComboboxSelected>>", on_llm_engine_selected)
 
     def on_run_llm():
-        # Dummy callback - intentionally does nothing
-        pass
+        runtime = global_config["ai_runtime"]
+        runtime["armed"] = not runtime.get("armed", False)
+        runtime["last_status"] = (
+            "WAITING_FOR_DECISION" if runtime["armed"] else "INACTIVE"
+        )
+        if runtime["armed"]:
+            runtime["last_turn"] = 0
+        write_ai_control()
 
     run_llm_btn = tk.Button(
         ai_row1, text=f"{SYM_PLAY} RUN LLM", font=(FONT_FAMILY, 8, "bold"),
@@ -1037,8 +1153,43 @@ def create_dashboard_window():
     sel_lbl = tk.Label(ai_row2, text="Selected: ", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     sel_lbl.pack(side="left")
     
-    selected_val_lbl = tk.Label(ai_row2, text="None", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_ACCENT)
+    selected_val_lbl = tk.Label(ai_row2, text=selected_model, font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_ACCENT)
     selected_val_lbl.pack(side="left")
+
+    tick_runtime = global_config["ai_runtime"]
+    tick_value_lbl = tk.Label(
+        ai_row2,
+        text=f"{int(tick_runtime.get('tick_seconds', 5))}s",
+        font=(FONT_FAMILY, 8, "bold"),
+        bg=COLOR_CARD,
+        fg=COLOR_ACCENT,
+        width=4,
+    )
+    tick_value_lbl.pack(side="right")
+
+    def on_tick_seconds_changed(value):
+        tick_seconds = min(15, max(2, int(float(value))))
+        global_config["ai_runtime"]["tick_seconds"] = tick_seconds
+        tick_value_lbl.config(text=f"{tick_seconds}s")
+        write_ai_control()
+
+    tick_slider = ttk.Scale(
+        ai_row2,
+        from_=2,
+        to=15,
+        value=tick_runtime.get("tick_seconds", 5),
+        style="Global.Horizontal.TScale",
+        command=on_tick_seconds_changed,
+        length=110,
+    )
+    tick_slider.pack(side="right", padx=(6, 2))
+    tk.Label(
+        ai_row2,
+        text="Decision interval",
+        font=(FONT_FAMILY, 8),
+        bg=COLOR_CARD,
+        fg=COLOR_TEXT_PRIMARY,
+    ).pack(side="right")
 
     # Third row: Control Scope Label
     ai_row3 = tk.Frame(ai_card, bg=COLOR_CARD)
@@ -1052,6 +1203,39 @@ def create_dashboard_window():
     
     ctrl_rest_lbl = tk.Label(ai_row3, text=" for all bus routes", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     ctrl_rest_lbl.pack(side="left")
+
+    def refresh_llm_status():
+        runtime = global_config.get("ai_runtime", {})
+        armed = bool(runtime.get("armed", False))
+        status = str(runtime.get("last_status", "INACTIVE"))
+        turn = int(runtime.get("last_turn", 0))
+        if not armed:
+            color = COLOR_TEXT_SECONDARY
+            status_text_value = "LLM INACTIVE"
+            button_text = f"{SYM_PLAY} RUN LLM"
+        else:
+            color = {
+                "OK": COLOR_SUCCESS,
+                "HELD_ALL_OFF": COLOR_DANGER,
+                "INVALID_DECISION": COLOR_DANGER,
+                "CONTROL_WRITE_ERROR": COLOR_DANGER,
+            }.get(status, COLOR_WARNING)
+            status_text_value = f"LLM {status}"
+            if turn:
+                status_text_value += f" | TURN {turn}"
+            button_text = "DISARM LLM"
+        llm_dot.config(fg=color)
+        llm_status_text.config(text=status_text_value, fg=color)
+        run_llm_btn.config(text=button_text)
+        root.after(250, refresh_llm_status)
+
+    root.after(250, refresh_llm_status)
+
+    def refresh_route_buttons():
+        repaint_route_flag_buttons()
+        root.after(250, refresh_route_buttons)
+
+    root.after(250, refresh_route_buttons)
 
 
     # 3. TRANSIT ROUTES CONTROL CARD
@@ -1214,6 +1398,7 @@ def create_dashboard_window():
         )
         dbl_btn.config(command=make_dbl_toggle(r_id, dbl_btn))
         dbl_btn.pack(fill="both", expand=True)
+        route_flag_buttons[r_id] = {"tsp": tsp_btn, "dbl": dbl_btn}
 
     # 4. PER-APPROACH PARAMETERS SECTION
     approaches_container = tk.Frame(root, bg=COLOR_BG)
@@ -1407,12 +1592,14 @@ import pygame
 import sys
 import random
 import math
+import json
 import subprocess
 import atexit
 import time
 from pathlib import Path
 import canvas_gemini as canvas
 import control_panel
+import guard
 from vehicle import Vehicle, Bus
 from signal_controller import SignalController
 from telemetry_exporter import TelemetryExporter
@@ -1453,9 +1640,278 @@ spawner_states = {
 
 bus_dispatch_counters = { r_id: 0.0 for r_id in control_panel.bus_routes_config.keys() }
 bus_sequence_counter = 0
+network_throughput = {
+    "passengers_served_total": 0,
+    "passengers_served_bus": 0,
+    "passengers_served_car": 0,
+    "vehicles_served_total": 0,
+    "buses_served": 0,
+    "cars_served": 0,
+}
 BASE_DIR = Path(__file__).resolve().parent
 TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
 DASHBOARD_PATH = BASE_DIR / "telemetry_dashboard.py"
+AGENT_PATH = BASE_DIR / "agent.py"
+DECISION_PATH = BASE_DIR / "decision.json"
+AGENT_TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
+TELEMETRY_LOG_PATH = BASE_DIR / "telemetry_log.jsonl"
+EXCEL_EXPORT_DIR = BASE_DIR / "excel_exports"
+TELEMETRY_LOG_INTERVAL = 60
+SESSION_ROUTE_IDS = (
+    "R1_EB_A_NB",
+    "R2_EB_B_NB",
+    "R3_EB_ONLY",
+    "R4_WB_A_SB",
+    "R5_WB_B_SB",
+    "R6_WB_ONLY",
+)
+_last_telemetry_log_frame = None
+
+
+def reset_session_logs():
+    """Start a clean pair of append-only logs for one simulator run."""
+    global _last_telemetry_log_frame
+    _last_telemetry_log_frame = None
+    for path in (TELEMETRY_LOG_PATH, AGENT_TURN_LOG_PATH):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"Session log reset warning for {path.name}: {exc}")
+
+
+def log_telemetry_sample(frame_number, payload):
+    """Append one schema-derived telemetry sample at roughly one-second gaps."""
+    global _last_telemetry_log_frame
+    try:
+        frame_number = int(frame_number)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not isinstance(payload, dict) or frame_number < 0:
+        return False
+    if _last_telemetry_log_frame is None:
+        if frame_number < TELEMETRY_LOG_INTERVAL:
+            return False
+    elif (
+        frame_number <= _last_telemetry_log_frame
+        or frame_number - _last_telemetry_log_frame < TELEMETRY_LOG_INTERVAL
+    ):
+        return False
+
+    network_throughput_state = payload.get("network_throughput", {})
+    network_summary_state = payload.get("network_summary", {})
+    if not isinstance(network_throughput_state, dict):
+        network_throughput_state = {}
+    if not isinstance(network_summary_state, dict):
+        network_summary_state = {}
+    ai_runtime = control_panel.global_config.get("ai_runtime", {})
+    if not isinstance(ai_runtime, dict):
+        ai_runtime = {}
+    record = {
+        "frame": frame_number,
+        "sim_time_s": payload.get("simulation_time_seconds"),
+        "passengers_served_total": network_throughput_state.get(
+            "passengers_served_total"
+        ),
+        "passengers_served_bus": network_throughput_state.get(
+            "passengers_served_bus"
+        ),
+        "passengers_served_car": network_throughput_state.get(
+            "passengers_served_car"
+        ),
+        "buses_served": network_throughput_state.get("buses_served"),
+        "cars_served": network_throughput_state.get("cars_served"),
+        "pax_per_min_cumulative": network_throughput_state.get(
+            "passengers_per_minute"
+        ),
+        "pax_per_min_recent": network_throughput_state.get(
+            "passengers_per_minute_recent"
+        ),
+        "queues_vehicles": network_summary_state.get("queues"),
+        "queues_passengers_est": network_summary_state.get(
+            "queues_passengers_est"
+        ),
+        "vehicles_in_network": network_summary_state.get("total_vehicles"),
+        "ai_armed": bool(ai_runtime.get("armed", False)),
+        "ai_last_status": ai_runtime.get("last_status"),
+    }
+    try:
+        with TELEMETRY_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(record) + "\n")
+    except (OSError, TypeError, ValueError):
+        return False
+    _last_telemetry_log_frame = frame_number
+    return True
+
+
+def _read_jsonl_rows(path):
+    """Read all complete JSON-object lines and ignore a damaged crash tail."""
+    rows = []
+    try:
+        with Path(path).open("r", encoding="utf-8") as source:
+            for line in source:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+    except OSError:
+        pass
+    return rows
+
+
+def export_session_excel(output_path=None):
+    """Build a two-sheet workbook from the crash-safe session JSONL logs."""
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print("openpyxl not installed; skipping Excel export")
+        return None
+
+    decisions = _read_jsonl_rows(AGENT_TURN_LOG_PATH)
+    telemetry_rows = _read_jsonl_rows(TELEMETRY_LOG_PATH)
+    if not decisions and not telemetry_rows:
+        return None
+
+    try:
+        workbook = Workbook()
+        decisions_sheet = workbook.active
+        decisions_sheet.title = "Decisions"
+        decision_header = ["turn", "timestamp", "model", "status"]
+        for route_id in SESSION_ROUTE_IDS:
+            decision_header.extend(
+                (f"{route_id}_tsp", f"{route_id}_dbl")
+            )
+        decision_header.extend(("locked_routes", "minimap", "raw_output"))
+        decisions_sheet.append(decision_header)
+        for decision in decisions:
+            flags = decision.get("flags", {})
+            if not isinstance(flags, dict):
+                flags = {}
+            row = [
+                decision.get("turn"),
+                decision.get("timestamp"),
+                decision.get("model"),
+                decision.get("status"),
+            ]
+            for route_id in SESSION_ROUTE_IDS:
+                route_flags = flags.get(route_id, {})
+                if not isinstance(route_flags, dict):
+                    route_flags = {}
+                row.extend(
+                    (
+                        bool(route_flags.get("tsp", False)),
+                        bool(route_flags.get("dbl", False)),
+                    )
+                )
+            locked_routes = decision.get("locked_routes", [])
+            if not isinstance(locked_routes, (list, tuple, set, frozenset)):
+                locked_routes = []
+            row.extend(
+                (
+                    ",".join(str(route_id) for route_id in locked_routes),
+                    str(decision.get("minimap", ""))[:32767],
+                    str(decision.get("raw_output", ""))[:32767],
+                )
+            )
+            decisions_sheet.append(row)
+
+        telemetry_sheet = workbook.create_sheet("Telemetry")
+        telemetry_header = [
+            "frame",
+            "sim_time_s",
+            "passengers_served_total",
+            "passengers_served_bus",
+            "passengers_served_car",
+            "buses_served",
+            "cars_served",
+            "pax_per_min_cumulative",
+            "pax_per_min_recent",
+            "vehicles_in_network",
+            "ai_armed",
+            "ai_last_status",
+            "queues_vehicles",
+            "queues_passengers_est",
+        ]
+        telemetry_sheet.append(telemetry_header)
+        for telemetry in telemetry_rows:
+            telemetry_sheet.append(
+                [
+                    telemetry.get("frame"),
+                    telemetry.get("sim_time_s"),
+                    telemetry.get("passengers_served_total"),
+                    telemetry.get("passengers_served_bus"),
+                    telemetry.get("passengers_served_car"),
+                    telemetry.get("buses_served"),
+                    telemetry.get("cars_served"),
+                    telemetry.get("pax_per_min_cumulative"),
+                    telemetry.get("pax_per_min_recent"),
+                    telemetry.get("vehicles_in_network"),
+                    telemetry.get("ai_armed"),
+                    telemetry.get("ai_last_status"),
+                    json.dumps(telemetry.get("queues_vehicles")),
+                    json.dumps(telemetry.get("queues_passengers_est")),
+                ]
+            )
+
+        destination = (
+            Path(output_path)
+            if output_path is not None
+            else EXCEL_EXPORT_DIR
+            / f"session_export_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        workbook.save(destination)
+        workbook.close()
+        print(f"Session exported: {destination}")
+        return destination
+    except Exception as exc:
+        print(f"Session Excel export warning: {exc}")
+        return None
+
+
+def _set_ai_flags(flags):
+    for route_id, route_flags in flags.items():
+        route_config = control_panel.bus_routes_config[route_id]
+        route_config["tsp_enabled"] = route_flags["tsp"]
+        route_config["dbl_enabled"] = route_flags["dbl"]
+
+
+def merge_ai_decision(path=None):
+    """Validate and merge one file-based AI decision into live route config."""
+    runtime = control_panel.global_config.setdefault("ai_runtime", {})
+    decision_path = DECISION_PATH if path is None else Path(path)
+    try:
+        with decision_path.open("r", encoding="utf-8") as decision_file:
+            decision = json.load(decision_file)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        runtime["last_status"] = "WAITING_FOR_DECISION"
+        return False
+
+    try:
+        runtime["last_turn"] = int(decision.get("turn", 0))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        runtime["last_turn"] = 0
+
+    flags = guard.validate_flags(decision)
+    if flags is None:
+        _set_ai_flags(guard.all_off_flags())
+        runtime["last_status"] = "INVALID_DECISION"
+        return False
+
+    _set_ai_flags(flags)
+    decision_status = decision.get("status", "OK")
+    runtime["last_status"] = (
+        decision_status
+        if decision_status in ("OK", "HELD_ALL_OFF")
+        else "OK"
+    )
+    return True
 
 
 def reset_all_spawner_states():
@@ -1757,6 +2213,7 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
 
 
 def main():
+    reset_session_logs()
     pygame.init()
     pygame.font.init()
     font = pygame.font.SysFont("Consolas", 13, bold=True)
@@ -1788,12 +2245,27 @@ def main():
         cwd=str(BASE_DIR),
     )
 
-    # 3. Register cleanup to prevent zombie dashboard processes on exit
+    print("Launching LLM Control Agent...")
+    agent_proc = subprocess.Popen(
+        [sys.executable, str(AGENT_PATH)],
+        cwd=str(BASE_DIR),
+    )
+
+    # 3. Register cleanup, then build the workbook after agent writes stop.
     def cleanup():
         try:
             dashboard_proc.terminate()
         except Exception:
             pass
+        try:
+            agent_proc.terminate()
+        except Exception:
+            pass
+        try:
+            agent_proc.wait(timeout=2)
+        except Exception:
+            pass
+        export_session_excel()
     atexit.register(cleanup)
 
     master_frame_count = 0
@@ -1831,6 +2303,7 @@ def main():
             vehicles.clear()
             reset_all_spawner_states()
             signals.reset_discharge()
+            network_throughput.update({key: 0 for key in network_throughput})
             control_panel.global_config["reset_triggered"] = False
 
         sim_speed = control_panel.global_config.get("sim_speed", 1.0)
@@ -1860,6 +2333,10 @@ def main():
 
                     if post_discharge_meter_frames_remaining <= 0:
                         check_and_dispatch_buses(vehicles, lane_options, dt_step)
+                if master_frame_count % 30 == 0:
+                    ai_runtime = control_panel.global_config.get("ai_runtime", {})
+                    if ai_runtime.get("armed", False):
+                        merge_ai_decision()
                 signals.update(vehicles=vehicles)
                 discharge_is_active = signals.is_discharge_active()
                 if discharge_was_active and not discharge_is_active:
@@ -1882,6 +2359,16 @@ def main():
                         signal_controller=signals
                     )
                     if (v.x < -60 or v.x > canvas.WIDTH + 60 or v.y < -60 or v.y > canvas.HEIGHT + 60):
+                        if len(getattr(v, "passed_nodes", set())) > 0:
+                            passengers = int(getattr(v, "passengers", 0))
+                            network_throughput["passengers_served_total"] += passengers
+                            network_throughput["vehicles_served_total"] += 1
+                            if isinstance(v, Bus):
+                                network_throughput["passengers_served_bus"] += passengers
+                                network_throughput["buses_served"] += 1
+                            else:
+                                network_throughput["passengers_served_car"] += passengers
+                                network_throughput["cars_served"] += 1
                         vehicles.remove(v)
                 
                 time_accumulator -= dt_step
@@ -1909,12 +2396,23 @@ def main():
         for v in vehicles:
             v.draw(screen)
 
-        telemetry.export(
+        telemetry_exported = telemetry.export(
             signal_controller=signals,
             vehicles=vehicles,
             frame_number=master_frame_count,
             demand_state=get_demand_telemetry(),
+            throughput_state=network_throughput,
         )
+        if telemetry_exported:
+            try:
+                with TELEMETRY_PATH.open("r", encoding="utf-8") as telemetry_file:
+                    exported_payload = json.load(telemetry_file)
+                log_telemetry_sample(
+                    exported_payload.get("frame_number", master_frame_count),
+                    exported_payload,
+                )
+            except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+                pass
         pygame.display.flip()
 
         # Constant GUI polling rate (~60 FPS) decoupled from simulation speed
@@ -1969,6 +2467,7 @@ DISCHARGE_TRANSITION_YELLOW = "TRANSITION_YELLOW"
 DISCHARGE_ALL_RED = "DISCHARGE_ALL_RED"
 DISCHARGE_WAITING = "WAITING"
 DISCHARGE_ACTIVE = "DISCHARGING"
+DISCHARGE_RECOVERY_FAILED = "RECOVERY_FAILED"
 DISCHARGE_STAGE_YELLOW = "STAGE_YELLOW"
 DISCHARGE_STOPPING_YELLOW = "STOPPING_YELLOW"
 DISCHARGE_STOPPING_ALL_RED = "STOPPING_ALL_RED"
@@ -2100,6 +2599,7 @@ class SignalController:
         self._discharge_stop_after_clearance = False
         self._discharge_completed = False
         self._discharge_last_progress_frame = 0
+        self._discharge_wait_snapshot: dict[str, Any] | None = None
         self._discharge_tracked: dict[tuple[int, int], Any] = {}
         self._discharge_last_served = {
             plan_name: -self.discharge_max_green
@@ -2153,6 +2653,8 @@ class SignalController:
             return "DISCHARGING"
         if self.discharge_state == DISCHARGE_WAITING:
             return "WAITING"
+        if self.discharge_state == DISCHARGE_RECOVERY_FAILED:
+            return "RECOVERY_FAILED"
         if self.discharge_state in (
             DISCHARGE_STOPPING_YELLOW,
             DISCHARGE_STOPPING_ALL_RED,
@@ -2201,6 +2703,7 @@ class SignalController:
         self._discharge_green_map = {}
         self._discharge_stop_after_clearance = False
         self._discharge_completed = False
+        self._discharge_wait_snapshot = None
         self._discharge_tracked.clear()
         self.global_config["discharge_start_requested"] = False
         self.global_config["discharge_stop_requested"] = False
@@ -2248,17 +2751,54 @@ class SignalController:
     def _first_relevant_stage_index(self, plan_name, vehicles):
         stages = DISCHARGE_PLAN_STAGES[plan_name]
         for index, stage in enumerate(stages):
-            if self._matching_stage_vehicles(stage, vehicles):
+            if (
+                self._matching_stage_vehicles(stage, vehicles)
+                or self._stage_same_direction_occupants(stage, vehicles)
+            ):
                 return index
         return None
 
+    def _stage_same_direction_occupants(self, stage, vehicles):
+        """Return box occupants that can exit under this protected stage."""
+        occupants = []
+        seen = set()
+        for node_x, approach in stage.greens:
+            for vehicle in vehicles or []:
+                if id(vehicle) in seen or vehicle.direction != approach:
+                    continue
+                if self.vehicle_occupies_intersection(vehicle, node_x):
+                    occupants.append(vehicle)
+                    seen.add(id(vehicle))
+        return occupants
+
+    def _served_stage_vehicles(self, stage, vehicles):
+        served = []
+        seen = set()
+        for vehicle in (
+            self._matching_stage_vehicles(stage, vehicles)
+            + self._stage_same_direction_occupants(stage, vehicles)
+        ):
+            if id(vehicle) not in seen:
+                served.append(vehicle)
+                seen.add(id(vehicle))
+        return served
+
     def _stage_readiness(self, stage, vehicles):
         for node_x, approach in stage.greens:
-            if not self.is_intersection_clear(node_x, vehicles):
+            if not self.is_intersection_clear_for_greens(
+                node_x, stage.greens, vehicles
+            ):
                 node_name = "Node A" if node_x == INT_X[0] else "Node B"
-                return False, f"{node_name} intersection is still occupied"
+                return (
+                    False,
+                    f"{node_name} intersection is blocked by a "
+                    "cross-direction vehicle",
+                )
 
         matching = self._matching_stage_vehicles(stage, vehicles)
+        exiting = self._stage_same_direction_occupants(stage, vehicles)
+        if exiting:
+            return True, "Same-direction box occupants can exit under this green"
         if not matching:
             return False, "No vehicles are waiting for this discharge stage"
 
@@ -2285,6 +2825,25 @@ class SignalController:
         return (
             False,
             f"{location_name} has insufficient storage",
+        )
+
+    def _box_occupant_directions(self, vehicles):
+        """Map each conflict box to current occupant travel directions."""
+        result = {node_x: set() for node_x in INT_X}
+        for node_x in INT_X:
+            for vehicle in vehicles or []:
+                if self.vehicle_occupies_intersection(vehicle, node_x):
+                    result[node_x].add(vehicle.direction)
+        return result
+
+    @staticmethod
+    def _candidate_drains_blocker(candidate, occupants):
+        stage = DISCHARGE_PLAN_STAGES[candidate["plan"]][
+            candidate["stage_index"]
+        ]
+        return any(
+            approach in occupants.get(node_x, set())
+            for node_x, approach in stage.greens
         )
 
     def _dependency_bonus(self, plan_name):
@@ -2403,7 +2962,76 @@ class SignalController:
         self._discharge_stop_after_clearance = False
         self._discharge_completed = False
         self._discharge_last_progress_frame = self.frame_number
+        self._discharge_wait_snapshot = None
         self._discharge_tracked.clear()
+        self._publish_discharge_status()
+
+    def _set_discharge_waiting(self, reason, recommendation):
+        if self.discharge_state != DISCHARGE_WAITING:
+            self._discharge_last_progress_frame = self.frame_number
+            self._discharge_wait_snapshot = None
+        self.discharge_state = DISCHARGE_WAITING
+        self.discharge_reason = reason
+        self.discharge_recommendation = recommendation
+        self._discharge_green_map = {}
+
+    def _waiting_progress_snapshot(self, vehicles):
+        ranked = self._rank_discharge_candidates(vehicles)
+        occupants = self._box_occupant_directions(vehicles)
+        return {
+            "upstream": self._network_upstream_count(vehicles),
+            "reservations": sum(
+                len(node.reservations) for node in self.nodes.values()
+            ),
+            "occupants": sum(len(items) for items in occupants.values()),
+            "ready": frozenset(
+                (item["plan"], item["stage_index"])
+                for item in ranked
+                if item["ready"]
+            ),
+        }
+
+    @staticmethod
+    def _waiting_snapshot_has_progress(previous, current):
+        if previous is None:
+            return False
+        return (
+            current["upstream"] < previous["upstream"]
+            or current["reservations"] < previous["reservations"]
+            or current["occupants"] < previous["occupants"]
+            or bool(current["ready"] - previous["ready"])
+        )
+
+    def _recovery_failure_reason(self, vehicles):
+        occupants = self._box_occupant_directions(vehicles)
+        details = []
+        for node_x in INT_X:
+            directions = sorted(occupants[node_x])
+            if not directions:
+                continue
+            node_name = "Node A" if node_x == INT_X[0] else "Node B"
+            direction_text = "/".join(directions)
+            needed = "/".join(f"{item} green" for item in directions)
+            details.append(
+                f"{node_name} blocked by {direction_text} vehicle; needs {needed}"
+            )
+        waited_seconds = (
+            self.frame_number - self._discharge_last_progress_frame
+        ) / 60.0
+        blocker_text = "; ".join(details) or "No safe ready discharge stage"
+        return (
+            f"{blocker_text}. No safe ready stage after "
+            f"{waited_seconds:.1f}s."
+        )
+
+    def _enter_recovery_failed(self, vehicles):
+        self.discharge_state = DISCHARGE_RECOVERY_FAILED
+        self.discharge_reason = self._recovery_failure_reason(vehicles)
+        self.discharge_recommendation = (
+            "RESET VEHICLES required - no safe discharge stage can drain "
+            "the current blockage."
+        )
+        self._discharge_green_map = {}
         self._publish_discharge_status()
 
     def _activate_current_stage(self, vehicles):
@@ -2412,17 +3040,17 @@ class SignalController:
             return False
         ready, reason = self._stage_readiness(stage, vehicles)
         if not ready:
-            self.discharge_state = DISCHARGE_WAITING
-            self.discharge_reason = reason
-            self.discharge_recommendation = self._recommend_discharge_plan(
-                vehicles,
-                exclude=(
-                    self.discharge_plan_name
-                    if self.discharge_mode != control_panel.DISCHARGE_AUTO
-                    else None
+            self._set_discharge_waiting(
+                reason,
+                self._recommend_discharge_plan(
+                    vehicles,
+                    exclude=(
+                        self.discharge_plan_name
+                        if self.discharge_mode != control_panel.DISCHARGE_AUTO
+                        else None
+                    ),
                 ),
             )
-            self._discharge_green_map = {}
             return False
 
         self.discharge_state = DISCHARGE_ACTIVE
@@ -2433,8 +3061,9 @@ class SignalController:
             "Continue this protected movement until its stage completes"
         )
         self._discharge_last_progress_frame = self.frame_number
+        self._discharge_wait_snapshot = None
         for node_x, _approach in stage.greens:
-            for vehicle in self._matching_stage_vehicles(stage, vehicles):
+            for vehicle in self._served_stage_vehicles(stage, vehicles):
                 if vehicle.get_next_target_node(INT_X) == node_x:
                     self._discharge_tracked[(id(vehicle), node_x)] = vehicle
         return True
@@ -2453,26 +3082,34 @@ class SignalController:
         if self.discharge_plan_name is None:
             if self.discharge_mode == control_panel.DISCHARGE_AUTO:
                 ranked = self._rank_discharge_candidates(vehicles)
-                candidate = next(
-                    (item for item in ranked if item["ready"]),
-                    ranked[0] if ranked else None,
+                occupants = self._box_occupant_directions(vehicles)
+                candidate = (
+                    next(
+                        (
+                            item
+                            for item in ranked
+                            if item["ready"]
+                            and self._candidate_drains_blocker(item, occupants)
+                        ),
+                        None,
+                    )
+                    or next(
+                        (item for item in ranked if item["ready"]), None
+                    )
+                    or (ranked[0] if ranked else None)
                 )
                 if candidate is None:
-                    self.discharge_state = DISCHARGE_WAITING
-                    self.discharge_reason = (
-                        "No queued approach currently requires a discharge green"
-                    )
-                    self.discharge_recommendation = (
-                        "Maintain arrival suspension while occupied lanes drain"
+                    self._set_discharge_waiting(
+                        "No queued approach currently requires a discharge green",
+                        "Maintain arrival suspension while occupied lanes drain",
                     )
                     return
                 self.discharge_plan_name = candidate["plan"]
                 self.discharge_stage_index = candidate["stage_index"]
                 if not candidate["ready"]:
-                    self.discharge_state = DISCHARGE_WAITING
-                    self.discharge_reason = candidate["reason"]
-                    self.discharge_recommendation = (
-                        "Maintain arrival suspension while downstream traffic drains"
+                    self._set_discharge_waiting(
+                        candidate["reason"],
+                        "Maintain arrival suspension while downstream traffic drains",
                     )
                     return
             else:
@@ -2490,7 +3127,10 @@ class SignalController:
         stages = DISCHARGE_PLAN_STAGES[self.discharge_plan_name]
         while self.discharge_stage_index < len(stages):
             stage = stages[self.discharge_stage_index]
-            if self._matching_stage_vehicles(stage, vehicles):
+            if (
+                self._matching_stage_vehicles(stage, vehicles)
+                or self._stage_same_direction_occupants(stage, vehicles)
+            ):
                 self._activate_current_stage(vehicles)
                 return
             self.discharge_stage_index += 1
@@ -2501,9 +3141,10 @@ class SignalController:
         if self.discharge_mode == control_panel.DISCHARGE_AUTO:
             self.discharge_plan_name = None
             self.discharge_stage_index = 0
-            self.discharge_state = DISCHARGE_WAITING
-            self.discharge_reason = f"{completed_plan} discharge is complete"
-            self.discharge_recommendation = self._recommend_discharge_plan(vehicles)
+            self._set_discharge_waiting(
+                f"{completed_plan} discharge is complete",
+                self._recommend_discharge_plan(vehicles),
+            )
         else:
             self._begin_safe_discharge_stop(
                 f"{completed_plan} discharge is complete"
@@ -2576,6 +3217,15 @@ class SignalController:
             )
             if not self.discharge_active:
                 self._start_discharge(mode, vehicles)
+            elif self.discharge_state == DISCHARGE_RECOVERY_FAILED:
+                self.discharge_reason = (
+                    "Recovery failed; use SAFE STOP or RESET VEHICLES before "
+                    "starting another discharge"
+                )
+                self.discharge_recommendation = (
+                    "RESET VEHICLES required - no safe discharge stage can "
+                    "drain the current blockage."
+                )
             else:
                 self.discharge_mode = (
                     mode if mode in control_panel.DISCHARGE_OPTIONS
@@ -2613,6 +3263,8 @@ class SignalController:
     def _update_discharge(self, vehicles):
         self._track_discharged_vehicles(vehicles)
         self.discharge_timer += 1
+        if self.discharge_state == DISCHARGE_RECOVERY_FAILED:
+            return
         if self.discharge_state == DISCHARGE_TRANSITION_YELLOW:
             if self.discharge_timer >= self.yellow_time:
                 self.discharge_state = DISCHARGE_ALL_RED
@@ -2661,6 +3313,28 @@ class SignalController:
             return
 
         if self.discharge_state == DISCHARGE_WAITING:
+            snapshot = self._waiting_progress_snapshot(vehicles)
+            if self._waiting_snapshot_has_progress(
+                self._discharge_wait_snapshot, snapshot
+            ):
+                self._discharge_last_progress_frame = self.frame_number
+            self._discharge_wait_snapshot = snapshot
+            waited = self.frame_number - self._discharge_last_progress_frame
+
+            if self.discharge_mode == control_panel.DISCHARGE_AUTO:
+                self.discharge_plan_name = None
+                self.discharge_stage_index = 0
+                self._choose_or_wait_for_discharge(vehicles)
+                if (
+                    waited >= self.discharge_stall_time
+                    and self.discharge_state == DISCHARGE_WAITING
+                ):
+                    self._enter_recovery_failed(vehicles)
+                return
+
+            if waited >= self.discharge_stall_time:
+                self._enter_recovery_failed(vehicles)
+                return
             self._choose_or_wait_for_discharge(vehicles)
             return
 
@@ -2674,19 +3348,19 @@ class SignalController:
             return
 
         for node_x, _approach in stage.greens:
-            for vehicle in self._matching_stage_vehicles(stage, vehicles):
+            for vehicle in self._served_stage_vehicles(stage, vehicles):
                 if vehicle.get_next_target_node(INT_X) == node_x:
                     self._discharge_tracked.setdefault(
                         (id(vehicle), node_x), vehicle
                     )
         self._track_discharged_vehicles(vehicles)
-        matching = self._matching_stage_vehicles(stage, vehicles)
-        if any(vehicle.speed >= 0.25 for vehicle in matching):
+        served = self._served_stage_vehicles(stage, vehicles)
+        if any(vehicle.speed >= 0.25 for vehicle in served):
             self._discharge_last_progress_frame = self.frame_number
 
         if self.discharge_timer < self.discharge_min_green:
             return
-        if not matching:
+        if not served:
             self._finish_current_discharge_stage(
                 f"{stage.label} queue has cleared"
             )
@@ -2762,6 +3436,32 @@ class SignalController:
         min_y, max_y = H_Y - half_w, H_Y + half_w
         vx1, vy1, vx2, vy2 = self._vehicle_bounds(vehicle)
         return vx1 < max_x and vx2 > min_x and vy1 < max_y and vy2 > min_y
+
+    def is_intersection_clear_for_greens(
+        self, node_x, greens, vehicles, road_w=ROAD_W, h_y=H_Y
+    ):
+        """Apply direction-aware conflict-box clearance during discharge only."""
+        half_w = road_w / 2.0
+        min_x, max_x = node_x - half_w, node_x + half_w
+        min_y, max_y = h_y - half_w, h_y + half_w
+        greened_dirs = {
+            approach for green_node_x, approach in greens
+            if green_node_x == node_x
+        }
+        for vehicle in vehicles or []:
+            vx1, vy1, vx2, vy2 = self._vehicle_bounds(vehicle)
+            overlaps = (
+                vx1 < max_x
+                and vx2 > min_x
+                and vy1 < max_y
+                and vy2 > min_y
+            )
+            if not overlaps:
+                continue
+            if vehicle.direction in greened_dirs:
+                continue
+            return False
+        return True
 
     def is_intersection_clear(self, int_x, vehicles, road_w=ROAD_W, h_y=H_Y):
         half_w = road_w / 2.0
@@ -3766,7 +4466,7 @@ class Bus(Vehicle):
 
 Purpose:
 
-The exporter builds schema-versioned per-node state, exports the controller's exact normal signal timing, separates pending/active/clearing priority, exports per-source congestion demand and the complete network-discharge status, and atomically replaces a source-relative JSON file. The dashboard validates that schema, distinguishes LIVE/PAUSED/STALE/ERROR, always reschedules polling, displays road/demand queues and active/pending grants separately, renders each node independently, and shows the recovery selection, status, reason, recommendation, stage, and discharge count. Both notebook tabs use responsive two-axis scroll containers, and the dashboard chooses a screen-fitting initial size while remaining freely resizable; the mouse wheel scrolls vertically and Shift+wheel scrolls horizontally. Below the summary cards, a three-band nominal phase-cycle diagram shows east-west, Node A north-south, and Node B north-south timing, outlined all-red intervals, a wrapping time marker, and authoritative live-state dots that expose priority or discharge divergence. Its Session Trends tab samples only advancing LIVE frames into bounded process memory and plots occupancy, queue pressure, and congestion without creating a history file; reset, manual clear, or dashboard close discards the samples.
+The exporter builds schema-versioned per-node state, exports the controller's exact normal signal timing, separates pending/active/clearing priority, exports per-source congestion demand and the complete network-discharge status, and atomically replaces a source-relative JSON file. The dashboard validates that schema, distinguishes LIVE/PAUSED/STALE/ERROR, always reschedules polling, displays road/demand queues and active/pending grants separately, renders each node independently, and shows the recovery selection, status, reason, recommendation, stage, and discharge count. Both notebook tabs are scrollbar-free and responsive: debounced resize handling scales fonts, cards, diagrams, and charts to the available window, while a uniform 3-by-3 grid keeps all summary metric cards equal. Below the summary cards, a three-band nominal phase-cycle diagram shows east-west, Node A north-south, and Node B north-south timing, outlined all-red intervals, a wrapping time marker, and authoritative live-state dots that expose priority or discharge divergence. Its Session Trends tab samples only advancing LIVE frames into bounded process memory and plots occupancy, queue pressure, and congestion without creating a history file; reset, manual clear, or dashboard close discards the samples.
 
 ### Full source: `telemetry_exporter.py`
 
@@ -3786,6 +4486,7 @@ from vehicle import Bus
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
+CAR_OCCUPANCY = 4
 
 
 class TelemetryExporter:
@@ -3793,6 +4494,9 @@ class TelemetryExporter:
         self.filename = Path(filename).resolve()
         self.export_interval = max(1, int(export_interval_frames))
         self.frame_counter = 0
+        self._throughput_samples = []
+        self._trend_window_seconds = 30.0
+        self._last_total_served = 0
 
     def compute_queue_counts(self, vehicles):
         queues = {"EB": 0, "WB": 0, "A_NB": 0, "A_SB": 0, "B_NB": 0, "B_SB": 0}
@@ -3836,6 +4540,11 @@ class TelemetryExporter:
         distance = bus.distance_to_node_stop_bar(
             target_node, canvas.H_Y, canvas.ROAD_W, canvas.STOP
         )
+        free_flow_speed = max(getattr(bus, "max_speed", 1.0), 1e-6)
+        eta_frames_freeflow = distance / free_flow_speed if distance > 0 else 0.0
+        live_speed = max(bus.speed, 1e-6)
+        eta_frames_live = distance / live_speed if distance > 0 else 0.0
+        eta_frames_live = min(eta_frames_live, 6000.0)
         live_cfg = control_panel.bus_routes_config.get(bus.route_id, bus.route_info)
         priority = signal_controller.get_priority_status_for_bus(bus, target_node)
         latest_terminal = signal_controller.get_latest_terminal_status_for_bus(bus)
@@ -3858,6 +4567,8 @@ class TelemetryExporter:
             "passengers": bus.passengers,
             "target_node_x": target_node,
             "distance_to_stop_bar_px": round(distance, 1),
+            "eta_to_stop_bar_sec_freeflow": round(eta_frames_freeflow / 60.0, 2),
+            "eta_to_stop_bar_sec_live": round(eta_frames_live / 60.0, 2),
             "target_turn": bus.target_turn,
             "route_leg": leg,
             "leg_state": bus.leg_state,
@@ -3877,10 +4588,20 @@ class TelemetryExporter:
         }
 
     def build_payload(
-        self, signal_controller, vehicles, frame_number, demand_state=None
+        self,
+        signal_controller,
+        vehicles,
+        frame_number,
+        demand_state=None,
+        throughput_state=None,
     ):
         queues = self.compute_queue_counts(vehicles)
+        queues_passengers = {
+            approach: vehicle_count * CAR_OCCUPANCY
+            for approach, vehicle_count in queues.items()
+        }
         demand_state = demand_state or {}
+        throughput_state = throughput_state or {}
         pending_demand = sum(
             int(item.get("pending_arrivals", 0))
             for item in demand_state.values()
@@ -3891,6 +4612,38 @@ class TelemetryExporter:
             for vehicle in vehicles
             if isinstance(vehicle, Bus)
         ]
+        routes_block = {}
+        for route_id, route_config in control_panel.bus_routes_config.items():
+            route_buses = [bus for bus in buses if bus["route_id"] == route_id]
+            nearest = None
+            if route_buses:
+                nearest = min(
+                    route_buses,
+                    key=lambda bus: bus["eta_to_stop_bar_sec_freeflow"],
+                )
+            routes_block[route_id] = {
+                "route_name": route_config.get("name", route_id),
+                "active": bool(route_config.get("active", False)),
+                "tsp_enabled": bool(route_config.get("tsp_enabled", False)),
+                "dbl_enabled": bool(route_config.get("dbl_enabled", False)),
+                "buses_on_route": len(route_buses),
+                "route_passengers_total": sum(
+                    int(bus["passengers"]) for bus in route_buses
+                ),
+                "nearest_bus_id": nearest["bus_id"] if nearest else None,
+                "nearest_bus_eta_sec": (
+                    nearest["eta_to_stop_bar_sec_freeflow"] if nearest else None
+                ),
+                "nearest_bus_target_node_x": (
+                    nearest["target_node_x"] if nearest else None
+                ),
+                "nearest_bus_priority_granted": (
+                    bool(nearest["priority_granted"]) if nearest else False
+                ),
+                "nearest_bus_priority_pending": (
+                    bool(nearest["priority_transitioning"]) if nearest else False
+                ),
+            }
         approaching = [
             bus
             for bus in buses
@@ -3909,11 +4662,35 @@ class TelemetryExporter:
         yellow_frames = signal_controller.yellow_time
         all_red_frames = signal_controller.red_clearance_time
         discharge_status = signal_controller.get_discharge_status()
+
+        simulation_seconds = frame_number / 60.0
+        total_served = int(throughput_state.get("passengers_served_total", 0))
+        if total_served < self._last_total_served:
+            self._throughput_samples.clear()
+        self._last_total_served = total_served
+
+        sample = (simulation_seconds, total_served)
+        if not self._throughput_samples or self._throughput_samples[-1] != sample:
+            self._throughput_samples.append(sample)
+        cutoff = simulation_seconds - self._trend_window_seconds
+        self._throughput_samples = [
+            item for item in self._throughput_samples if item[0] >= cutoff
+        ]
+        recent_rate = 0.0
+        if len(self._throughput_samples) >= 2:
+            start_seconds, start_passengers = self._throughput_samples[0]
+            end_seconds, end_passengers = self._throughput_samples[-1]
+            elapsed_minutes = (end_seconds - start_seconds) / 60.0
+            if elapsed_minutes > 1e-6:
+                recent_rate = (
+                    end_passengers - start_passengers
+                ) / elapsed_minutes
+
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "timestamp": round(time.time(), 3),
             "frame_number": frame_number,
-            "simulation_time_seconds": round(frame_number / 60.0, 3),
+            "simulation_time_seconds": round(simulation_seconds, 3),
             "simulation_paused": bool(control_panel.global_config.get("is_paused", False)),
             "simulation_speed": float(control_panel.global_config.get("sim_speed", 1.0)),
             "signal_state": {
@@ -3936,22 +4713,53 @@ class TelemetryExporter:
                     int(getattr(vehicle, "passengers", 0)) for vehicle in vehicles
                 ),
                 "queues": queues,
+                "queues_passengers_est": queues_passengers,
+                "car_occupancy_assumed": CAR_OCCUPANCY,
                 "pending_demand": pending_demand,
             },
+            "network_throughput": {
+                "passengers_served_total": total_served,
+                "passengers_served_bus": int(
+                    throughput_state.get("passengers_served_bus", 0)
+                ),
+                "passengers_served_car": int(
+                    throughput_state.get("passengers_served_car", 0)
+                ),
+                "vehicles_served_total": int(
+                    throughput_state.get("vehicles_served_total", 0)
+                ),
+                "buses_served": int(throughput_state.get("buses_served", 0)),
+                "cars_served": int(throughput_state.get("cars_served", 0)),
+                "passengers_per_minute": round(
+                    total_served / max(simulation_seconds / 60.0, 1e-9), 1
+                ),
+                "passengers_per_minute_recent": round(recent_rate, 1),
+                "trend_window_seconds": self._trend_window_seconds,
+            },
             "demand_generation": demand_state,
+            "routes": routes_block,
             "active_buses": buses,
             "approaching_buses": approaching,
         }
 
     def export(
-        self, signal_controller, vehicles, frame_number, demand_state=None
+        self,
+        signal_controller,
+        vehicles,
+        frame_number,
+        demand_state=None,
+        throughput_state=None,
     ):
         self.frame_counter += 1
         if self.frame_counter % self.export_interval != 0:
             return False
 
         payload = self.build_payload(
-            signal_controller, vehicles, frame_number, demand_state=demand_state
+            signal_controller,
+            vehicles,
+            frame_number,
+            demand_state=demand_state,
+            throughput_state=throughput_state,
         )
         self.filename.parent.mkdir(parents=True, exist_ok=True)
         temp_name = None
@@ -4019,10 +4827,9 @@ HISTORY_MAX_POINTS = 600
 WINDOW_DEFAULT_WIDTH = 900
 WINDOW_DEFAULT_HEIGHT = 780
 WINDOW_MIN_WIDTH = 480
-WINDOW_MIN_HEIGHT = 360
+WINDOW_MIN_HEIGHT = 500
 WINDOW_SCREEN_MARGIN_X = 80
 WINDOW_SCREEN_MARGIN_Y = 140
-DASHBOARD_CONTENT_MIN_WIDTH = 720
 
 
 class TelemetryDashboard:
@@ -4037,10 +4844,13 @@ class TelemetryDashboard:
         self.root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.root.resizable(True, True)
         self.root.configure(bg=COLOR_BG)
+        self._resize_after_id = None
         self.initialize_history_state()
         self.latest_telemetry = None
         self.last_read_error = None
         self.build_ui()
+        self.root.bind("<Configure>", self.schedule_responsive_layout, add="+")
+        self.root.after_idle(self.apply_responsive_layout)
         self.poll_telemetry()
 
     @staticmethod
@@ -4081,13 +4891,14 @@ class TelemetryDashboard:
     def build_ui(self):
         header = tk.Frame(self.root, bg=COLOR_BG)
         header.pack(fill="x", padx=20, pady=(15, 10))
-        tk.Label(
+        self.header_title_lbl = tk.Label(
             header,
             text="LIVE TELEMETRY DASHBOARD",
             font=(FONT_FAMILY, 16, "bold"),
             bg=COLOR_BG,
             fg=COLOR_TEXT_PRIMARY,
-        ).pack(side="left")
+        )
+        self.header_title_lbl.pack(side="left")
         self.status_lbl = tk.Label(
             header,
             text="WAITING FOR DATA",
@@ -4109,51 +4920,52 @@ class TelemetryDashboard:
             style="Telemetry.TNotebook",
         )
         self.notebook.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-        self.scroll_canvases = {}
-        (
-            self.summary_tab,
-            self.summary_content,
-            self.summary_scroll_canvas,
-        ) = self.create_scrollable_tab()
-        (
-            self.trends_tab,
-            self.trends_content,
-            self.trends_scroll_canvas,
-        ) = self.create_scrollable_tab()
+        self.summary_tab, self.summary_content = self.create_responsive_tab()
+        self.trends_tab, self.trends_content = self.create_responsive_tab()
         self.notebook.add(self.summary_tab, text="SUMMARY")
         self.notebook.add(self.trends_tab, text="SESSION TRENDS")
-        self.scroll_canvases[str(self.summary_tab)] = self.summary_scroll_canvas
-        self.scroll_canvases[str(self.trends_tab)] = self.trends_scroll_canvas
-        self.root.bind("<MouseWheel>", self.on_mousewheel, add="+")
-        self.root.bind("<Button-4>", self.on_mousewheel, add="+")
-        self.root.bind("<Button-5>", self.on_mousewheel, add="+")
 
         self.metrics_frame = tk.Frame(self.summary_content, bg=COLOR_BG)
         self.metrics_frame.pack(fill="x", padx=20, pady=5)
         self.vars = {}
+        self.metric_cards = []
+        self.metric_title_labels = []
         metrics_layout = [
             [("Active Vehicles", "vehicles"), ("Active Buses", "buses"), ("Passenger Vol", "passengers")],
             [("Road/Demand Queue", "queued"), ("Avg Queue (20s)", "delay"), ("Congestion", "congestion")],
             [("TSP Active/Pending", "tsp"), ("DBL Active/Pending", "dbl"), ("Sim Timer", "timer")],
         ]
-        for row in metrics_layout:
-            row_frame = tk.Frame(self.metrics_frame, bg=COLOR_BG)
-            row_frame.pack(fill="x", pady=5)
-            for title, key in row:
+        for column_index in range(3):
+            self.metrics_frame.grid_columnconfigure(
+                column_index, weight=1, uniform="summary_metric_columns"
+            )
+        for row_index, row in enumerate(metrics_layout):
+            self.metrics_frame.grid_rowconfigure(
+                row_index, weight=1, uniform="summary_metric_rows"
+            )
+            for column_index, (title, key) in enumerate(row):
                 card = tk.Frame(
-                    row_frame,
+                    self.metrics_frame,
                     bg=COLOR_CARD,
                     highlightbackground=COLOR_CARD_BORDER,
                     highlightthickness=1,
                 )
-                card.pack(side="left", fill="x", expand=True, padx=5)
-                tk.Label(
+                card.grid(
+                    row=row_index,
+                    column=column_index,
+                    sticky="nsew",
+                    padx=5,
+                    pady=5,
+                )
+                title_label = tk.Label(
                     card,
                     text=title,
                     font=(FONT_FAMILY, 9, "bold"),
                     bg=COLOR_CARD,
                     fg=COLOR_TEXT_SECONDARY,
-                ).pack(anchor="w", padx=10, pady=(10, 0))
+                    anchor="w",
+                )
+                title_label.pack(fill="x", padx=10, pady=(8, 0))
                 value = tk.Label(
                     card,
                     text="--",
@@ -4161,7 +4973,9 @@ class TelemetryDashboard:
                     bg=COLOR_CARD,
                     fg=COLOR_ACCENT,
                 )
-                value.pack(anchor="w", padx=10, pady=(0, 10))
+                value.pack(fill="x", anchor="w", padx=10, pady=(0, 8))
+                self.metric_cards.append(card)
+                self.metric_title_labels.append(title_label)
                 self.vars[key] = value
 
         recovery_card = tk.Frame(
@@ -4171,13 +4985,14 @@ class TelemetryDashboard:
             highlightthickness=1,
         )
         recovery_card.pack(fill="x", padx=25, pady=(7, 3))
-        tk.Label(
+        self.recovery_title_lbl = tk.Label(
             recovery_card,
             text="NETWORK GRIDLOCK RECOVERY",
             font=(FONT_FAMILY, 9, "bold"),
             bg=COLOR_CARD,
             fg=COLOR_DANGER,
-        ).pack(anchor="w", padx=10, pady=(6, 1))
+        )
+        self.recovery_title_lbl.pack(anchor="w", padx=10, pady=(6, 1))
         self.discharge_selected_lbl = tk.Label(
             recovery_card,
             text="Selected: Auto (Recommended)",
@@ -4219,95 +5034,213 @@ class TelemetryDashboard:
 
         self.build_phase_cycle_ui()
 
-        tk.Label(
+        self.intersection_title_lbl = tk.Label(
             self.summary_content,
             text="INTERSECTION PHASE STATES",
             font=(FONT_FAMILY, 11, "bold"),
             bg=COLOR_BG,
             fg=COLOR_TEXT_PRIMARY,
-        ).pack(anchor="w", padx=20, pady=(15, 5))
+        )
+        self.intersection_title_lbl.pack(anchor="w", padx=20, pady=(10, 3))
         diagram_frame = tk.Frame(self.summary_content, bg=COLOR_BG)
         diagram_frame.pack(fill="both", expand=True, padx=20, pady=5)
+        self.diagram_frame = diagram_frame
+        self.diagram_frame.grid_rowconfigure(0, weight=1)
+        self.diagram_frame.grid_columnconfigure(
+            0, weight=1, uniform="intersection_node_columns"
+        )
+        self.diagram_frame.grid_columnconfigure(
+            1, weight=1, uniform="intersection_node_columns"
+        )
+        self.node_title_labels = []
         self.node_a_canvas = self.create_node_canvas(diagram_frame, "NODE A (x=300)")
-        self.node_a_canvas.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        self.node_a_canvas.master.grid(
+            row=0, column=0, sticky="nsew", padx=(0, 5)
+        )
         self.node_b_canvas = self.create_node_canvas(diagram_frame, "NODE B (x=700)")
-        self.node_b_canvas.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        self.node_b_canvas.master.grid(
+            row=0, column=1, sticky="nsew", padx=(5, 0)
+        )
+        self.node_a_canvas.bind(
+            "<Configure>", lambda _event: self.draw_node_intersections()
+        )
+        self.node_b_canvas.bind(
+            "<Configure>", lambda _event: self.draw_node_intersections()
+        )
         self.build_trends_ui()
 
-    def create_scrollable_tab(self):
-        """Return a notebook tab with two-axis scrolling and a content frame."""
+    def create_responsive_tab(self):
+        """Return a tab whose content reflows with the available window size."""
         tab = tk.Frame(self.notebook, bg=COLOR_BG)
-        tab.grid_rowconfigure(0, weight=1)
-        tab.grid_columnconfigure(0, weight=1)
+        content = tk.Frame(tab, bg=COLOR_BG)
+        content.pack(fill="both", expand=True)
+        return tab, content
 
-        viewport = tk.Canvas(
-            tab,
-            bg=COLOR_BG,
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        vertical = ttk.Scrollbar(tab, orient="vertical", command=viewport.yview)
-        horizontal = ttk.Scrollbar(tab, orient="horizontal", command=viewport.xview)
-        viewport.configure(
-            yscrollcommand=vertical.set,
-            xscrollcommand=horizontal.set,
-        )
-        viewport.grid(row=0, column=0, sticky="nsew")
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
+    @staticmethod
+    def responsive_profile(width, height):
+        """Return bounded dimensions and fonts for the current client area."""
+        width = max(WINDOW_MIN_WIDTH, int(width))
+        height = max(WINDOW_MIN_HEIGHT, int(height))
+        scale = max(0.60, min(1.0, min(width / 900.0, height / 780.0)))
+        compact = width < 700 or height < 700
+        return {
+            "compact": compact,
+            "header_font": max(11, round(16 * scale)),
+            "status_font": max(8, round(10 * scale)),
+            "section_font": max(8, round(11 * scale)),
+            "metric_title_font": max(6, round(9 * scale)),
+            "metric_value_font": max(11, min(16, round(18 * scale))),
+            "detail_font": max(6, round(8 * scale)),
+            "metric_row_height": max(34, min(58, round(height * 0.07))),
+            "phase_height": max(35, min(85, round(height * 0.11))),
+            "node_height": max(45, min(100, round(height * 0.13))),
+            "chart_height": max(72, min(150, round((height - 165) / 3))),
+            "wraplength": max(310, width - 92),
+        }
 
-        content = tk.Frame(viewport, bg=COLOR_BG)
-        window_id = viewport.create_window((0, 0), window=content, anchor="nw")
-        content.bind(
-            "<Configure>",
-            lambda _event, canvas=viewport: self.update_scroll_region(canvas),
+    def schedule_responsive_layout(self, event=None):
+        """Debounce resize work so dragging a window edge remains fluid."""
+        if event is not None and event.widget is not self.root:
+            return
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.root.after(35, self.apply_responsive_layout)
+
+    def apply_responsive_layout(self, width=None, height=None):
+        """Scale dashboard content to the window instead of exposing scrollbars."""
+        self._resize_after_id = None
+        width = self.root.winfo_width() if width is None else width
+        height = self.root.winfo_height() if height is None else height
+        profile = self.responsive_profile(width, height)
+        compact = profile["compact"]
+
+        self.header_title_lbl.config(
+            font=(FONT_FAMILY, profile["header_font"], "bold")
         )
-        viewport.bind(
-            "<Configure>",
-            lambda event, canvas=viewport, item=window_id: self.resize_scroll_content(
-                canvas, item, event.width
+        self.status_lbl.config(
+            font=(FONT_FAMILY, profile["status_font"], "bold")
+        )
+        self.header_title_lbl.master.pack_configure(
+            padx=10 if compact else 20,
+            pady=(6, 4) if compact else (15, 10),
+        )
+        self.notebook.pack_configure(
+            padx=6 if compact else 14,
+            pady=(0, 6 if compact else 12),
+        )
+
+        metric_pad = 1 if compact else 3
+        self.metrics_frame.pack_configure(
+            padx=8 if compact else 20,
+            pady=2 if compact else 5,
+        )
+        for row_index in range(3):
+            self.metrics_frame.grid_rowconfigure(
+                row_index,
+                weight=1,
+                uniform="summary_metric_rows",
+                minsize=profile["metric_row_height"],
+            )
+        for card, title_label in zip(self.metric_cards, self.metric_title_labels):
+            card.grid_configure(padx=metric_pad, pady=metric_pad)
+            title_label.config(
+                font=(FONT_FAMILY, profile["metric_title_font"], "bold")
+            )
+            title_label.pack_configure(
+                padx=5 if compact else 10,
+                pady=(1 if compact else 4, 0),
+            )
+        for value_label in self.vars.values():
+            value_label.config(
+                font=(FONT_FAMILY, profile["metric_value_font"], "bold")
+            )
+            value_label.pack_configure(
+                padx=5 if compact else 10,
+                pady=(0, 1 if compact else 4),
+            )
+
+        detail_font = (FONT_FAMILY, profile["detail_font"])
+        detail_bold_font = (FONT_FAMILY, profile["detail_font"], "bold")
+        self.recovery_title_lbl.config(font=detail_bold_font)
+        self.discharge_selected_lbl.config(font=detail_bold_font)
+        self.discharge_status_lbl.config(font=detail_bold_font)
+        self.discharge_reason_lbl.config(
+            font=detail_font,
+            wraplength=profile["wraplength"],
+        )
+        self.discharge_recommendation_lbl.config(
+            font=detail_font,
+            wraplength=profile["wraplength"],
+        )
+        self.recovery_title_lbl.master.pack_configure(
+            padx=10 if compact else 25,
+            pady=(3, 2) if compact else (7, 3),
+        )
+        self.recovery_title_lbl.pack_configure(pady=(3 if compact else 6, 0))
+        self.discharge_recommendation_lbl.pack_configure(
+            pady=(0, 3 if compact else 6)
+        )
+
+        self.phase_title_lbl.config(
+            font=(FONT_FAMILY, max(8, profile["section_font"] - 1), "bold")
+        )
+        self.phase_hint_lbl.config(
+            text=(
+                "Nominal cycle | live dots"
+                if compact
+                else "Nominal plan | marker repeats | dots show live state"
             ),
+            font=(FONT_FAMILY, profile["detail_font"]),
         )
-        return tab, content, viewport
+        self.phase_status_lbl.config(font=detail_bold_font, width=16 if compact else 18)
+        self.phase_heading.pack_configure(
+            padx=6 if compact else 10,
+            pady=(2, 0) if compact else (7, 0),
+        )
+        self.phase_cycle_canvas.config(height=profile["phase_height"])
+        self.phase_cycle_canvas.master.pack_configure(
+            padx=10 if compact else 25,
+            pady=(3, 2) if compact else (10, 3),
+        )
 
-    @staticmethod
-    def update_scroll_region(canvas):
-        """Keep both scrollbars synchronized with the complete content area."""
-        bounds = canvas.bbox("all")
-        if bounds:
-            canvas.configure(scrollregion=bounds)
+        self.intersection_title_lbl.config(
+            font=(FONT_FAMILY, profile["section_font"], "bold")
+        )
+        self.intersection_title_lbl.pack_configure(
+            padx=10 if compact else 20,
+            pady=(3, 1) if compact else (10, 3),
+        )
+        self.diagram_frame.pack_configure(
+            padx=10 if compact else 20,
+            pady=2 if compact else 5,
+        )
+        for title_label in self.node_title_labels:
+            title_label.config(
+                font=(FONT_FAMILY, max(8, profile["section_font"] - 1), "bold")
+            )
+            title_label.pack_configure(pady=(3 if compact else 10, 0))
+        self.node_a_canvas.config(height=profile["node_height"])
+        self.node_b_canvas.config(height=profile["node_height"])
 
-    def resize_scroll_content(self, canvas, window_id, viewport_width):
-        """Fill wide viewports, retaining a scrollable minimum on narrow ones."""
-        content_width = max(DASHBOARD_CONTENT_MIN_WIDTH, int(viewport_width))
-        canvas.itemconfigure(window_id, width=content_width)
-        self.update_scroll_region(canvas)
+        self.trends_info_lbl.config(
+            text=(
+                "IN MEMORY ONLY  |  Session data clears on reset/close"
+                if compact
+                else "IN MEMORY ONLY  |  Up to 1 sample per simulated second  |  "
+                f"Latest {HISTORY_MAX_POINTS} samples  |  Clears on reset/close"
+            ),
+            font=(FONT_FAMILY, profile["detail_font"]),
+        )
+        self.clear_history_btn.config(font=detail_bold_font)
+        for chart in self.trend_charts:
+            chart["title_label"].config(
+                font=(FONT_FAMILY, profile["metric_title_font"], "bold")
+            )
+            chart["canvas"].config(height=profile["chart_height"])
 
-    @staticmethod
-    def mousewheel_units(event):
-        """Normalize Windows/macOS wheel deltas and Linux wheel buttons."""
-        delta = int(getattr(event, "delta", 0) or 0)
-        if delta:
-            steps = max(1, abs(delta) // 120)
-            return -steps if delta > 0 else steps
-        button = getattr(event, "num", None)
-        if button == 4:
-            return -1
-        if button == 5:
-            return 1
-        return 0
-
-    def on_mousewheel(self, event):
-        """Scroll the selected tab; Shift+wheel scrolls horizontally."""
-        canvas = self.scroll_canvases.get(self.notebook.select())
-        units = self.mousewheel_units(event)
-        if canvas is None or units == 0:
-            return None
-        if int(getattr(event, "state", 0) or 0) & 0x0001:
-            canvas.xview_scroll(units, "units")
-        else:
-            canvas.yview_scroll(units, "units")
-        return "break"
+        self.draw_phase_cycle(self.latest_telemetry)
+        self.draw_node_intersections()
+        self.draw_trend_charts()
 
     def build_phase_cycle_ui(self):
         card = tk.Frame(
@@ -4319,13 +5252,15 @@ class TelemetryDashboard:
         card.pack(fill="x", padx=25, pady=(10, 3))
         heading = tk.Frame(card, bg=COLOR_CARD)
         heading.pack(fill="x", padx=10, pady=(7, 0))
-        tk.Label(
+        self.phase_heading = heading
+        self.phase_title_lbl = tk.Label(
             heading,
             text="SIGNAL PHASE CYCLE",
             font=(FONT_FAMILY, 10, "bold"),
             bg=COLOR_CARD,
             fg=COLOR_TEXT_PRIMARY,
-        ).pack(side="left")
+        )
+        self.phase_title_lbl.pack(side="left")
         self.phase_status_lbl = tk.Label(
             heading,
             text="WAITING",
@@ -4336,13 +5271,14 @@ class TelemetryDashboard:
             fg=COLOR_WARNING,
         )
         self.phase_status_lbl.pack(side="right")
-        tk.Label(
+        self.phase_hint_lbl = tk.Label(
             heading,
-            text="Nominal plan • marker repeats • dots show live state",
+            text="Nominal plan | marker repeats | dots show live state",
             font=(FONT_FAMILY, 8),
             bg=COLOR_CARD,
             fg=COLOR_TEXT_SECONDARY,
-        ).pack(side="right", padx=(10, 12))
+        )
+        self.phase_hint_lbl.pack(side="right", padx=(10, 12))
         self.phase_cycle_canvas = tk.Canvas(
             card,
             bg=COLOR_CARD,
@@ -4358,7 +5294,7 @@ class TelemetryDashboard:
     def build_trends_ui(self):
         controls = tk.Frame(self.trends_content, bg=COLOR_BG)
         controls.pack(fill="x", padx=20, pady=(12, 6))
-        tk.Label(
+        self.trends_info_lbl = tk.Label(
             controls,
             text=(
                 "IN MEMORY ONLY  |  Up to 1 sample per simulated second  |  "
@@ -4367,8 +5303,9 @@ class TelemetryDashboard:
             font=(FONT_FAMILY, 9),
             bg=COLOR_BG,
             fg=COLOR_TEXT_SECONDARY,
-        ).pack(side="left")
-        tk.Button(
+        )
+        self.trends_info_lbl.pack(side="left")
+        self.clear_history_btn = tk.Button(
             controls,
             text="CLEAR HISTORY",
             command=self.clear_history,
@@ -4380,7 +5317,8 @@ class TelemetryDashboard:
             relief="flat",
             padx=10,
             pady=4,
-        ).pack(side="right")
+        )
+        self.clear_history_btn.pack(side="right")
 
         charts = tk.Frame(self.trends_content, bg=COLOR_BG)
         charts.pack(fill="both", expand=True, padx=20, pady=(0, 12))
@@ -4416,13 +5354,14 @@ class TelemetryDashboard:
             highlightthickness=1,
         )
         card.pack(fill="both", expand=True, pady=5)
-        tk.Label(
+        title_label = tk.Label(
             card,
             text=title,
             font=(FONT_FAMILY, 9, "bold"),
             bg=COLOR_CARD,
             fg=COLOR_TEXT_SECONDARY,
-        ).pack(anchor="w", padx=10, pady=(7, 0))
+        )
+        title_label.pack(anchor="w", padx=10, pady=(7, 0))
         canvas = tk.Canvas(
             card,
             bg=COLOR_CARD,
@@ -4434,6 +5373,7 @@ class TelemetryDashboard:
             "canvas": canvas,
             "series": series,
             "fixed_max": fixed_max,
+            "title_label": title_label,
         }
         self.trend_charts.append(chart)
         canvas.bind("<Configure>", lambda _event: self.draw_trend_charts())
@@ -4446,14 +5386,22 @@ class TelemetryDashboard:
             highlightbackground=COLOR_CARD_BORDER,
             highlightthickness=1,
         )
-        tk.Label(
+        title_label = tk.Label(
             card,
             text=title,
             font=(FONT_FAMILY, 10, "bold"),
             bg=COLOR_CARD,
             fg=COLOR_TEXT_SECONDARY,
-        ).pack(pady=(10, 0))
-        canvas = tk.Canvas(card, bg=COLOR_CARD, highlightthickness=0, height=135)
+        )
+        title_label.pack(pady=(10, 0))
+        self.node_title_labels.append(title_label)
+        canvas = tk.Canvas(
+            card,
+            bg=COLOR_CARD,
+            highlightthickness=0,
+            width=1,
+            height=135,
+        )
         canvas.pack(fill="both", expand=True)
         return canvas
 
@@ -4504,7 +5452,7 @@ class TelemetryDashboard:
         canvas = self.phase_cycle_canvas
         canvas.delete("all")
         width, height = canvas.winfo_width(), canvas.winfo_height()
-        if width < 260 or height < 100:
+        if width < 240 or height < 45:
             return
         if not data:
             if hasattr(self, "phase_status_lbl"):
@@ -4522,14 +5470,18 @@ class TelemetryDashboard:
         timing = signal_state.get("timing", {})
         cycle_frames, segment_map = self.build_nominal_phase_segments(timing)
         frames_per_second = max(1, int(timing.get("frames_per_second", 60)))
-        left, right, top, bottom = 142, 14, 25, 25
+        compact_chart = width < 650 or height < 90
+        left = 82 if compact_chart else 142
+        right = 8 if compact_chart else 14
+        top = 15 if compact_chart else 25
+        bottom = 10 if compact_chart else 25
         plot_width = max(1, width - left - right)
-        row_gap = 5
-        row_height = max(12, (height - top - bottom - 2 * row_gap) / 3)
+        row_gap = 2 if compact_chart else 5
+        row_height = max(7, (height - top - bottom - 2 * row_gap) / 3)
         rows = (
-            ("EW", "EAST–WEST CORRIDOR"),
-            ("NS_A", "NORTH–SOUTH NODE A"),
-            ("NS_B", "NORTH–SOUTH NODE B"),
+            ("EW", "E-W" if compact_chart else "EAST-WEST CORRIDOR"),
+            ("NS_A", "N-S NODE A" if compact_chart else "NORTH-SOUTH NODE A"),
+            ("NS_B", "N-S NODE B" if compact_chart else "NORTH-SOUTH NODE B"),
         )
         state_colors = {
             "GREEN": COLOR_SUCCESS,
@@ -4552,7 +5504,7 @@ class TelemetryDashboard:
                 text=row_label,
                 anchor="e",
                 fill=COLOR_TEXT_SECONDARY,
-                font=(FONT_FAMILY, 8, "bold"),
+                font=(FONT_FAMILY, 6 if compact_chart else 8, "bold"),
             )
             for start, end, state in segment_map[row_key]:
                 canvas.create_rectangle(
@@ -4583,13 +5535,14 @@ class TelemetryDashboard:
                 dash=(3, 2),
                 width=1,
             )
-            canvas.create_text(
-                (frame_x(start) + frame_x(end)) / 2,
-                9,
-                text="ALL RED",
-                fill=COLOR_TEXT_SECONDARY,
-                font=(FONT_FAMILY, 7, "bold"),
-            )
+            if not compact_chart:
+                canvas.create_text(
+                    (frame_x(start) + frame_x(end)) / 2,
+                    9,
+                    text="ALL RED",
+                    fill=COLOR_TEXT_SECONDARY,
+                    font=(FONT_FAMILY, 7, "bold"),
+                )
 
         boundaries = sorted(
             {
@@ -4602,7 +5555,8 @@ class TelemetryDashboard:
                 cycle_frames,
             }
         )
-        for boundary in boundaries:
+        displayed_boundaries = (0, cycle_frames) if compact_chart else boundaries
+        for boundary in displayed_boundaries:
             x = frame_x(boundary)
             canvas.create_line(x, chart_bottom + 2, x, chart_bottom + 5, fill=COLOR_TEXT_SECONDARY)
             canvas.create_text(
@@ -4695,13 +5649,36 @@ class TelemetryDashboard:
         if hasattr(self, "phase_status_lbl"):
             self.phase_status_lbl.config(text=status_text, fg=status_color)
 
+    def draw_node_intersections(self):
+        """Redraw both live node diagrams after telemetry or geometry changes."""
+        data = self.latest_telemetry or {}
+        signal_state = data.get("signal_state", {})
+        nodes = signal_state.get("nodes", {})
+        fallback = signal_state.get("current_phase", "UNKNOWN")
+        node_a = nodes.get("300", {})
+        node_b = nodes.get("700", {})
+        self.draw_intersection(
+            self.node_a_canvas,
+            "A",
+            node_a.get("phase", fallback),
+            node_a.get("signals"),
+        )
+        self.draw_intersection(
+            self.node_b_canvas,
+            "B",
+            node_b.get("phase", fallback),
+            node_b.get("signals"),
+        )
+
     def draw_intersection(self, canvas, node_key, phase, signals=None):
         canvas.delete("all")
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width < 10 or height < 10:
             return
         center_x, center_y = width // 2, height // 2
-        road_w = 40
+        shortest_side = min(width, height)
+        road_w = max(14, min(40, int(shortest_side * 0.38)))
+        signal_offset = max(9, min(40, int(shortest_side * 0.32)))
         canvas.create_rectangle(0, center_y - road_w // 2, width, center_y + road_w // 2, fill="#333D50", outline="")
         canvas.create_rectangle(center_x - road_w // 2, 0, center_x + road_w // 2, height, fill="#333D50", outline="")
         ew_color, ns_color = COLOR_DANGER, COLOR_DANGER
@@ -4726,12 +5703,13 @@ class TelemetryDashboard:
         wb_color = color_by_state.get(signals.get("WB"), ew_color)
         nb_color = color_by_state.get(signals.get("NB"), ns_color)
         sb_color = color_by_state.get(signals.get("SB"), ns_color)
-        radius = 8
-        canvas.create_oval(center_x - road_w - radius, center_y - radius, center_x - road_w + radius, center_y + radius, fill=eb_color)
-        canvas.create_oval(center_x + road_w - radius, center_y - radius, center_x + road_w + radius, center_y + radius, fill=wb_color)
-        canvas.create_oval(center_x - radius, center_y - road_w - radius, center_x + radius, center_y - road_w + radius, fill=nb_color)
-        canvas.create_oval(center_x - radius, center_y + road_w - radius, center_x + radius, center_y + road_w + radius, fill=sb_color)
-        canvas.create_text(center_x, height - 15, text=phase.replace("_", " "), fill=COLOR_TEXT_PRIMARY, font=(FONT_FAMILY, 9, "bold"))
+        radius = max(4, min(8, int(shortest_side * 0.08)))
+        canvas.create_oval(center_x - signal_offset - radius, center_y - radius, center_x - signal_offset + radius, center_y + radius, fill=eb_color)
+        canvas.create_oval(center_x + signal_offset - radius, center_y - radius, center_x + signal_offset + radius, center_y + radius, fill=wb_color)
+        canvas.create_oval(center_x - radius, center_y - signal_offset - radius, center_x + radius, center_y - signal_offset + radius, fill=nb_color)
+        canvas.create_oval(center_x - radius, center_y + signal_offset - radius, center_x + radius, center_y + signal_offset + radius, fill=sb_color)
+        if height >= 55:
+            canvas.create_text(center_x, height - 12, text=phase.replace("_", " "), fill=COLOR_TEXT_PRIMARY, font=(FONT_FAMILY, 8 if height < 90 else 9, "bold"))
 
     def safe_read_telemetry(self):
         self.last_read_error = None
@@ -5025,16 +6003,11 @@ class TelemetryDashboard:
                 text=display["recommendation"]
             )
 
-        nodes = data.get("signal_state", {}).get("nodes", {})
-        fallback = data.get("signal_state", {}).get("current_phase", "UNKNOWN")
-        phase_a = nodes.get("300", {}).get("phase", fallback)
-        phase_b = nodes.get("700", {}).get("phase", fallback)
         self.latest_telemetry = data
         self.root.update_idletasks()
         if hasattr(self, "phase_cycle_canvas"):
             self.draw_phase_cycle(data)
-        self.draw_intersection(self.node_a_canvas, "A", phase_a, nodes.get("300", {}).get("signals"))
-        self.draw_intersection(self.node_b_canvas, "B", phase_b, nodes.get("700", {}).get("signals"))
+        self.draw_node_intersections()
 
     @staticmethod
     def format_discharge_status(status):

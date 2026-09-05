@@ -1,5 +1,11 @@
 # Traffic Simulator Audit and Step-by-Step Fix Report
 
+> **LLM scope notice (2026-09-05):** Statements below requiring the LLM controls
+> to remain placeholders document the earlier audit/fix scope. They were
+> intentionally superseded by the later Phase 2 guarded LLM integration. The
+> traffic-safety findings remain historical evidence; current AI behavior is
+> described in `README.md` and the live source.
+
 > [!IMPORTANT]
 > **Canonical current-state verdict (2026-09-03): the design decision is
 > closed.** The simulator uses one `SignalController` object as the network
@@ -50,7 +56,7 @@ order:
    because it is a distinct unresolved congestion investigation.
 
 The code-inclusive companion is the
-[Simulator Guide and Source Documentation](TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md).
+[Simulator Guide and Source Documentation](../TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md).
 
 Status chronology matters: an item described as open in the baseline evidence
 may be listed as fixed in a later completion or post-fix section. The newest

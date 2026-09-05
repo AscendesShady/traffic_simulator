@@ -28,10 +28,9 @@ HISTORY_MAX_POINTS = 600
 WINDOW_DEFAULT_WIDTH = 900
 WINDOW_DEFAULT_HEIGHT = 780
 WINDOW_MIN_WIDTH = 480
-WINDOW_MIN_HEIGHT = 360
+WINDOW_MIN_HEIGHT = 500
 WINDOW_SCREEN_MARGIN_X = 80
 WINDOW_SCREEN_MARGIN_Y = 140
-DASHBOARD_CONTENT_MIN_WIDTH = 720
 
 
 class TelemetryDashboard:
@@ -46,10 +45,13 @@ class TelemetryDashboard:
         self.root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.root.resizable(True, True)
         self.root.configure(bg=COLOR_BG)
+        self._resize_after_id = None
         self.initialize_history_state()
         self.latest_telemetry = None
         self.last_read_error = None
         self.build_ui()
+        self.root.bind("<Configure>", self.schedule_responsive_layout, add="+")
+        self.root.after_idle(self.apply_responsive_layout)
         self.poll_telemetry()
 
     @staticmethod
@@ -90,13 +92,14 @@ class TelemetryDashboard:
     def build_ui(self):
         header = tk.Frame(self.root, bg=COLOR_BG)
         header.pack(fill="x", padx=20, pady=(15, 10))
-        tk.Label(
+        self.header_title_lbl = tk.Label(
             header,
             text="LIVE TELEMETRY DASHBOARD",
             font=(FONT_FAMILY, 16, "bold"),
             bg=COLOR_BG,
             fg=COLOR_TEXT_PRIMARY,
-        ).pack(side="left")
+        )
+        self.header_title_lbl.pack(side="left")
         self.status_lbl = tk.Label(
             header,
             text="WAITING FOR DATA",
@@ -118,51 +121,52 @@ class TelemetryDashboard:
             style="Telemetry.TNotebook",
         )
         self.notebook.pack(fill="both", expand=True, padx=14, pady=(0, 12))
-        self.scroll_canvases = {}
-        (
-            self.summary_tab,
-            self.summary_content,
-            self.summary_scroll_canvas,
-        ) = self.create_scrollable_tab()
-        (
-            self.trends_tab,
-            self.trends_content,
-            self.trends_scroll_canvas,
-        ) = self.create_scrollable_tab()
+        self.summary_tab, self.summary_content = self.create_responsive_tab()
+        self.trends_tab, self.trends_content = self.create_responsive_tab()
         self.notebook.add(self.summary_tab, text="SUMMARY")
         self.notebook.add(self.trends_tab, text="SESSION TRENDS")
-        self.scroll_canvases[str(self.summary_tab)] = self.summary_scroll_canvas
-        self.scroll_canvases[str(self.trends_tab)] = self.trends_scroll_canvas
-        self.root.bind("<MouseWheel>", self.on_mousewheel, add="+")
-        self.root.bind("<Button-4>", self.on_mousewheel, add="+")
-        self.root.bind("<Button-5>", self.on_mousewheel, add="+")
 
         self.metrics_frame = tk.Frame(self.summary_content, bg=COLOR_BG)
         self.metrics_frame.pack(fill="x", padx=20, pady=5)
         self.vars = {}
+        self.metric_cards = []
+        self.metric_title_labels = []
         metrics_layout = [
             [("Active Vehicles", "vehicles"), ("Active Buses", "buses"), ("Passenger Vol", "passengers")],
             [("Road/Demand Queue", "queued"), ("Avg Queue (20s)", "delay"), ("Congestion", "congestion")],
             [("TSP Active/Pending", "tsp"), ("DBL Active/Pending", "dbl"), ("Sim Timer", "timer")],
         ]
-        for row in metrics_layout:
-            row_frame = tk.Frame(self.metrics_frame, bg=COLOR_BG)
-            row_frame.pack(fill="x", pady=5)
-            for title, key in row:
+        for column_index in range(3):
+            self.metrics_frame.grid_columnconfigure(
+                column_index, weight=1, uniform="summary_metric_columns"
+            )
+        for row_index, row in enumerate(metrics_layout):
+            self.metrics_frame.grid_rowconfigure(
+                row_index, weight=1, uniform="summary_metric_rows"
+            )
+            for column_index, (title, key) in enumerate(row):
                 card = tk.Frame(
-                    row_frame,
+                    self.metrics_frame,
                     bg=COLOR_CARD,
                     highlightbackground=COLOR_CARD_BORDER,
                     highlightthickness=1,
                 )
-                card.pack(side="left", fill="x", expand=True, padx=5)
-                tk.Label(
+                card.grid(
+                    row=row_index,
+                    column=column_index,
+                    sticky="nsew",
+                    padx=5,
+                    pady=5,
+                )
+                title_label = tk.Label(
                     card,
                     text=title,
                     font=(FONT_FAMILY, 9, "bold"),
                     bg=COLOR_CARD,
                     fg=COLOR_TEXT_SECONDARY,
-                ).pack(anchor="w", padx=10, pady=(10, 0))
+                    anchor="w",
+                )
+                title_label.pack(fill="x", padx=10, pady=(8, 0))
                 value = tk.Label(
                     card,
                     text="--",
@@ -170,7 +174,9 @@ class TelemetryDashboard:
                     bg=COLOR_CARD,
                     fg=COLOR_ACCENT,
                 )
-                value.pack(anchor="w", padx=10, pady=(0, 10))
+                value.pack(fill="x", anchor="w", padx=10, pady=(0, 8))
+                self.metric_cards.append(card)
+                self.metric_title_labels.append(title_label)
                 self.vars[key] = value
 
         recovery_card = tk.Frame(
@@ -180,13 +186,14 @@ class TelemetryDashboard:
             highlightthickness=1,
         )
         recovery_card.pack(fill="x", padx=25, pady=(7, 3))
-        tk.Label(
+        self.recovery_title_lbl = tk.Label(
             recovery_card,
             text="NETWORK GRIDLOCK RECOVERY",
             font=(FONT_FAMILY, 9, "bold"),
             bg=COLOR_CARD,
             fg=COLOR_DANGER,
-        ).pack(anchor="w", padx=10, pady=(6, 1))
+        )
+        self.recovery_title_lbl.pack(anchor="w", padx=10, pady=(6, 1))
         self.discharge_selected_lbl = tk.Label(
             recovery_card,
             text="Selected: Auto (Recommended)",
@@ -228,95 +235,213 @@ class TelemetryDashboard:
 
         self.build_phase_cycle_ui()
 
-        tk.Label(
+        self.intersection_title_lbl = tk.Label(
             self.summary_content,
             text="INTERSECTION PHASE STATES",
             font=(FONT_FAMILY, 11, "bold"),
             bg=COLOR_BG,
             fg=COLOR_TEXT_PRIMARY,
-        ).pack(anchor="w", padx=20, pady=(15, 5))
+        )
+        self.intersection_title_lbl.pack(anchor="w", padx=20, pady=(10, 3))
         diagram_frame = tk.Frame(self.summary_content, bg=COLOR_BG)
         diagram_frame.pack(fill="both", expand=True, padx=20, pady=5)
+        self.diagram_frame = diagram_frame
+        self.diagram_frame.grid_rowconfigure(0, weight=1)
+        self.diagram_frame.grid_columnconfigure(
+            0, weight=1, uniform="intersection_node_columns"
+        )
+        self.diagram_frame.grid_columnconfigure(
+            1, weight=1, uniform="intersection_node_columns"
+        )
+        self.node_title_labels = []
         self.node_a_canvas = self.create_node_canvas(diagram_frame, "NODE A (x=300)")
-        self.node_a_canvas.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        self.node_a_canvas.master.grid(
+            row=0, column=0, sticky="nsew", padx=(0, 5)
+        )
         self.node_b_canvas = self.create_node_canvas(diagram_frame, "NODE B (x=700)")
-        self.node_b_canvas.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        self.node_b_canvas.master.grid(
+            row=0, column=1, sticky="nsew", padx=(5, 0)
+        )
+        self.node_a_canvas.bind(
+            "<Configure>", lambda _event: self.draw_node_intersections()
+        )
+        self.node_b_canvas.bind(
+            "<Configure>", lambda _event: self.draw_node_intersections()
+        )
         self.build_trends_ui()
 
-    def create_scrollable_tab(self):
-        """Return a notebook tab with two-axis scrolling and a content frame."""
+    def create_responsive_tab(self):
+        """Return a tab whose content reflows with the available window size."""
         tab = tk.Frame(self.notebook, bg=COLOR_BG)
-        tab.grid_rowconfigure(0, weight=1)
-        tab.grid_columnconfigure(0, weight=1)
+        content = tk.Frame(tab, bg=COLOR_BG)
+        content.pack(fill="both", expand=True)
+        return tab, content
 
-        viewport = tk.Canvas(
-            tab,
-            bg=COLOR_BG,
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        vertical = ttk.Scrollbar(tab, orient="vertical", command=viewport.yview)
-        horizontal = ttk.Scrollbar(tab, orient="horizontal", command=viewport.xview)
-        viewport.configure(
-            yscrollcommand=vertical.set,
-            xscrollcommand=horizontal.set,
-        )
-        viewport.grid(row=0, column=0, sticky="nsew")
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
+    @staticmethod
+    def responsive_profile(width, height):
+        """Return bounded dimensions and fonts for the current client area."""
+        width = max(WINDOW_MIN_WIDTH, int(width))
+        height = max(WINDOW_MIN_HEIGHT, int(height))
+        scale = max(0.60, min(1.0, min(width / 900.0, height / 780.0)))
+        compact = width < 700 or height < 700
+        return {
+            "compact": compact,
+            "header_font": max(11, round(16 * scale)),
+            "status_font": max(8, round(10 * scale)),
+            "section_font": max(8, round(11 * scale)),
+            "metric_title_font": max(6, round(9 * scale)),
+            "metric_value_font": max(11, min(16, round(18 * scale))),
+            "detail_font": max(6, round(8 * scale)),
+            "metric_row_height": max(34, min(58, round(height * 0.07))),
+            "phase_height": max(35, min(85, round(height * 0.11))),
+            "node_height": max(45, min(100, round(height * 0.13))),
+            "chart_height": max(72, min(150, round((height - 165) / 3))),
+            "wraplength": max(310, width - 92),
+        }
 
-        content = tk.Frame(viewport, bg=COLOR_BG)
-        window_id = viewport.create_window((0, 0), window=content, anchor="nw")
-        content.bind(
-            "<Configure>",
-            lambda _event, canvas=viewport: self.update_scroll_region(canvas),
+    def schedule_responsive_layout(self, event=None):
+        """Debounce resize work so dragging a window edge remains fluid."""
+        if event is not None and event.widget is not self.root:
+            return
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.root.after(35, self.apply_responsive_layout)
+
+    def apply_responsive_layout(self, width=None, height=None):
+        """Scale dashboard content to the window instead of exposing scrollbars."""
+        self._resize_after_id = None
+        width = self.root.winfo_width() if width is None else width
+        height = self.root.winfo_height() if height is None else height
+        profile = self.responsive_profile(width, height)
+        compact = profile["compact"]
+
+        self.header_title_lbl.config(
+            font=(FONT_FAMILY, profile["header_font"], "bold")
         )
-        viewport.bind(
-            "<Configure>",
-            lambda event, canvas=viewport, item=window_id: self.resize_scroll_content(
-                canvas, item, event.width
+        self.status_lbl.config(
+            font=(FONT_FAMILY, profile["status_font"], "bold")
+        )
+        self.header_title_lbl.master.pack_configure(
+            padx=10 if compact else 20,
+            pady=(6, 4) if compact else (15, 10),
+        )
+        self.notebook.pack_configure(
+            padx=6 if compact else 14,
+            pady=(0, 6 if compact else 12),
+        )
+
+        metric_pad = 1 if compact else 3
+        self.metrics_frame.pack_configure(
+            padx=8 if compact else 20,
+            pady=2 if compact else 5,
+        )
+        for row_index in range(3):
+            self.metrics_frame.grid_rowconfigure(
+                row_index,
+                weight=1,
+                uniform="summary_metric_rows",
+                minsize=profile["metric_row_height"],
+            )
+        for card, title_label in zip(self.metric_cards, self.metric_title_labels):
+            card.grid_configure(padx=metric_pad, pady=metric_pad)
+            title_label.config(
+                font=(FONT_FAMILY, profile["metric_title_font"], "bold")
+            )
+            title_label.pack_configure(
+                padx=5 if compact else 10,
+                pady=(1 if compact else 4, 0),
+            )
+        for value_label in self.vars.values():
+            value_label.config(
+                font=(FONT_FAMILY, profile["metric_value_font"], "bold")
+            )
+            value_label.pack_configure(
+                padx=5 if compact else 10,
+                pady=(0, 1 if compact else 4),
+            )
+
+        detail_font = (FONT_FAMILY, profile["detail_font"])
+        detail_bold_font = (FONT_FAMILY, profile["detail_font"], "bold")
+        self.recovery_title_lbl.config(font=detail_bold_font)
+        self.discharge_selected_lbl.config(font=detail_bold_font)
+        self.discharge_status_lbl.config(font=detail_bold_font)
+        self.discharge_reason_lbl.config(
+            font=detail_font,
+            wraplength=profile["wraplength"],
+        )
+        self.discharge_recommendation_lbl.config(
+            font=detail_font,
+            wraplength=profile["wraplength"],
+        )
+        self.recovery_title_lbl.master.pack_configure(
+            padx=10 if compact else 25,
+            pady=(3, 2) if compact else (7, 3),
+        )
+        self.recovery_title_lbl.pack_configure(pady=(3 if compact else 6, 0))
+        self.discharge_recommendation_lbl.pack_configure(
+            pady=(0, 3 if compact else 6)
+        )
+
+        self.phase_title_lbl.config(
+            font=(FONT_FAMILY, max(8, profile["section_font"] - 1), "bold")
+        )
+        self.phase_hint_lbl.config(
+            text=(
+                "Nominal cycle | live dots"
+                if compact
+                else "Nominal plan | marker repeats | dots show live state"
             ),
+            font=(FONT_FAMILY, profile["detail_font"]),
         )
-        return tab, content, viewport
+        self.phase_status_lbl.config(font=detail_bold_font, width=16 if compact else 18)
+        self.phase_heading.pack_configure(
+            padx=6 if compact else 10,
+            pady=(2, 0) if compact else (7, 0),
+        )
+        self.phase_cycle_canvas.config(height=profile["phase_height"])
+        self.phase_cycle_canvas.master.pack_configure(
+            padx=10 if compact else 25,
+            pady=(3, 2) if compact else (10, 3),
+        )
 
-    @staticmethod
-    def update_scroll_region(canvas):
-        """Keep both scrollbars synchronized with the complete content area."""
-        bounds = canvas.bbox("all")
-        if bounds:
-            canvas.configure(scrollregion=bounds)
+        self.intersection_title_lbl.config(
+            font=(FONT_FAMILY, profile["section_font"], "bold")
+        )
+        self.intersection_title_lbl.pack_configure(
+            padx=10 if compact else 20,
+            pady=(3, 1) if compact else (10, 3),
+        )
+        self.diagram_frame.pack_configure(
+            padx=10 if compact else 20,
+            pady=2 if compact else 5,
+        )
+        for title_label in self.node_title_labels:
+            title_label.config(
+                font=(FONT_FAMILY, max(8, profile["section_font"] - 1), "bold")
+            )
+            title_label.pack_configure(pady=(3 if compact else 10, 0))
+        self.node_a_canvas.config(height=profile["node_height"])
+        self.node_b_canvas.config(height=profile["node_height"])
 
-    def resize_scroll_content(self, canvas, window_id, viewport_width):
-        """Fill wide viewports, retaining a scrollable minimum on narrow ones."""
-        content_width = max(DASHBOARD_CONTENT_MIN_WIDTH, int(viewport_width))
-        canvas.itemconfigure(window_id, width=content_width)
-        self.update_scroll_region(canvas)
+        self.trends_info_lbl.config(
+            text=(
+                "IN MEMORY ONLY  |  Session data clears on reset/close"
+                if compact
+                else "IN MEMORY ONLY  |  Up to 1 sample per simulated second  |  "
+                f"Latest {HISTORY_MAX_POINTS} samples  |  Clears on reset/close"
+            ),
+            font=(FONT_FAMILY, profile["detail_font"]),
+        )
+        self.clear_history_btn.config(font=detail_bold_font)
+        for chart in self.trend_charts:
+            chart["title_label"].config(
+                font=(FONT_FAMILY, profile["metric_title_font"], "bold")
+            )
+            chart["canvas"].config(height=profile["chart_height"])
 
-    @staticmethod
-    def mousewheel_units(event):
-        """Normalize Windows/macOS wheel deltas and Linux wheel buttons."""
-        delta = int(getattr(event, "delta", 0) or 0)
-        if delta:
-            steps = max(1, abs(delta) // 120)
-            return -steps if delta > 0 else steps
-        button = getattr(event, "num", None)
-        if button == 4:
-            return -1
-        if button == 5:
-            return 1
-        return 0
-
-    def on_mousewheel(self, event):
-        """Scroll the selected tab; Shift+wheel scrolls horizontally."""
-        canvas = self.scroll_canvases.get(self.notebook.select())
-        units = self.mousewheel_units(event)
-        if canvas is None or units == 0:
-            return None
-        if int(getattr(event, "state", 0) or 0) & 0x0001:
-            canvas.xview_scroll(units, "units")
-        else:
-            canvas.yview_scroll(units, "units")
-        return "break"
+        self.draw_phase_cycle(self.latest_telemetry)
+        self.draw_node_intersections()
+        self.draw_trend_charts()
 
     def build_phase_cycle_ui(self):
         card = tk.Frame(
@@ -328,13 +453,15 @@ class TelemetryDashboard:
         card.pack(fill="x", padx=25, pady=(10, 3))
         heading = tk.Frame(card, bg=COLOR_CARD)
         heading.pack(fill="x", padx=10, pady=(7, 0))
-        tk.Label(
+        self.phase_heading = heading
+        self.phase_title_lbl = tk.Label(
             heading,
             text="SIGNAL PHASE CYCLE",
             font=(FONT_FAMILY, 10, "bold"),
             bg=COLOR_CARD,
             fg=COLOR_TEXT_PRIMARY,
-        ).pack(side="left")
+        )
+        self.phase_title_lbl.pack(side="left")
         self.phase_status_lbl = tk.Label(
             heading,
             text="WAITING",
@@ -345,13 +472,14 @@ class TelemetryDashboard:
             fg=COLOR_WARNING,
         )
         self.phase_status_lbl.pack(side="right")
-        tk.Label(
+        self.phase_hint_lbl = tk.Label(
             heading,
-            text="Nominal plan • marker repeats • dots show live state",
+            text="Nominal plan | marker repeats | dots show live state",
             font=(FONT_FAMILY, 8),
             bg=COLOR_CARD,
             fg=COLOR_TEXT_SECONDARY,
-        ).pack(side="right", padx=(10, 12))
+        )
+        self.phase_hint_lbl.pack(side="right", padx=(10, 12))
         self.phase_cycle_canvas = tk.Canvas(
             card,
             bg=COLOR_CARD,
@@ -367,7 +495,7 @@ class TelemetryDashboard:
     def build_trends_ui(self):
         controls = tk.Frame(self.trends_content, bg=COLOR_BG)
         controls.pack(fill="x", padx=20, pady=(12, 6))
-        tk.Label(
+        self.trends_info_lbl = tk.Label(
             controls,
             text=(
                 "IN MEMORY ONLY  |  Up to 1 sample per simulated second  |  "
@@ -376,8 +504,9 @@ class TelemetryDashboard:
             font=(FONT_FAMILY, 9),
             bg=COLOR_BG,
             fg=COLOR_TEXT_SECONDARY,
-        ).pack(side="left")
-        tk.Button(
+        )
+        self.trends_info_lbl.pack(side="left")
+        self.clear_history_btn = tk.Button(
             controls,
             text="CLEAR HISTORY",
             command=self.clear_history,
@@ -389,7 +518,8 @@ class TelemetryDashboard:
             relief="flat",
             padx=10,
             pady=4,
-        ).pack(side="right")
+        )
+        self.clear_history_btn.pack(side="right")
 
         charts = tk.Frame(self.trends_content, bg=COLOR_BG)
         charts.pack(fill="both", expand=True, padx=20, pady=(0, 12))
@@ -425,13 +555,14 @@ class TelemetryDashboard:
             highlightthickness=1,
         )
         card.pack(fill="both", expand=True, pady=5)
-        tk.Label(
+        title_label = tk.Label(
             card,
             text=title,
             font=(FONT_FAMILY, 9, "bold"),
             bg=COLOR_CARD,
             fg=COLOR_TEXT_SECONDARY,
-        ).pack(anchor="w", padx=10, pady=(7, 0))
+        )
+        title_label.pack(anchor="w", padx=10, pady=(7, 0))
         canvas = tk.Canvas(
             card,
             bg=COLOR_CARD,
@@ -443,6 +574,7 @@ class TelemetryDashboard:
             "canvas": canvas,
             "series": series,
             "fixed_max": fixed_max,
+            "title_label": title_label,
         }
         self.trend_charts.append(chart)
         canvas.bind("<Configure>", lambda _event: self.draw_trend_charts())
@@ -455,14 +587,22 @@ class TelemetryDashboard:
             highlightbackground=COLOR_CARD_BORDER,
             highlightthickness=1,
         )
-        tk.Label(
+        title_label = tk.Label(
             card,
             text=title,
             font=(FONT_FAMILY, 10, "bold"),
             bg=COLOR_CARD,
             fg=COLOR_TEXT_SECONDARY,
-        ).pack(pady=(10, 0))
-        canvas = tk.Canvas(card, bg=COLOR_CARD, highlightthickness=0, height=135)
+        )
+        title_label.pack(pady=(10, 0))
+        self.node_title_labels.append(title_label)
+        canvas = tk.Canvas(
+            card,
+            bg=COLOR_CARD,
+            highlightthickness=0,
+            width=1,
+            height=135,
+        )
         canvas.pack(fill="both", expand=True)
         return canvas
 
@@ -513,7 +653,7 @@ class TelemetryDashboard:
         canvas = self.phase_cycle_canvas
         canvas.delete("all")
         width, height = canvas.winfo_width(), canvas.winfo_height()
-        if width < 260 or height < 100:
+        if width < 240 or height < 45:
             return
         if not data:
             if hasattr(self, "phase_status_lbl"):
@@ -531,14 +671,18 @@ class TelemetryDashboard:
         timing = signal_state.get("timing", {})
         cycle_frames, segment_map = self.build_nominal_phase_segments(timing)
         frames_per_second = max(1, int(timing.get("frames_per_second", 60)))
-        left, right, top, bottom = 142, 14, 25, 25
+        compact_chart = width < 650 or height < 90
+        left = 82 if compact_chart else 142
+        right = 8 if compact_chart else 14
+        top = 15 if compact_chart else 25
+        bottom = 10 if compact_chart else 25
         plot_width = max(1, width - left - right)
-        row_gap = 5
-        row_height = max(12, (height - top - bottom - 2 * row_gap) / 3)
+        row_gap = 2 if compact_chart else 5
+        row_height = max(7, (height - top - bottom - 2 * row_gap) / 3)
         rows = (
-            ("EW", "EAST–WEST CORRIDOR"),
-            ("NS_A", "NORTH–SOUTH NODE A"),
-            ("NS_B", "NORTH–SOUTH NODE B"),
+            ("EW", "E-W" if compact_chart else "EAST-WEST CORRIDOR"),
+            ("NS_A", "N-S NODE A" if compact_chart else "NORTH-SOUTH NODE A"),
+            ("NS_B", "N-S NODE B" if compact_chart else "NORTH-SOUTH NODE B"),
         )
         state_colors = {
             "GREEN": COLOR_SUCCESS,
@@ -561,7 +705,7 @@ class TelemetryDashboard:
                 text=row_label,
                 anchor="e",
                 fill=COLOR_TEXT_SECONDARY,
-                font=(FONT_FAMILY, 8, "bold"),
+                font=(FONT_FAMILY, 6 if compact_chart else 8, "bold"),
             )
             for start, end, state in segment_map[row_key]:
                 canvas.create_rectangle(
@@ -592,13 +736,14 @@ class TelemetryDashboard:
                 dash=(3, 2),
                 width=1,
             )
-            canvas.create_text(
-                (frame_x(start) + frame_x(end)) / 2,
-                9,
-                text="ALL RED",
-                fill=COLOR_TEXT_SECONDARY,
-                font=(FONT_FAMILY, 7, "bold"),
-            )
+            if not compact_chart:
+                canvas.create_text(
+                    (frame_x(start) + frame_x(end)) / 2,
+                    9,
+                    text="ALL RED",
+                    fill=COLOR_TEXT_SECONDARY,
+                    font=(FONT_FAMILY, 7, "bold"),
+                )
 
         boundaries = sorted(
             {
@@ -611,7 +756,8 @@ class TelemetryDashboard:
                 cycle_frames,
             }
         )
-        for boundary in boundaries:
+        displayed_boundaries = (0, cycle_frames) if compact_chart else boundaries
+        for boundary in displayed_boundaries:
             x = frame_x(boundary)
             canvas.create_line(x, chart_bottom + 2, x, chart_bottom + 5, fill=COLOR_TEXT_SECONDARY)
             canvas.create_text(
@@ -704,13 +850,36 @@ class TelemetryDashboard:
         if hasattr(self, "phase_status_lbl"):
             self.phase_status_lbl.config(text=status_text, fg=status_color)
 
+    def draw_node_intersections(self):
+        """Redraw both live node diagrams after telemetry or geometry changes."""
+        data = self.latest_telemetry or {}
+        signal_state = data.get("signal_state", {})
+        nodes = signal_state.get("nodes", {})
+        fallback = signal_state.get("current_phase", "UNKNOWN")
+        node_a = nodes.get("300", {})
+        node_b = nodes.get("700", {})
+        self.draw_intersection(
+            self.node_a_canvas,
+            "A",
+            node_a.get("phase", fallback),
+            node_a.get("signals"),
+        )
+        self.draw_intersection(
+            self.node_b_canvas,
+            "B",
+            node_b.get("phase", fallback),
+            node_b.get("signals"),
+        )
+
     def draw_intersection(self, canvas, node_key, phase, signals=None):
         canvas.delete("all")
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width < 10 or height < 10:
             return
         center_x, center_y = width // 2, height // 2
-        road_w = 40
+        shortest_side = min(width, height)
+        road_w = max(14, min(40, int(shortest_side * 0.38)))
+        signal_offset = max(9, min(40, int(shortest_side * 0.32)))
         canvas.create_rectangle(0, center_y - road_w // 2, width, center_y + road_w // 2, fill="#333D50", outline="")
         canvas.create_rectangle(center_x - road_w // 2, 0, center_x + road_w // 2, height, fill="#333D50", outline="")
         ew_color, ns_color = COLOR_DANGER, COLOR_DANGER
@@ -735,12 +904,13 @@ class TelemetryDashboard:
         wb_color = color_by_state.get(signals.get("WB"), ew_color)
         nb_color = color_by_state.get(signals.get("NB"), ns_color)
         sb_color = color_by_state.get(signals.get("SB"), ns_color)
-        radius = 8
-        canvas.create_oval(center_x - road_w - radius, center_y - radius, center_x - road_w + radius, center_y + radius, fill=eb_color)
-        canvas.create_oval(center_x + road_w - radius, center_y - radius, center_x + road_w + radius, center_y + radius, fill=wb_color)
-        canvas.create_oval(center_x - radius, center_y - road_w - radius, center_x + radius, center_y - road_w + radius, fill=nb_color)
-        canvas.create_oval(center_x - radius, center_y + road_w - radius, center_x + radius, center_y + road_w + radius, fill=sb_color)
-        canvas.create_text(center_x, height - 15, text=phase.replace("_", " "), fill=COLOR_TEXT_PRIMARY, font=(FONT_FAMILY, 9, "bold"))
+        radius = max(4, min(8, int(shortest_side * 0.08)))
+        canvas.create_oval(center_x - signal_offset - radius, center_y - radius, center_x - signal_offset + radius, center_y + radius, fill=eb_color)
+        canvas.create_oval(center_x + signal_offset - radius, center_y - radius, center_x + signal_offset + radius, center_y + radius, fill=wb_color)
+        canvas.create_oval(center_x - radius, center_y - signal_offset - radius, center_x + radius, center_y - signal_offset + radius, fill=nb_color)
+        canvas.create_oval(center_x - radius, center_y + signal_offset - radius, center_x + radius, center_y + signal_offset + radius, fill=sb_color)
+        if height >= 55:
+            canvas.create_text(center_x, height - 12, text=phase.replace("_", " "), fill=COLOR_TEXT_PRIMARY, font=(FONT_FAMILY, 8 if height < 90 else 9, "bold"))
 
     def safe_read_telemetry(self):
         self.last_read_error = None
@@ -1034,16 +1204,11 @@ class TelemetryDashboard:
                 text=display["recommendation"]
             )
 
-        nodes = data.get("signal_state", {}).get("nodes", {})
-        fallback = data.get("signal_state", {}).get("current_phase", "UNKNOWN")
-        phase_a = nodes.get("300", {}).get("phase", fallback)
-        phase_b = nodes.get("700", {}).get("phase", fallback)
         self.latest_telemetry = data
         self.root.update_idletasks()
         if hasattr(self, "phase_cycle_canvas"):
             self.draw_phase_cycle(data)
-        self.draw_intersection(self.node_a_canvas, "A", phase_a, nodes.get("300", {}).get("signals"))
-        self.draw_intersection(self.node_b_canvas, "B", phase_b, nodes.get("700", {}).get("signals"))
+        self.draw_node_intersections()
 
     @staticmethod
     def format_discharge_status(status):

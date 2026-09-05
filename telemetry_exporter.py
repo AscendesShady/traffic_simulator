@@ -13,6 +13,7 @@ from vehicle import Bus
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
+CAR_OCCUPANCY = 4
 
 
 class TelemetryExporter:
@@ -20,6 +21,9 @@ class TelemetryExporter:
         self.filename = Path(filename).resolve()
         self.export_interval = max(1, int(export_interval_frames))
         self.frame_counter = 0
+        self._throughput_samples = []
+        self._trend_window_seconds = 30.0
+        self._last_total_served = 0
 
     def compute_queue_counts(self, vehicles):
         queues = {"EB": 0, "WB": 0, "A_NB": 0, "A_SB": 0, "B_NB": 0, "B_SB": 0}
@@ -63,6 +67,11 @@ class TelemetryExporter:
         distance = bus.distance_to_node_stop_bar(
             target_node, canvas.H_Y, canvas.ROAD_W, canvas.STOP
         )
+        free_flow_speed = max(getattr(bus, "max_speed", 1.0), 1e-6)
+        eta_frames_freeflow = distance / free_flow_speed if distance > 0 else 0.0
+        live_speed = max(bus.speed, 1e-6)
+        eta_frames_live = distance / live_speed if distance > 0 else 0.0
+        eta_frames_live = min(eta_frames_live, 6000.0)
         live_cfg = control_panel.bus_routes_config.get(bus.route_id, bus.route_info)
         priority = signal_controller.get_priority_status_for_bus(bus, target_node)
         latest_terminal = signal_controller.get_latest_terminal_status_for_bus(bus)
@@ -85,6 +94,8 @@ class TelemetryExporter:
             "passengers": bus.passengers,
             "target_node_x": target_node,
             "distance_to_stop_bar_px": round(distance, 1),
+            "eta_to_stop_bar_sec_freeflow": round(eta_frames_freeflow / 60.0, 2),
+            "eta_to_stop_bar_sec_live": round(eta_frames_live / 60.0, 2),
             "target_turn": bus.target_turn,
             "route_leg": leg,
             "leg_state": bus.leg_state,
@@ -104,10 +115,20 @@ class TelemetryExporter:
         }
 
     def build_payload(
-        self, signal_controller, vehicles, frame_number, demand_state=None
+        self,
+        signal_controller,
+        vehicles,
+        frame_number,
+        demand_state=None,
+        throughput_state=None,
     ):
         queues = self.compute_queue_counts(vehicles)
+        queues_passengers = {
+            approach: vehicle_count * CAR_OCCUPANCY
+            for approach, vehicle_count in queues.items()
+        }
         demand_state = demand_state or {}
+        throughput_state = throughput_state or {}
         pending_demand = sum(
             int(item.get("pending_arrivals", 0))
             for item in demand_state.values()
@@ -118,6 +139,38 @@ class TelemetryExporter:
             for vehicle in vehicles
             if isinstance(vehicle, Bus)
         ]
+        routes_block = {}
+        for route_id, route_config in control_panel.bus_routes_config.items():
+            route_buses = [bus for bus in buses if bus["route_id"] == route_id]
+            nearest = None
+            if route_buses:
+                nearest = min(
+                    route_buses,
+                    key=lambda bus: bus["eta_to_stop_bar_sec_freeflow"],
+                )
+            routes_block[route_id] = {
+                "route_name": route_config.get("name", route_id),
+                "active": bool(route_config.get("active", False)),
+                "tsp_enabled": bool(route_config.get("tsp_enabled", False)),
+                "dbl_enabled": bool(route_config.get("dbl_enabled", False)),
+                "buses_on_route": len(route_buses),
+                "route_passengers_total": sum(
+                    int(bus["passengers"]) for bus in route_buses
+                ),
+                "nearest_bus_id": nearest["bus_id"] if nearest else None,
+                "nearest_bus_eta_sec": (
+                    nearest["eta_to_stop_bar_sec_freeflow"] if nearest else None
+                ),
+                "nearest_bus_target_node_x": (
+                    nearest["target_node_x"] if nearest else None
+                ),
+                "nearest_bus_priority_granted": (
+                    bool(nearest["priority_granted"]) if nearest else False
+                ),
+                "nearest_bus_priority_pending": (
+                    bool(nearest["priority_transitioning"]) if nearest else False
+                ),
+            }
         approaching = [
             bus
             for bus in buses
@@ -136,11 +189,35 @@ class TelemetryExporter:
         yellow_frames = signal_controller.yellow_time
         all_red_frames = signal_controller.red_clearance_time
         discharge_status = signal_controller.get_discharge_status()
+
+        simulation_seconds = frame_number / 60.0
+        total_served = int(throughput_state.get("passengers_served_total", 0))
+        if total_served < self._last_total_served:
+            self._throughput_samples.clear()
+        self._last_total_served = total_served
+
+        sample = (simulation_seconds, total_served)
+        if not self._throughput_samples or self._throughput_samples[-1] != sample:
+            self._throughput_samples.append(sample)
+        cutoff = simulation_seconds - self._trend_window_seconds
+        self._throughput_samples = [
+            item for item in self._throughput_samples if item[0] >= cutoff
+        ]
+        recent_rate = 0.0
+        if len(self._throughput_samples) >= 2:
+            start_seconds, start_passengers = self._throughput_samples[0]
+            end_seconds, end_passengers = self._throughput_samples[-1]
+            elapsed_minutes = (end_seconds - start_seconds) / 60.0
+            if elapsed_minutes > 1e-6:
+                recent_rate = (
+                    end_passengers - start_passengers
+                ) / elapsed_minutes
+
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "timestamp": round(time.time(), 3),
             "frame_number": frame_number,
-            "simulation_time_seconds": round(frame_number / 60.0, 3),
+            "simulation_time_seconds": round(simulation_seconds, 3),
             "simulation_paused": bool(control_panel.global_config.get("is_paused", False)),
             "simulation_speed": float(control_panel.global_config.get("sim_speed", 1.0)),
             "signal_state": {
@@ -163,22 +240,53 @@ class TelemetryExporter:
                     int(getattr(vehicle, "passengers", 0)) for vehicle in vehicles
                 ),
                 "queues": queues,
+                "queues_passengers_est": queues_passengers,
+                "car_occupancy_assumed": CAR_OCCUPANCY,
                 "pending_demand": pending_demand,
             },
+            "network_throughput": {
+                "passengers_served_total": total_served,
+                "passengers_served_bus": int(
+                    throughput_state.get("passengers_served_bus", 0)
+                ),
+                "passengers_served_car": int(
+                    throughput_state.get("passengers_served_car", 0)
+                ),
+                "vehicles_served_total": int(
+                    throughput_state.get("vehicles_served_total", 0)
+                ),
+                "buses_served": int(throughput_state.get("buses_served", 0)),
+                "cars_served": int(throughput_state.get("cars_served", 0)),
+                "passengers_per_minute": round(
+                    total_served / max(simulation_seconds / 60.0, 1e-9), 1
+                ),
+                "passengers_per_minute_recent": round(recent_rate, 1),
+                "trend_window_seconds": self._trend_window_seconds,
+            },
             "demand_generation": demand_state,
+            "routes": routes_block,
             "active_buses": buses,
             "approaching_buses": approaching,
         }
 
     def export(
-        self, signal_controller, vehicles, frame_number, demand_state=None
+        self,
+        signal_controller,
+        vehicles,
+        frame_number,
+        demand_state=None,
+        throughput_state=None,
     ):
         self.frame_counter += 1
         if self.frame_counter % self.export_interval != 0:
             return False
 
         payload = self.build_payload(
-            signal_controller, vehicles, frame_number, demand_state=demand_state
+            signal_controller,
+            vehicles,
+            frame_number,
+            demand_state=demand_state,
+            throughput_state=throughput_state,
         )
         self.filename.parent.mkdir(parents=True, exist_ok=True)
         temp_name = None

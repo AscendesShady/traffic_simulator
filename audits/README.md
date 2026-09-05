@@ -1,0 +1,15 @@
+# Simulator Audits
+
+Keep audit reports, incident investigations, and verification reports in this
+folder. The repository root should contain only the current simulator guide and
+general project documentation.
+
+## Current reports
+
+- [Audit and Step-by-Step Fix Report](TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)
+- [Automatic Discharge Gridlock Incident Audit](AUTO_DISCHARGE_GRIDLOCK_INCIDENT_AUDIT_2026-09-05.md)
+- [Gridlock Incident Report](TRAFFIC_SIMULATOR_GRIDLOCK_INCIDENT_REPORT.md)
+- [Pre-integration Callback and Placeholder Audit](TRAFFIC_SIMULATOR_CALLBACK_AND_PLACEHOLDER_AUDIT.md)
+
+Future audit filenames should identify the subject and, for incident-specific
+snapshots, include the date in `YYYY-MM-DD` form.

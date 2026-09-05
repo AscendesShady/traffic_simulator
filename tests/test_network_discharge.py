@@ -7,10 +7,12 @@ from signal_controller import (
     DISCHARGE_ACTIVE,
     DISCHARGE_ALL_RED,
     DISCHARGE_INACTIVE,
+    DISCHARGE_RECOVERY_FAILED,
     DISCHARGE_STOPPING_ALL_RED,
     DISCHARGE_STOPPING_YELLOW,
     DISCHARGE_TRANSITION_YELLOW,
     DISCHARGE_WAITING,
+    DischargeStage,
     SignalController,
 )
 from telemetry_dashboard import COLOR_WARNING, TelemetryDashboard
@@ -93,6 +95,42 @@ def assert_exclusive_greens(signals, expected):
         green = [key for key, value in node_signals.items() if value == "GREEN"]
         expected_green = [expected[node_x]] if node_x in expected else []
         assert green == expected_green
+
+
+def vehicle_in_box(node_x, direction):
+    if direction == "EB":
+        vehicle = Vehicle(node_x + ROAD_W / 2 - 6, H_Y - 1.5 * LANE, "EB")
+    elif direction == "WB":
+        vehicle = Vehicle(node_x - ROAD_W / 2 + 6, H_Y + 1.5 * LANE, "WB")
+    elif direction == "NB":
+        vehicle = Vehicle(
+            node_x - 1.5 * LANE,
+            H_Y - ROAD_W / 2 + 6,
+            "NB",
+            assigned_node_x=node_x,
+        )
+    else:
+        vehicle = Vehicle(
+            node_x + 1.5 * LANE,
+            H_Y + ROAD_W / 2 - 6,
+            "SB",
+            assigned_node_x=node_x,
+        )
+    vehicle.speed = 0.0
+    return vehicle
+
+
+def wb_vehicle_before_node_a():
+    vehicle = Vehicle(
+        500,
+        H_Y + 1.5 * LANE,
+        "WB",
+        target_turn="STRAIGHT",
+        lane_index=1,
+    )
+    vehicle.passed_nodes.add(700)
+    vehicle.speed = 0.0
+    return vehicle
 
 
 def test_manual_eastbound_discharge_is_downstream_first_then_coordinated():
@@ -181,6 +219,229 @@ def test_manual_selection_waits_with_reason_when_receiving_space_is_full():
     )
     assert status["recommendation"] == "Discharge Node B Northbound"
     assert set(controller.get_all_signals()[700].values()) == {"RED"}
+
+
+def test_direction_aware_clearance_releases_same_direction_exiter():
+    controller, _config = make_controller()
+    stage = DischargeStage("Node A eastbound", ((300, "EB"),))
+    exiter = vehicle_in_box(300, "EB")
+    waiting = eb_vehicle_before_node(300)
+
+    assert not controller.is_intersection_clear(300, [exiter])
+    assert controller.is_intersection_clear_for_greens(
+        300, stage.greens, [exiter]
+    )
+    assert controller._stage_readiness(stage, [exiter, waiting])[0] is True
+
+    cross_direction = vehicle_in_box(300, "NB")
+    assert not controller.is_intersection_clear_for_greens(
+        300, stage.greens, [cross_direction]
+    )
+    assert controller._stage_readiness(
+        stage, [cross_direction, waiting]
+    )[0] is False
+
+
+def test_auto_selects_blocker_draining_plan():
+    controller, config = make_controller()
+    blocker = make_bus_for_leg(
+        "R2_EB_B_NB", 300, "BUS_R2_EB_B_NB_GRIDLOCK"
+    )
+    blocker.x = 380.5
+    blocker.leg_state = "IN_INTERSECTION"
+    blocker.speed = 0.0
+    downstream_leader = Vehicle(
+        420,
+        H_Y - 1.5 * LANE,
+        "EB",
+        target_turn="STRAIGHT",
+        lane_index=1,
+    )
+    downstream_leader.passed_nodes.add(300)
+    downstream_leader.speed = 0.0
+    vehicles = [blocker, downstream_leader]
+
+    request_discharge(
+        controller, config, vehicles, control_panel.DISCHARGE_AUTO
+    )
+    advance_until(
+        controller,
+        vehicles,
+        lambda: controller.discharge_state == DISCHARGE_ACTIVE,
+    )
+
+    status = controller.get_discharge_status()
+    assert status["mode"] == control_panel.DISCHARGE_AUTO
+    assert status["selected"] == "Eastbound Corridor"
+    assert controller.current_discharge_stage.label == "Node B downstream"
+    assert_exclusive_greens(controller.get_all_signals(), {700: "EB"})
+
+    for _ in range(120):
+        signals = controller.get_all_signals()
+        for vehicle in vehicles:
+            vehicle.update(
+                signals,
+                INT_X,
+                H_Y,
+                ROAD_W,
+                STOP,
+                LANE,
+                vehicles,
+                controller,
+            )
+        controller.update(vehicles)
+        if 300 in blocker.passed_nodes:
+            break
+
+    assert 300 in blocker.passed_nodes
+    assert controller.is_intersection_clear(300, vehicles)
+
+
+def test_auto_reranks_when_latched_candidate_unready():
+    controller, config = make_controller()
+    waiting_wb = wb_vehicle_before_node_a()
+    blocker_eb = vehicle_in_box(300, "EB")
+    blocker_nb = vehicle_in_box(300, "NB")
+    vehicles = [waiting_wb, blocker_eb, blocker_nb]
+
+    request_discharge(
+        controller, config, vehicles, control_panel.DISCHARGE_AUTO
+    )
+    advance_until(
+        controller,
+        vehicles,
+        lambda: controller.discharge_state == DISCHARGE_WAITING,
+    )
+    assert controller.discharge_plan_name is not None
+
+    alternative = vertical_vehicle(700, "NB")
+    vehicles.append(alternative)
+    controller.update(vehicles)
+
+    assert controller.discharge_state == DISCHARGE_ACTIVE
+    assert controller.discharge_plan_name == "Node B Northbound"
+    assert_exclusive_greens(controller.get_all_signals(), {700: "NB"})
+
+
+def test_waiting_never_all_red_forever():
+    controller, config = make_controller()
+    vehicles = [
+        vehicle_in_box(300, "EB"),
+        vehicle_in_box(300, "NB"),
+    ]
+
+    request_discharge(
+        controller, config, vehicles, control_panel.DISCHARGE_AUTO
+    )
+    advance_until(
+        controller,
+        vehicles,
+        lambda: controller.discharge_state == DISCHARGE_RECOVERY_FAILED,
+        limit=20,
+    )
+
+    status = controller.get_discharge_status()
+    assert status["status"] == "RECOVERY_FAILED"
+    assert "Node A blocked by EB/NB vehicle" in status["reason"]
+    assert "No safe ready stage" in status["reason"]
+    assert status["recommendation"].startswith("RESET VEHICLES required")
+    for node_signals in controller.get_all_signals().values():
+        assert set(node_signals.values()) == {"RED"}
+
+    controller.update(vehicles)
+    assert controller.discharge_state == DISCHARGE_RECOVERY_FAILED
+
+    config["discharge_selection"] = "Node B Northbound"
+    config["discharge_start_requested"] = True
+    controller.update(vehicles)
+    assert controller.discharge_state == DISCHARGE_RECOVERY_FAILED
+
+    config["discharge_stop_requested"] = True
+    controller.update(vehicles)
+    assert controller.discharge_state == DISCHARGE_STOPPING_ALL_RED
+    for node_signals in controller.get_all_signals().values():
+        assert set(node_signals.values()) == {"RED"}
+
+
+def test_manual_plan_not_silently_switched():
+    controller, config = make_controller("Westbound Corridor")
+    vehicles = [wb_vehicle_before_node_a(), vehicle_in_box(300, "EB")]
+
+    request_discharge(controller, config, vehicles, "Westbound Corridor")
+    advance_until(
+        controller,
+        vehicles,
+        lambda: controller.discharge_state == DISCHARGE_RECOVERY_FAILED,
+        limit=20,
+    )
+
+    status = controller.get_discharge_status()
+    assert status["mode"] == "Westbound Corridor"
+    assert status["selected"] == "Westbound Corridor"
+    assert controller.discharge_plan_name == "Westbound Corridor"
+    for node_signals in controller.get_all_signals().values():
+        assert set(node_signals.values()) == {"RED"}
+
+
+def test_no_perpendicular_overlap_during_recovery():
+    controller, config = make_controller()
+    blocker = vehicle_in_box(300, "EB")
+    downstream_leader = Vehicle(
+        410,
+        H_Y - 1.5 * LANE,
+        "EB",
+        target_turn="STRAIGHT",
+        lane_index=1,
+    )
+    downstream_leader.passed_nodes.add(300)
+    vehicles = [blocker, downstream_leader]
+    request_discharge(
+        controller, config, vehicles, control_panel.DISCHARGE_AUTO
+    )
+
+    for _ in range(30):
+        signals = controller.get_all_signals()
+        for node_signals in signals.values():
+            green_directions = [
+                direction
+                for direction, state in node_signals.items()
+                if state == "GREEN"
+            ]
+            assert len(green_directions) <= 1
+        controller.update(vehicles)
+
+
+def test_auto_selects_westbound_for_node_b_blocker():
+    controller, config = make_controller()
+    blocker = make_bus_for_leg(
+        "R4_WB_A_SB", 700, "BUS_R4_WB_A_SB_GRIDLOCK"
+    )
+    blocker.x = 619.5
+    blocker.leg_state = "IN_INTERSECTION"
+    blocker.speed = 0.0
+    downstream_leader = Vehicle(
+        580,
+        H_Y + 1.5 * LANE,
+        "WB",
+        target_turn="STRAIGHT",
+        lane_index=1,
+    )
+    downstream_leader.passed_nodes.add(700)
+    downstream_leader.speed = 0.0
+    vehicles = [blocker, downstream_leader]
+
+    request_discharge(
+        controller, config, vehicles, control_panel.DISCHARGE_AUTO
+    )
+    advance_until(
+        controller,
+        vehicles,
+        lambda: controller.discharge_state == DISCHARGE_ACTIVE,
+    )
+
+    assert controller.discharge_plan_name == "Westbound Corridor"
+    assert controller.current_discharge_stage.label == "Node A downstream"
+    assert_exclusive_greens(controller.get_all_signals(), {300: "WB"})
 
 
 def test_safe_stop_uses_yellow_and_all_red_before_normal_control():

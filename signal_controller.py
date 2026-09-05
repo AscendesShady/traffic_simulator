@@ -30,6 +30,7 @@ DISCHARGE_TRANSITION_YELLOW = "TRANSITION_YELLOW"
 DISCHARGE_ALL_RED = "DISCHARGE_ALL_RED"
 DISCHARGE_WAITING = "WAITING"
 DISCHARGE_ACTIVE = "DISCHARGING"
+DISCHARGE_RECOVERY_FAILED = "RECOVERY_FAILED"
 DISCHARGE_STAGE_YELLOW = "STAGE_YELLOW"
 DISCHARGE_STOPPING_YELLOW = "STOPPING_YELLOW"
 DISCHARGE_STOPPING_ALL_RED = "STOPPING_ALL_RED"
@@ -161,6 +162,7 @@ class SignalController:
         self._discharge_stop_after_clearance = False
         self._discharge_completed = False
         self._discharge_last_progress_frame = 0
+        self._discharge_wait_snapshot: dict[str, Any] | None = None
         self._discharge_tracked: dict[tuple[int, int], Any] = {}
         self._discharge_last_served = {
             plan_name: -self.discharge_max_green
@@ -214,6 +216,8 @@ class SignalController:
             return "DISCHARGING"
         if self.discharge_state == DISCHARGE_WAITING:
             return "WAITING"
+        if self.discharge_state == DISCHARGE_RECOVERY_FAILED:
+            return "RECOVERY_FAILED"
         if self.discharge_state in (
             DISCHARGE_STOPPING_YELLOW,
             DISCHARGE_STOPPING_ALL_RED,
@@ -262,6 +266,7 @@ class SignalController:
         self._discharge_green_map = {}
         self._discharge_stop_after_clearance = False
         self._discharge_completed = False
+        self._discharge_wait_snapshot = None
         self._discharge_tracked.clear()
         self.global_config["discharge_start_requested"] = False
         self.global_config["discharge_stop_requested"] = False
@@ -309,17 +314,54 @@ class SignalController:
     def _first_relevant_stage_index(self, plan_name, vehicles):
         stages = DISCHARGE_PLAN_STAGES[plan_name]
         for index, stage in enumerate(stages):
-            if self._matching_stage_vehicles(stage, vehicles):
+            if (
+                self._matching_stage_vehicles(stage, vehicles)
+                or self._stage_same_direction_occupants(stage, vehicles)
+            ):
                 return index
         return None
 
+    def _stage_same_direction_occupants(self, stage, vehicles):
+        """Return box occupants that can exit under this protected stage."""
+        occupants = []
+        seen = set()
+        for node_x, approach in stage.greens:
+            for vehicle in vehicles or []:
+                if id(vehicle) in seen or vehicle.direction != approach:
+                    continue
+                if self.vehicle_occupies_intersection(vehicle, node_x):
+                    occupants.append(vehicle)
+                    seen.add(id(vehicle))
+        return occupants
+
+    def _served_stage_vehicles(self, stage, vehicles):
+        served = []
+        seen = set()
+        for vehicle in (
+            self._matching_stage_vehicles(stage, vehicles)
+            + self._stage_same_direction_occupants(stage, vehicles)
+        ):
+            if id(vehicle) not in seen:
+                served.append(vehicle)
+                seen.add(id(vehicle))
+        return served
+
     def _stage_readiness(self, stage, vehicles):
         for node_x, approach in stage.greens:
-            if not self.is_intersection_clear(node_x, vehicles):
+            if not self.is_intersection_clear_for_greens(
+                node_x, stage.greens, vehicles
+            ):
                 node_name = "Node A" if node_x == INT_X[0] else "Node B"
-                return False, f"{node_name} intersection is still occupied"
+                return (
+                    False,
+                    f"{node_name} intersection is blocked by a "
+                    "cross-direction vehicle",
+                )
 
         matching = self._matching_stage_vehicles(stage, vehicles)
+        exiting = self._stage_same_direction_occupants(stage, vehicles)
+        if exiting:
+            return True, "Same-direction box occupants can exit under this green"
         if not matching:
             return False, "No vehicles are waiting for this discharge stage"
 
@@ -346,6 +388,25 @@ class SignalController:
         return (
             False,
             f"{location_name} has insufficient storage",
+        )
+
+    def _box_occupant_directions(self, vehicles):
+        """Map each conflict box to current occupant travel directions."""
+        result = {node_x: set() for node_x in INT_X}
+        for node_x in INT_X:
+            for vehicle in vehicles or []:
+                if self.vehicle_occupies_intersection(vehicle, node_x):
+                    result[node_x].add(vehicle.direction)
+        return result
+
+    @staticmethod
+    def _candidate_drains_blocker(candidate, occupants):
+        stage = DISCHARGE_PLAN_STAGES[candidate["plan"]][
+            candidate["stage_index"]
+        ]
+        return any(
+            approach in occupants.get(node_x, set())
+            for node_x, approach in stage.greens
         )
 
     def _dependency_bonus(self, plan_name):
@@ -464,7 +525,76 @@ class SignalController:
         self._discharge_stop_after_clearance = False
         self._discharge_completed = False
         self._discharge_last_progress_frame = self.frame_number
+        self._discharge_wait_snapshot = None
         self._discharge_tracked.clear()
+        self._publish_discharge_status()
+
+    def _set_discharge_waiting(self, reason, recommendation):
+        if self.discharge_state != DISCHARGE_WAITING:
+            self._discharge_last_progress_frame = self.frame_number
+            self._discharge_wait_snapshot = None
+        self.discharge_state = DISCHARGE_WAITING
+        self.discharge_reason = reason
+        self.discharge_recommendation = recommendation
+        self._discharge_green_map = {}
+
+    def _waiting_progress_snapshot(self, vehicles):
+        ranked = self._rank_discharge_candidates(vehicles)
+        occupants = self._box_occupant_directions(vehicles)
+        return {
+            "upstream": self._network_upstream_count(vehicles),
+            "reservations": sum(
+                len(node.reservations) for node in self.nodes.values()
+            ),
+            "occupants": sum(len(items) for items in occupants.values()),
+            "ready": frozenset(
+                (item["plan"], item["stage_index"])
+                for item in ranked
+                if item["ready"]
+            ),
+        }
+
+    @staticmethod
+    def _waiting_snapshot_has_progress(previous, current):
+        if previous is None:
+            return False
+        return (
+            current["upstream"] < previous["upstream"]
+            or current["reservations"] < previous["reservations"]
+            or current["occupants"] < previous["occupants"]
+            or bool(current["ready"] - previous["ready"])
+        )
+
+    def _recovery_failure_reason(self, vehicles):
+        occupants = self._box_occupant_directions(vehicles)
+        details = []
+        for node_x in INT_X:
+            directions = sorted(occupants[node_x])
+            if not directions:
+                continue
+            node_name = "Node A" if node_x == INT_X[0] else "Node B"
+            direction_text = "/".join(directions)
+            needed = "/".join(f"{item} green" for item in directions)
+            details.append(
+                f"{node_name} blocked by {direction_text} vehicle; needs {needed}"
+            )
+        waited_seconds = (
+            self.frame_number - self._discharge_last_progress_frame
+        ) / 60.0
+        blocker_text = "; ".join(details) or "No safe ready discharge stage"
+        return (
+            f"{blocker_text}. No safe ready stage after "
+            f"{waited_seconds:.1f}s."
+        )
+
+    def _enter_recovery_failed(self, vehicles):
+        self.discharge_state = DISCHARGE_RECOVERY_FAILED
+        self.discharge_reason = self._recovery_failure_reason(vehicles)
+        self.discharge_recommendation = (
+            "RESET VEHICLES required - no safe discharge stage can drain "
+            "the current blockage."
+        )
+        self._discharge_green_map = {}
         self._publish_discharge_status()
 
     def _activate_current_stage(self, vehicles):
@@ -473,17 +603,17 @@ class SignalController:
             return False
         ready, reason = self._stage_readiness(stage, vehicles)
         if not ready:
-            self.discharge_state = DISCHARGE_WAITING
-            self.discharge_reason = reason
-            self.discharge_recommendation = self._recommend_discharge_plan(
-                vehicles,
-                exclude=(
-                    self.discharge_plan_name
-                    if self.discharge_mode != control_panel.DISCHARGE_AUTO
-                    else None
+            self._set_discharge_waiting(
+                reason,
+                self._recommend_discharge_plan(
+                    vehicles,
+                    exclude=(
+                        self.discharge_plan_name
+                        if self.discharge_mode != control_panel.DISCHARGE_AUTO
+                        else None
+                    ),
                 ),
             )
-            self._discharge_green_map = {}
             return False
 
         self.discharge_state = DISCHARGE_ACTIVE
@@ -494,8 +624,9 @@ class SignalController:
             "Continue this protected movement until its stage completes"
         )
         self._discharge_last_progress_frame = self.frame_number
+        self._discharge_wait_snapshot = None
         for node_x, _approach in stage.greens:
-            for vehicle in self._matching_stage_vehicles(stage, vehicles):
+            for vehicle in self._served_stage_vehicles(stage, vehicles):
                 if vehicle.get_next_target_node(INT_X) == node_x:
                     self._discharge_tracked[(id(vehicle), node_x)] = vehicle
         return True
@@ -514,26 +645,34 @@ class SignalController:
         if self.discharge_plan_name is None:
             if self.discharge_mode == control_panel.DISCHARGE_AUTO:
                 ranked = self._rank_discharge_candidates(vehicles)
-                candidate = next(
-                    (item for item in ranked if item["ready"]),
-                    ranked[0] if ranked else None,
+                occupants = self._box_occupant_directions(vehicles)
+                candidate = (
+                    next(
+                        (
+                            item
+                            for item in ranked
+                            if item["ready"]
+                            and self._candidate_drains_blocker(item, occupants)
+                        ),
+                        None,
+                    )
+                    or next(
+                        (item for item in ranked if item["ready"]), None
+                    )
+                    or (ranked[0] if ranked else None)
                 )
                 if candidate is None:
-                    self.discharge_state = DISCHARGE_WAITING
-                    self.discharge_reason = (
-                        "No queued approach currently requires a discharge green"
-                    )
-                    self.discharge_recommendation = (
-                        "Maintain arrival suspension while occupied lanes drain"
+                    self._set_discharge_waiting(
+                        "No queued approach currently requires a discharge green",
+                        "Maintain arrival suspension while occupied lanes drain",
                     )
                     return
                 self.discharge_plan_name = candidate["plan"]
                 self.discharge_stage_index = candidate["stage_index"]
                 if not candidate["ready"]:
-                    self.discharge_state = DISCHARGE_WAITING
-                    self.discharge_reason = candidate["reason"]
-                    self.discharge_recommendation = (
-                        "Maintain arrival suspension while downstream traffic drains"
+                    self._set_discharge_waiting(
+                        candidate["reason"],
+                        "Maintain arrival suspension while downstream traffic drains",
                     )
                     return
             else:
@@ -551,7 +690,10 @@ class SignalController:
         stages = DISCHARGE_PLAN_STAGES[self.discharge_plan_name]
         while self.discharge_stage_index < len(stages):
             stage = stages[self.discharge_stage_index]
-            if self._matching_stage_vehicles(stage, vehicles):
+            if (
+                self._matching_stage_vehicles(stage, vehicles)
+                or self._stage_same_direction_occupants(stage, vehicles)
+            ):
                 self._activate_current_stage(vehicles)
                 return
             self.discharge_stage_index += 1
@@ -562,9 +704,10 @@ class SignalController:
         if self.discharge_mode == control_panel.DISCHARGE_AUTO:
             self.discharge_plan_name = None
             self.discharge_stage_index = 0
-            self.discharge_state = DISCHARGE_WAITING
-            self.discharge_reason = f"{completed_plan} discharge is complete"
-            self.discharge_recommendation = self._recommend_discharge_plan(vehicles)
+            self._set_discharge_waiting(
+                f"{completed_plan} discharge is complete",
+                self._recommend_discharge_plan(vehicles),
+            )
         else:
             self._begin_safe_discharge_stop(
                 f"{completed_plan} discharge is complete"
@@ -637,6 +780,15 @@ class SignalController:
             )
             if not self.discharge_active:
                 self._start_discharge(mode, vehicles)
+            elif self.discharge_state == DISCHARGE_RECOVERY_FAILED:
+                self.discharge_reason = (
+                    "Recovery failed; use SAFE STOP or RESET VEHICLES before "
+                    "starting another discharge"
+                )
+                self.discharge_recommendation = (
+                    "RESET VEHICLES required - no safe discharge stage can "
+                    "drain the current blockage."
+                )
             else:
                 self.discharge_mode = (
                     mode if mode in control_panel.DISCHARGE_OPTIONS
@@ -674,6 +826,8 @@ class SignalController:
     def _update_discharge(self, vehicles):
         self._track_discharged_vehicles(vehicles)
         self.discharge_timer += 1
+        if self.discharge_state == DISCHARGE_RECOVERY_FAILED:
+            return
         if self.discharge_state == DISCHARGE_TRANSITION_YELLOW:
             if self.discharge_timer >= self.yellow_time:
                 self.discharge_state = DISCHARGE_ALL_RED
@@ -722,6 +876,28 @@ class SignalController:
             return
 
         if self.discharge_state == DISCHARGE_WAITING:
+            snapshot = self._waiting_progress_snapshot(vehicles)
+            if self._waiting_snapshot_has_progress(
+                self._discharge_wait_snapshot, snapshot
+            ):
+                self._discharge_last_progress_frame = self.frame_number
+            self._discharge_wait_snapshot = snapshot
+            waited = self.frame_number - self._discharge_last_progress_frame
+
+            if self.discharge_mode == control_panel.DISCHARGE_AUTO:
+                self.discharge_plan_name = None
+                self.discharge_stage_index = 0
+                self._choose_or_wait_for_discharge(vehicles)
+                if (
+                    waited >= self.discharge_stall_time
+                    and self.discharge_state == DISCHARGE_WAITING
+                ):
+                    self._enter_recovery_failed(vehicles)
+                return
+
+            if waited >= self.discharge_stall_time:
+                self._enter_recovery_failed(vehicles)
+                return
             self._choose_or_wait_for_discharge(vehicles)
             return
 
@@ -735,19 +911,19 @@ class SignalController:
             return
 
         for node_x, _approach in stage.greens:
-            for vehicle in self._matching_stage_vehicles(stage, vehicles):
+            for vehicle in self._served_stage_vehicles(stage, vehicles):
                 if vehicle.get_next_target_node(INT_X) == node_x:
                     self._discharge_tracked.setdefault(
                         (id(vehicle), node_x), vehicle
                     )
         self._track_discharged_vehicles(vehicles)
-        matching = self._matching_stage_vehicles(stage, vehicles)
-        if any(vehicle.speed >= 0.25 for vehicle in matching):
+        served = self._served_stage_vehicles(stage, vehicles)
+        if any(vehicle.speed >= 0.25 for vehicle in served):
             self._discharge_last_progress_frame = self.frame_number
 
         if self.discharge_timer < self.discharge_min_green:
             return
-        if not matching:
+        if not served:
             self._finish_current_discharge_stage(
                 f"{stage.label} queue has cleared"
             )
@@ -823,6 +999,32 @@ class SignalController:
         min_y, max_y = H_Y - half_w, H_Y + half_w
         vx1, vy1, vx2, vy2 = self._vehicle_bounds(vehicle)
         return vx1 < max_x and vx2 > min_x and vy1 < max_y and vy2 > min_y
+
+    def is_intersection_clear_for_greens(
+        self, node_x, greens, vehicles, road_w=ROAD_W, h_y=H_Y
+    ):
+        """Apply direction-aware conflict-box clearance during discharge only."""
+        half_w = road_w / 2.0
+        min_x, max_x = node_x - half_w, node_x + half_w
+        min_y, max_y = h_y - half_w, h_y + half_w
+        greened_dirs = {
+            approach for green_node_x, approach in greens
+            if green_node_x == node_x
+        }
+        for vehicle in vehicles or []:
+            vx1, vy1, vx2, vy2 = self._vehicle_bounds(vehicle)
+            overlaps = (
+                vx1 < max_x
+                and vx2 > min_x
+                and vy1 < max_y
+                and vy2 > min_y
+            )
+            if not overlaps:
+                continue
+            if vehicle.direction in greened_dirs:
+                continue
+            return False
+        return True
 
     def is_intersection_clear(self, int_x, vehicles, road_w=ROAD_W, h_y=H_Y):
         half_w = road_w / 2.0

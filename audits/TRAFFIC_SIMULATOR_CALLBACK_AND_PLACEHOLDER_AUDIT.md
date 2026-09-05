@@ -1,5 +1,12 @@
 # Traffic Simulator Callback and Placeholder Audit
 
+> **Historical checkpoint:** This report describes the pre-LLM-integration
+> checkout audited on 2026-09-03. Its conclusions that the model selector and
+> RUN LLM button are placeholders were superseded by the Phase 2 integration
+> on 2026-09-05 (`agent.py`, `guard.py`, and the guarded file-based control
+> loop). Retain this document as historical audit evidence, not current AI
+> behavior documentation.
+
 **Audit date:** 2026-09-03
 **Project:** `C:\Users\ascen\python_projects\traffic_simulator`
 **Scope:** Every Tkinter/Pygame callback registration and every intentional UI
@@ -7,7 +14,7 @@ placeholder in the current checkout.
 
 Companion documents:
 
-- [Simulator Guide and Source Documentation](TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md)
+- [Simulator Guide and Source Documentation](../TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md)
 - [Audit and Step-by-Step Fix Report](TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)
 - [Gridlock Incident Report](TRAFFIC_SIMULATOR_GRIDLOCK_INCIDENT_REPORT.md)
 
@@ -130,7 +137,7 @@ of the unsafe pattern exists in this file.
 |---|---|---|
 | Initial poll | `self.poll_telemetry()` in `__init__` (line 53) | Starts polling immediately on window construction |
 | Recurring poll | `self.root.after(250, self.poll_telemetry)` inside a `finally:` block (lines 796-797) | Reschedules unconditionally, including after a caught read/schema/UI exception — matches the documented F-09 fix |
-| Mouse wheel scrolling | `root.bind("<MouseWheel>"/"<Button-4>"/"<Button-5>", self.on_mousewheel, add="+")` | Present for both scroll directions on both tabs |
+| Responsive dashboard resize | Root `<Configure>` binding -> debounced `schedule_responsive_layout()` -> `apply_responsive_layout()` | Present; content compacts without dashboard scrollbars |
 | Metric card population | `for row in metrics_layout: for title, key in row: ...` (lines 148-174) | Stores widgets in `self.vars[key]`, a dict keyed by string — not a closure over the loop variable, so no late-binding risk despite the nested loop |
 
 No `WM_DELETE_WINDOW` override exists for the dashboard window; closing it

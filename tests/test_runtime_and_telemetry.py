@@ -52,7 +52,7 @@ def test_telemetry_uses_authoritative_passengers_and_per_node_signals(tmp_path):
     car = Vehicle(0, H_Y - 0.5 * LANE, "EB")
     exporter = TelemetryExporter(tmp_path / "state.json", 1)
     payload = exporter.build_payload(controller, [car], 60)
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["network_summary"]["passenger_volume"] == car.passengers
     assert set(payload["signal_state"]["nodes"]) == {"300", "700"}
     assert payload["signal_state"]["timing"] == {
@@ -89,11 +89,104 @@ def test_telemetry_export_atomically_writes_valid_schema(tmp_path):
     destination = tmp_path / "state.json"
     exporter = TelemetryExporter(destination, 1)
     controller = SignalController({"green_time": 20})
-    assert exporter.export(controller, [], 15)
+    throughput = {
+        "passengers_served_total": 49,
+        "passengers_served_bus": 45,
+        "passengers_served_car": 4,
+        "vehicles_served_total": 2,
+        "buses_served": 1,
+        "cars_served": 1,
+    }
+    assert exporter.export(controller, [], 3600, throughput_state=throughput)
     payload = json.loads(destination.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
-    assert payload["frame_number"] == 15
+    assert payload["schema_version"] == 3
+    assert payload["frame_number"] == 3600
+    assert payload["network_throughput"]["passengers_served_total"] == 49
+    assert payload["network_throughput"]["passengers_per_minute"] == 49.0
     assert not list(tmp_path.glob("tmp*"))
+
+
+def test_schema_v3_exposes_bus_eta_routes_and_passenger_weighted_queues():
+    controller = SignalController({"green_time": 20})
+    exporter = TelemetryExporter(export_interval_frames=1)
+    bus = make_bus_for_leg("R1_EB_A_NB", 300, "ETA_BUS")
+    bus.speed = 0.0
+    car = Vehicle(0, H_Y - 0.5 * LANE, "EB")
+    car.speed = 0.0
+    throughput = {
+        "passengers_served_total": 49,
+        "passengers_served_bus": 45,
+        "passengers_served_car": 4,
+        "vehicles_served_total": 2,
+        "buses_served": 1,
+        "cars_served": 1,
+    }
+
+    payload = exporter.build_payload(
+        controller,
+        [bus, car],
+        frame_number=3600,
+        throughput_state=throughput,
+    )
+
+    assert payload["schema_version"] == 3
+    assert {
+        "signal_state",
+        "active_buses",
+        "approaching_buses",
+        "demand_generation",
+        "network_discharge",
+    } <= payload.keys()
+    assert set(payload["routes"]) == set(control_panel.bus_routes_config)
+
+    bus_state = payload["active_buses"][0]
+    assert 0 <= bus_state["eta_to_stop_bar_sec_freeflow"] < float("inf")
+    assert 0 <= bus_state["eta_to_stop_bar_sec_live"] <= 100.0
+
+    route = payload["routes"]["R1_EB_A_NB"]
+    assert route["buses_on_route"] == 1
+    assert route["route_passengers_total"] == bus.passengers
+    assert route["nearest_bus_id"] == "ETA_BUS"
+    assert route["nearest_bus_eta_sec"] == bus_state["eta_to_stop_bar_sec_freeflow"]
+    assert all(
+        payload["network_summary"]["queues_passengers_est"][approach]
+        == vehicle_count * 4
+        for approach, vehicle_count in payload["network_summary"]["queues"].items()
+    )
+    assert payload["network_summary"]["car_occupancy_assumed"] == 4
+
+
+def test_recent_throughput_uses_rolling_window_and_clears_on_reset():
+    controller = SignalController({"green_time": 20})
+    exporter = TelemetryExporter(export_interval_frames=1)
+
+    initial = exporter.build_payload(
+        controller, [], frame_number=0, throughput_state={"passengers_served_total": 0}
+    )
+    rising = exporter.build_payload(
+        controller,
+        [],
+        frame_number=600,
+        throughput_state={"passengers_served_total": 100},
+    )
+    recent = exporter.build_payload(
+        controller,
+        [],
+        frame_number=2400,
+        throughput_state={"passengers_served_total": 160},
+    )
+    reset = exporter.build_payload(
+        controller,
+        [],
+        frame_number=2460,
+        throughput_state={"passengers_served_total": 0},
+    )
+
+    assert initial["network_throughput"]["passengers_per_minute_recent"] == 0.0
+    assert rising["network_throughput"]["passengers_per_minute_recent"] == 600.0
+    assert recent["network_throughput"]["passengers_per_minute_recent"] == 120.0
+    assert reset["network_throughput"]["passengers_per_minute_recent"] == 0.0
+    assert exporter._throughput_samples == [(41.0, 0)]
 
 
 def test_dashboard_freshness_states():
@@ -155,43 +248,21 @@ def test_dashboard_history_is_bounded_in_memory():
 def test_dashboard_initial_window_fits_smaller_screens_and_remains_useful():
     assert TelemetryDashboard.initial_window_size(1920, 1080) == (900, 780)
     assert TelemetryDashboard.initial_window_size(1366, 768) == (900, 628)
-    assert TelemetryDashboard.initial_window_size(640, 480) == (560, 360)
+    assert TelemetryDashboard.initial_window_size(640, 480) == (560, 500)
 
 
-def test_dashboard_mousewheel_scrolls_selected_tab_on_both_axes():
-    class FakeNotebook:
-        @staticmethod
-        def select():
-            return ".summary"
+def test_dashboard_responsive_profile_shrinks_content_without_scrollbars():
+    full = TelemetryDashboard.responsive_profile(900, 780)
+    compact = TelemetryDashboard.responsive_profile(560, 500)
 
-    class FakeCanvas:
-        def __init__(self):
-            self.vertical_calls = []
-            self.horizontal_calls = []
-
-        def yview_scroll(self, units, mode):
-            self.vertical_calls.append((units, mode))
-
-        def xview_scroll(self, units, mode):
-            self.horizontal_calls.append((units, mode))
-
-    class WheelEvent:
-        def __init__(self, delta, state=0, num=None):
-            self.delta = delta
-            self.state = state
-            self.num = num
-
-    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
-    dashboard.notebook = FakeNotebook()
-    canvas = FakeCanvas()
-    dashboard.scroll_canvases = {".summary": canvas}
-
-    assert dashboard.on_mousewheel(WheelEvent(-120)) == "break"
-    assert canvas.vertical_calls == [(1, "units")]
-    assert dashboard.on_mousewheel(WheelEvent(120, state=0x0001)) == "break"
-    assert canvas.horizontal_calls == [(-1, "units")]
-    assert TelemetryDashboard.mousewheel_units(WheelEvent(0, num=4)) == -1
-    assert TelemetryDashboard.mousewheel_units(WheelEvent(0, num=5)) == 1
+    assert not full["compact"]
+    assert compact["compact"]
+    assert compact["header_font"] < full["header_font"]
+    assert compact["metric_value_font"] < full["metric_value_font"]
+    assert compact["metric_row_height"] < full["metric_row_height"]
+    assert compact["phase_height"] < full["phase_height"]
+    assert compact["node_height"] < full["node_height"]
+    assert compact["chart_height"] < full["chart_height"]
 
 
 def test_dashboard_line_chart_renders_sampled_series_without_gui():
@@ -475,21 +546,23 @@ def test_congestion_peak_cycles_to_recovery_and_caps_backlog(monkeypatch):
     main.reset_all_spawner_states()
 
 
-def test_llm_callbacks_remain_placeholders():
+def test_llm_callbacks_write_runtime_control_instead_of_remaining_placeholders():
     source = Path(control_panel.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
-    run_llm = functions["on_run_llm"]
-    assert len(run_llm.body) == 1 and isinstance(run_llm.body[0], ast.Pass)
-    selector = functions["on_llm_engine_selected"]
-    assigned_names = {
-        target.id
-        for node in ast.walk(selector)
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
-    assert not assigned_names
+    for callback_name in (
+        "on_run_llm",
+        "on_llm_engine_selected",
+        "on_tick_seconds_changed",
+    ):
+        callback = functions[callback_name]
+        assert not any(isinstance(node, ast.Pass) for node in ast.walk(callback))
+        called_functions = {
+            node.func.id
+            for node in ast.walk(callback)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "write_ai_control" in called_functions
 
 
 def test_priority_telemetry_distinguishes_pending_from_active():

@@ -8,7 +8,7 @@
 
 Companion documents:
 
-- [Simulator Guide and Source Documentation](TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md)
+- [Simulator Guide and Source Documentation](../TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md)
 - [Audit and Step-by-Step Fix Report](TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)
 
 ---

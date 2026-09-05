@@ -3,12 +3,14 @@ import pygame
 import sys
 import random
 import math
+import json
 import subprocess
 import atexit
 import time
 from pathlib import Path
 import canvas_gemini as canvas
 import control_panel
+import guard
 from vehicle import Vehicle, Bus
 from signal_controller import SignalController
 from telemetry_exporter import TelemetryExporter
@@ -49,9 +51,278 @@ spawner_states = {
 
 bus_dispatch_counters = { r_id: 0.0 for r_id in control_panel.bus_routes_config.keys() }
 bus_sequence_counter = 0
+network_throughput = {
+    "passengers_served_total": 0,
+    "passengers_served_bus": 0,
+    "passengers_served_car": 0,
+    "vehicles_served_total": 0,
+    "buses_served": 0,
+    "cars_served": 0,
+}
 BASE_DIR = Path(__file__).resolve().parent
 TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
 DASHBOARD_PATH = BASE_DIR / "telemetry_dashboard.py"
+AGENT_PATH = BASE_DIR / "agent.py"
+DECISION_PATH = BASE_DIR / "decision.json"
+AGENT_TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
+TELEMETRY_LOG_PATH = BASE_DIR / "telemetry_log.jsonl"
+EXCEL_EXPORT_DIR = BASE_DIR / "excel_exports"
+TELEMETRY_LOG_INTERVAL = 60
+SESSION_ROUTE_IDS = (
+    "R1_EB_A_NB",
+    "R2_EB_B_NB",
+    "R3_EB_ONLY",
+    "R4_WB_A_SB",
+    "R5_WB_B_SB",
+    "R6_WB_ONLY",
+)
+_last_telemetry_log_frame = None
+
+
+def reset_session_logs():
+    """Start a clean pair of append-only logs for one simulator run."""
+    global _last_telemetry_log_frame
+    _last_telemetry_log_frame = None
+    for path in (TELEMETRY_LOG_PATH, AGENT_TURN_LOG_PATH):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"Session log reset warning for {path.name}: {exc}")
+
+
+def log_telemetry_sample(frame_number, payload):
+    """Append one schema-derived telemetry sample at roughly one-second gaps."""
+    global _last_telemetry_log_frame
+    try:
+        frame_number = int(frame_number)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not isinstance(payload, dict) or frame_number < 0:
+        return False
+    if _last_telemetry_log_frame is None:
+        if frame_number < TELEMETRY_LOG_INTERVAL:
+            return False
+    elif (
+        frame_number <= _last_telemetry_log_frame
+        or frame_number - _last_telemetry_log_frame < TELEMETRY_LOG_INTERVAL
+    ):
+        return False
+
+    network_throughput_state = payload.get("network_throughput", {})
+    network_summary_state = payload.get("network_summary", {})
+    if not isinstance(network_throughput_state, dict):
+        network_throughput_state = {}
+    if not isinstance(network_summary_state, dict):
+        network_summary_state = {}
+    ai_runtime = control_panel.global_config.get("ai_runtime", {})
+    if not isinstance(ai_runtime, dict):
+        ai_runtime = {}
+    record = {
+        "frame": frame_number,
+        "sim_time_s": payload.get("simulation_time_seconds"),
+        "passengers_served_total": network_throughput_state.get(
+            "passengers_served_total"
+        ),
+        "passengers_served_bus": network_throughput_state.get(
+            "passengers_served_bus"
+        ),
+        "passengers_served_car": network_throughput_state.get(
+            "passengers_served_car"
+        ),
+        "buses_served": network_throughput_state.get("buses_served"),
+        "cars_served": network_throughput_state.get("cars_served"),
+        "pax_per_min_cumulative": network_throughput_state.get(
+            "passengers_per_minute"
+        ),
+        "pax_per_min_recent": network_throughput_state.get(
+            "passengers_per_minute_recent"
+        ),
+        "queues_vehicles": network_summary_state.get("queues"),
+        "queues_passengers_est": network_summary_state.get(
+            "queues_passengers_est"
+        ),
+        "vehicles_in_network": network_summary_state.get("total_vehicles"),
+        "ai_armed": bool(ai_runtime.get("armed", False)),
+        "ai_last_status": ai_runtime.get("last_status"),
+    }
+    try:
+        with TELEMETRY_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(record) + "\n")
+    except (OSError, TypeError, ValueError):
+        return False
+    _last_telemetry_log_frame = frame_number
+    return True
+
+
+def _read_jsonl_rows(path):
+    """Read all complete JSON-object lines and ignore a damaged crash tail."""
+    rows = []
+    try:
+        with Path(path).open("r", encoding="utf-8") as source:
+            for line in source:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+    except OSError:
+        pass
+    return rows
+
+
+def export_session_excel(output_path=None):
+    """Build a two-sheet workbook from the crash-safe session JSONL logs."""
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print("openpyxl not installed; skipping Excel export")
+        return None
+
+    decisions = _read_jsonl_rows(AGENT_TURN_LOG_PATH)
+    telemetry_rows = _read_jsonl_rows(TELEMETRY_LOG_PATH)
+    if not decisions and not telemetry_rows:
+        return None
+
+    try:
+        workbook = Workbook()
+        decisions_sheet = workbook.active
+        decisions_sheet.title = "Decisions"
+        decision_header = ["turn", "timestamp", "model", "status"]
+        for route_id in SESSION_ROUTE_IDS:
+            decision_header.extend(
+                (f"{route_id}_tsp", f"{route_id}_dbl")
+            )
+        decision_header.extend(("locked_routes", "minimap", "raw_output"))
+        decisions_sheet.append(decision_header)
+        for decision in decisions:
+            flags = decision.get("flags", {})
+            if not isinstance(flags, dict):
+                flags = {}
+            row = [
+                decision.get("turn"),
+                decision.get("timestamp"),
+                decision.get("model"),
+                decision.get("status"),
+            ]
+            for route_id in SESSION_ROUTE_IDS:
+                route_flags = flags.get(route_id, {})
+                if not isinstance(route_flags, dict):
+                    route_flags = {}
+                row.extend(
+                    (
+                        bool(route_flags.get("tsp", False)),
+                        bool(route_flags.get("dbl", False)),
+                    )
+                )
+            locked_routes = decision.get("locked_routes", [])
+            if not isinstance(locked_routes, (list, tuple, set, frozenset)):
+                locked_routes = []
+            row.extend(
+                (
+                    ",".join(str(route_id) for route_id in locked_routes),
+                    str(decision.get("minimap", ""))[:32767],
+                    str(decision.get("raw_output", ""))[:32767],
+                )
+            )
+            decisions_sheet.append(row)
+
+        telemetry_sheet = workbook.create_sheet("Telemetry")
+        telemetry_header = [
+            "frame",
+            "sim_time_s",
+            "passengers_served_total",
+            "passengers_served_bus",
+            "passengers_served_car",
+            "buses_served",
+            "cars_served",
+            "pax_per_min_cumulative",
+            "pax_per_min_recent",
+            "vehicles_in_network",
+            "ai_armed",
+            "ai_last_status",
+            "queues_vehicles",
+            "queues_passengers_est",
+        ]
+        telemetry_sheet.append(telemetry_header)
+        for telemetry in telemetry_rows:
+            telemetry_sheet.append(
+                [
+                    telemetry.get("frame"),
+                    telemetry.get("sim_time_s"),
+                    telemetry.get("passengers_served_total"),
+                    telemetry.get("passengers_served_bus"),
+                    telemetry.get("passengers_served_car"),
+                    telemetry.get("buses_served"),
+                    telemetry.get("cars_served"),
+                    telemetry.get("pax_per_min_cumulative"),
+                    telemetry.get("pax_per_min_recent"),
+                    telemetry.get("vehicles_in_network"),
+                    telemetry.get("ai_armed"),
+                    telemetry.get("ai_last_status"),
+                    json.dumps(telemetry.get("queues_vehicles")),
+                    json.dumps(telemetry.get("queues_passengers_est")),
+                ]
+            )
+
+        destination = (
+            Path(output_path)
+            if output_path is not None
+            else EXCEL_EXPORT_DIR
+            / f"session_export_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        workbook.save(destination)
+        workbook.close()
+        print(f"Session exported: {destination}")
+        return destination
+    except Exception as exc:
+        print(f"Session Excel export warning: {exc}")
+        return None
+
+
+def _set_ai_flags(flags):
+    for route_id, route_flags in flags.items():
+        route_config = control_panel.bus_routes_config[route_id]
+        route_config["tsp_enabled"] = route_flags["tsp"]
+        route_config["dbl_enabled"] = route_flags["dbl"]
+
+
+def merge_ai_decision(path=None):
+    """Validate and merge one file-based AI decision into live route config."""
+    runtime = control_panel.global_config.setdefault("ai_runtime", {})
+    decision_path = DECISION_PATH if path is None else Path(path)
+    try:
+        with decision_path.open("r", encoding="utf-8") as decision_file:
+            decision = json.load(decision_file)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        runtime["last_status"] = "WAITING_FOR_DECISION"
+        return False
+
+    try:
+        runtime["last_turn"] = int(decision.get("turn", 0))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        runtime["last_turn"] = 0
+
+    flags = guard.validate_flags(decision)
+    if flags is None:
+        _set_ai_flags(guard.all_off_flags())
+        runtime["last_status"] = "INVALID_DECISION"
+        return False
+
+    _set_ai_flags(flags)
+    decision_status = decision.get("status", "OK")
+    runtime["last_status"] = (
+        decision_status
+        if decision_status in ("OK", "HELD_ALL_OFF")
+        else "OK"
+    )
+    return True
 
 
 def reset_all_spawner_states():
@@ -353,6 +624,7 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
 
 
 def main():
+    reset_session_logs()
     pygame.init()
     pygame.font.init()
     font = pygame.font.SysFont("Consolas", 13, bold=True)
@@ -384,12 +656,27 @@ def main():
         cwd=str(BASE_DIR),
     )
 
-    # 3. Register cleanup to prevent zombie dashboard processes on exit
+    print("Launching LLM Control Agent...")
+    agent_proc = subprocess.Popen(
+        [sys.executable, str(AGENT_PATH)],
+        cwd=str(BASE_DIR),
+    )
+
+    # 3. Register cleanup, then build the workbook after agent writes stop.
     def cleanup():
         try:
             dashboard_proc.terminate()
         except Exception:
             pass
+        try:
+            agent_proc.terminate()
+        except Exception:
+            pass
+        try:
+            agent_proc.wait(timeout=2)
+        except Exception:
+            pass
+        export_session_excel()
     atexit.register(cleanup)
 
     master_frame_count = 0
@@ -427,6 +714,7 @@ def main():
             vehicles.clear()
             reset_all_spawner_states()
             signals.reset_discharge()
+            network_throughput.update({key: 0 for key in network_throughput})
             control_panel.global_config["reset_triggered"] = False
 
         sim_speed = control_panel.global_config.get("sim_speed", 1.0)
@@ -456,6 +744,10 @@ def main():
 
                     if post_discharge_meter_frames_remaining <= 0:
                         check_and_dispatch_buses(vehicles, lane_options, dt_step)
+                if master_frame_count % 30 == 0:
+                    ai_runtime = control_panel.global_config.get("ai_runtime", {})
+                    if ai_runtime.get("armed", False):
+                        merge_ai_decision()
                 signals.update(vehicles=vehicles)
                 discharge_is_active = signals.is_discharge_active()
                 if discharge_was_active and not discharge_is_active:
@@ -478,6 +770,16 @@ def main():
                         signal_controller=signals
                     )
                     if (v.x < -60 or v.x > canvas.WIDTH + 60 or v.y < -60 or v.y > canvas.HEIGHT + 60):
+                        if len(getattr(v, "passed_nodes", set())) > 0:
+                            passengers = int(getattr(v, "passengers", 0))
+                            network_throughput["passengers_served_total"] += passengers
+                            network_throughput["vehicles_served_total"] += 1
+                            if isinstance(v, Bus):
+                                network_throughput["passengers_served_bus"] += passengers
+                                network_throughput["buses_served"] += 1
+                            else:
+                                network_throughput["passengers_served_car"] += passengers
+                                network_throughput["cars_served"] += 1
                         vehicles.remove(v)
                 
                 time_accumulator -= dt_step
@@ -505,12 +807,23 @@ def main():
         for v in vehicles:
             v.draw(screen)
 
-        telemetry.export(
+        telemetry_exported = telemetry.export(
             signal_controller=signals,
             vehicles=vehicles,
             frame_number=master_frame_count,
             demand_state=get_demand_telemetry(),
+            throughput_state=network_throughput,
         )
+        if telemetry_exported:
+            try:
+                with TELEMETRY_PATH.open("r", encoding="utf-8") as telemetry_file:
+                    exported_payload = json.load(telemetry_file)
+                log_telemetry_sample(
+                    exported_payload.get("frame_number", master_frame_count),
+                    exported_payload,
+                )
+            except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+                pass
         pygame.display.flip()
 
         # Constant GUI polling rate (~60 FPS) decoupled from simulation speed

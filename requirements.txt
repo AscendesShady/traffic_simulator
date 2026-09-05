@@ -5,6 +5,9 @@
 
 # Application runtime
 pygame>=2.5,<3
+ollama>=0.6,<1
+langgraph>=1.2,<2
+openpyxl>=3.1,<4
 
 # Regression and safety test suite
 pytest>=8,<10

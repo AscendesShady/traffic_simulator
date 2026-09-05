@@ -1,6 +1,11 @@
 # control_panel.py
+import json
+import os
+from pathlib import Path
+import subprocess
 import tkinter as tk
 from tkinter import ttk
+import tempfile
 import sys
 
 # ==========================================================
@@ -19,6 +24,9 @@ COLOR_TEXT_SECONDARY = "#94A3B8"# Soft light blue-gray
 
 FONT_FAMILY = "Segoe UI"      # Clean UI font
 
+BASE_DIR = Path(__file__).resolve().parent
+AI_CONTROL_PATH = BASE_DIR / "ai_control.json"
+
 SYM_DOT = "\u25cf"            # ●
 SYM_PAUSE = "\u23f8"          # ⏸
 SYM_PLAY = "\u25b6"           # ▶
@@ -35,6 +43,10 @@ DISCHARGE_OPTIONS = (
     "Node B Northbound",
     "Node B Southbound",
 )
+
+# Live widget references used by the periodic repaint poller. The data in
+# bus_routes_config remains authoritative whether a human or the LLM changed it.
+route_flag_buttons = {}
 
 # ==========================================================
 # SHARED STATE DICTIONARIES (Accessed by main.py)
@@ -56,6 +68,13 @@ global_config = {
         "recommendation": "Select Auto or a corridor, then start discharge",
         "stage": "",
         "vehicles_discharged": 0,
+    },
+    "ai_runtime": {
+        "armed": False,
+        "model": "None",
+        "tick_seconds": 5,
+        "last_status": "INACTIVE",
+        "last_turn": 0,
     },
 }
 
@@ -155,7 +174,86 @@ APPROACH_NAMES = {
     "B_SB": "Node B (SB)"
 }
 
+
+def repaint_route_flag_buttons():
+    """Repaint TSP/DBL controls from the authoritative route configuration."""
+    for route_id, buttons in route_flag_buttons.items():
+        config = bus_routes_config.get(route_id, {})
+        tsp_on = bool(config.get("tsp_enabled", False))
+        dbl_on = bool(config.get("dbl_enabled", False))
+        buttons["tsp"].config(
+            text="TSP ACTIVE" if tsp_on else "TSP OFF",
+            fg=COLOR_SUCCESS if tsp_on else COLOR_DANGER,
+        )
+        buttons["dbl"].config(
+            text="DBL ACTIVE" if dbl_on else "DBL OFF",
+            fg=COLOR_ACCENT if dbl_on else COLOR_DANGER,
+        )
+
+
+def get_ollama_models():
+    """Return locally installed Ollama tags, with safe offline fallbacks."""
+    fallback = [
+        "None",
+        "gemma4:12b",
+        "llama3.1:8b",
+        "deepseek-r1:32b",
+        "qwen3.6:latest",
+    ]
+    try:
+        result = subprocess.run(
+            ["ollama", "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return fallback
+        names = [
+            line.split()[0]
+            for line in result.stdout.strip().splitlines()[1:]
+            if line.split()
+        ]
+        return ["None"] + list(dict.fromkeys(names))
+    except Exception:
+        return fallback
+
+
+def write_ai_control(path=None):
+    """Atomically mirror in-process AI controls for the agent subprocess."""
+    runtime = global_config["ai_runtime"]
+    payload = {
+        "armed": bool(runtime.get("armed", False)),
+        "model": str(runtime.get("model", "None")),
+        "tick_seconds": min(15, max(2, int(runtime.get("tick_seconds", 5)))),
+    }
+    destination = AI_CONTROL_PATH if path is None else Path(path)
+    temp_name = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=destination.parent,
+            delete=False,
+        ) as temp_file:
+            json.dump(payload, temp_file, indent=2)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_name = Path(temp_file.name)
+        os.replace(temp_name, destination)
+        return True
+    except Exception:
+        if temp_name and temp_name.exists():
+            try:
+                temp_name.unlink()
+            except OSError:
+                pass
+        runtime["last_status"] = "CONTROL_WRITE_ERROR"
+        return False
+
 def create_dashboard_window():
+    route_flag_buttons.clear()
     root = tk.Tk()
     root.title("Traffic & Transit Control Dashboard")
     # Increased height slightly to accommodate the new AI control section
@@ -164,6 +262,7 @@ def create_dashboard_window():
     # underneath this window and also made focus/drag interaction feel sticky.
     root.attributes("-topmost", False)
     root.configure(bg=COLOR_BG)
+    write_ai_control()
 
     def on_close():
         global_config["is_running"] = False
@@ -485,23 +584,39 @@ def create_dashboard_window():
     llm_lbl = tk.Label(ai_row1, text="LLM Engine", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     llm_lbl.pack(side="left", padx=(0, 8))
 
+    available_models = get_ollama_models()
+    selected_model = str(global_config["ai_runtime"].get("model", "None"))
+    if selected_model not in available_models:
+        selected_model = "None"
+        global_config["ai_runtime"]["model"] = selected_model
+
     llm_engine_box = ttk.Combobox(
         ai_row1,
-        values=["None", "gemma4:12b", "deepseek-r1:32b", "qwen3.6:latest", "llama3:latest", "gemma4:latest"],
+        values=available_models,
         width=22, state="readonly", style="Modern.TCombobox"
     )
-    llm_engine_box.set("None")
+    llm_engine_box.set(selected_model)
     llm_engine_box.pack(side="left", padx=(0, 16))
 
     def on_llm_engine_selected(event):
-        # UI-only update
-        selected_val_lbl.config(text=llm_engine_box.get())
+        selected_model_name = llm_engine_box.get()
+        selected_val_lbl.config(text=selected_model_name)
+        global_config["ai_runtime"]["model"] = selected_model_name
+        if global_config["ai_runtime"].get("armed", False):
+            global_config["ai_runtime"]["last_status"] = "MODEL_CHANGED_WAITING"
+        write_ai_control()
 
     llm_engine_box.bind("<<ComboboxSelected>>", on_llm_engine_selected)
 
     def on_run_llm():
-        # Dummy callback - intentionally does nothing
-        pass
+        runtime = global_config["ai_runtime"]
+        runtime["armed"] = not runtime.get("armed", False)
+        runtime["last_status"] = (
+            "WAITING_FOR_DECISION" if runtime["armed"] else "INACTIVE"
+        )
+        if runtime["armed"]:
+            runtime["last_turn"] = 0
+        write_ai_control()
 
     run_llm_btn = tk.Button(
         ai_row1, text=f"{SYM_PLAY} RUN LLM", font=(FONT_FAMILY, 8, "bold"),
@@ -527,8 +642,43 @@ def create_dashboard_window():
     sel_lbl = tk.Label(ai_row2, text="Selected: ", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     sel_lbl.pack(side="left")
     
-    selected_val_lbl = tk.Label(ai_row2, text="None", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_ACCENT)
+    selected_val_lbl = tk.Label(ai_row2, text=selected_model, font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_ACCENT)
     selected_val_lbl.pack(side="left")
+
+    tick_runtime = global_config["ai_runtime"]
+    tick_value_lbl = tk.Label(
+        ai_row2,
+        text=f"{int(tick_runtime.get('tick_seconds', 5))}s",
+        font=(FONT_FAMILY, 8, "bold"),
+        bg=COLOR_CARD,
+        fg=COLOR_ACCENT,
+        width=4,
+    )
+    tick_value_lbl.pack(side="right")
+
+    def on_tick_seconds_changed(value):
+        tick_seconds = min(15, max(2, int(float(value))))
+        global_config["ai_runtime"]["tick_seconds"] = tick_seconds
+        tick_value_lbl.config(text=f"{tick_seconds}s")
+        write_ai_control()
+
+    tick_slider = ttk.Scale(
+        ai_row2,
+        from_=2,
+        to=15,
+        value=tick_runtime.get("tick_seconds", 5),
+        style="Global.Horizontal.TScale",
+        command=on_tick_seconds_changed,
+        length=110,
+    )
+    tick_slider.pack(side="right", padx=(6, 2))
+    tk.Label(
+        ai_row2,
+        text="Decision interval",
+        font=(FONT_FAMILY, 8),
+        bg=COLOR_CARD,
+        fg=COLOR_TEXT_PRIMARY,
+    ).pack(side="right")
 
     # Third row: Control Scope Label
     ai_row3 = tk.Frame(ai_card, bg=COLOR_CARD)
@@ -542,6 +692,39 @@ def create_dashboard_window():
     
     ctrl_rest_lbl = tk.Label(ai_row3, text=" for all bus routes", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     ctrl_rest_lbl.pack(side="left")
+
+    def refresh_llm_status():
+        runtime = global_config.get("ai_runtime", {})
+        armed = bool(runtime.get("armed", False))
+        status = str(runtime.get("last_status", "INACTIVE"))
+        turn = int(runtime.get("last_turn", 0))
+        if not armed:
+            color = COLOR_TEXT_SECONDARY
+            status_text_value = "LLM INACTIVE"
+            button_text = f"{SYM_PLAY} RUN LLM"
+        else:
+            color = {
+                "OK": COLOR_SUCCESS,
+                "HELD_ALL_OFF": COLOR_DANGER,
+                "INVALID_DECISION": COLOR_DANGER,
+                "CONTROL_WRITE_ERROR": COLOR_DANGER,
+            }.get(status, COLOR_WARNING)
+            status_text_value = f"LLM {status}"
+            if turn:
+                status_text_value += f" | TURN {turn}"
+            button_text = "DISARM LLM"
+        llm_dot.config(fg=color)
+        llm_status_text.config(text=status_text_value, fg=color)
+        run_llm_btn.config(text=button_text)
+        root.after(250, refresh_llm_status)
+
+    root.after(250, refresh_llm_status)
+
+    def refresh_route_buttons():
+        repaint_route_flag_buttons()
+        root.after(250, refresh_route_buttons)
+
+    root.after(250, refresh_route_buttons)
 
 
     # 3. TRANSIT ROUTES CONTROL CARD
@@ -704,6 +887,7 @@ def create_dashboard_window():
         )
         dbl_btn.config(command=make_dbl_toggle(r_id, dbl_btn))
         dbl_btn.pack(fill="both", expand=True)
+        route_flag_buttons[r_id] = {"tsp": tsp_btn, "dbl": dbl_btn}
 
     # 4. PER-APPROACH PARAMETERS SECTION
     approaches_container = tk.Frame(root, bg=COLOR_BG)

@@ -13,6 +13,11 @@ venv/
 # Runtime-generated simulator data
 runtime/
 traffic_state_telemetry.json
+ai_control.json
+decision.json
+agent_turn_log.jsonl
+telemetry_log.jsonl
+excel_exports/*.xlsx
 *.log
 *.tmp
 

@@ -6,6 +6,7 @@
 # Application runtime
 pygame>=2.5,<3
 ollama>=0.6,<1
+google-genai>=1,<2
 langgraph>=1.2,<2
 openpyxl>=3.1,<4
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import queue
 import tempfile
+import threading
 import time
 from typing import TypedDict
 
@@ -15,6 +17,13 @@ try:
     import ollama
 except ImportError:  # The simulator still starts and the agent fails all-off.
     ollama = None
+
+try:
+    from google import genai as _genai
+    from google.genai import types as _genai_types
+except ImportError:  # Gemini remains unavailable without the optional SDK.
+    _genai = None
+    _genai_types = None
 
 try:
     from langgraph.graph import END, StateGraph
@@ -32,8 +41,48 @@ TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
 STALE_SECONDS = 3.0
 RECENT_DECISION_LIMIT = 5
 DEFAULT_CONTROL = {"armed": False, "model": "None", "tick_seconds": 5}
+GEMINI_TIMEOUT_SECONDS = 30.0
+OLLAMA_TIMEOUT_SECONDS = 45.0
+_GEMINI_CLIENT = None
+_GEMINI_CALL_LOCK = threading.Lock()
+_OLLAMA_CLIENT = None
+_OLLAMA_CALL_LOCK = threading.Lock()
 
-OUTPUT_SCHEMA = json.dumps({"flags": guard.all_off_flags()}, indent=2)
+OUTPUT_SCHEMA = json.dumps(
+    {
+        "reason": (
+            "<one sentence: why these flags maximize passenger throughput "
+            "this turn>"
+        ),
+        "tsp": [False for _ in guard.ROUTE_ORDER],
+        "dbl": [False for _ in guard.ROUTE_ORDER],
+    },
+    indent=2,
+)
+OLLAMA_OUTPUT_FORMAT = {
+    "type": "object",
+    "properties": {
+        "reason": {"type": "string"},
+        "tsp": {
+            "type": "array",
+            "items": {"type": "boolean"},
+            "minItems": len(guard.ROUTE_ORDER),
+            "maxItems": len(guard.ROUTE_ORDER),
+        },
+        "dbl": {
+            "type": "array",
+            "items": {"type": "boolean"},
+            "minItems": len(guard.ROUTE_ORDER),
+            "maxItems": len(guard.ROUTE_ORDER),
+        },
+    },
+    "required": ["reason", "tsp", "dbl"],
+    "additionalProperties": False,
+}
+ROUTE_ORDER_TEXT = "\n".join(
+    f"{position}) {route_id}"
+    for position, route_id in enumerate(guard.ROUTE_ORDER, start=1)
+)
 SYSTEM_PROMPT = f"""You control TSP and DBL flags for one traffic network.
 Your objective is to maximize passengers_per_minute across the whole network.
 
@@ -42,9 +91,19 @@ DBL enables the dynamic bus lane for that route. A 45-passenger bus can justify
 priority, but unnecessary priority delays cross traffic. Use
 queues_passengers_est to account for that tradeoff.
 
-Return EXACTLY one JSON object matching this literal schema, with all six route
-IDs and strict JSON booleans. Do not add markdown, analysis, or extra keys:
+The route positions are fixed in this exact order:
+{ROUTE_ORDER_TEXT}
+
+Return EXACTLY one JSON object matching this literal schema. The first boolean
+in each array controls route position 1, the second controls position 2, and so
+on. Never write route IDs as JSON keys. Use strict JSON booleans and do not add
+markdown, analysis, or extra keys:
 {OUTPUT_SCHEMA}
+
+"reason" must be one sentence under about 40 words stating the main throughput
+justification for this turn's flag choices. Keep it on one line, with no line
+breaks and no quotation marks inside it if avoidable. The "tsp" and "dbl"
+arrays matter most: each must contain exactly {len(guard.ROUTE_ORDER)} booleans.
 
 If a route has no approaching bus, set both tsp and dbl to false. If a route is
 marked GRANTED, preserve its current tsp and dbl values and do not change it.
@@ -53,6 +112,7 @@ marked GRANTED, preserve its current tsp and dbl values and do not change it.
 
 class AgentState(TypedDict):
     telemetry: dict
+    discharge_active: bool
     minimap: str
     locked_routes: set
     raw_output: str
@@ -97,6 +157,12 @@ def log_turn(state: AgentState, decision: dict) -> None:
         locked_routes = state.get("locked_routes", [])
         if not isinstance(locked_routes, (list, tuple, set, frozenset)):
             locked_routes = []
+        telemetry = state.get("telemetry", {})
+        if not isinstance(telemetry, dict):
+            telemetry = {}
+        throughput = telemetry.get("network_throughput", {})
+        if not isinstance(throughput, dict):
+            throughput = {}
         record = {
             "turn": decision.get("turn"),
             "timestamp": decision.get("timestamp"),
@@ -105,6 +171,10 @@ def log_turn(state: AgentState, decision: dict) -> None:
             "minimap": state.get("minimap", ""),
             "raw_output": state.get("raw_output", ""),
             "flags": decision.get("flags", {}),
+            "reason": decision.get("reason", ""),
+            "pax_per_min_recent": throughput.get(
+                "passengers_per_minute_recent"
+            ),
             "locked_routes": sorted(locked_routes),
             "stale": state.get("status") in ("STALE", "HELD"),
         }
@@ -194,6 +264,40 @@ def _route_after_load(state: AgentState) -> str:
     return "hold" if state.get("status") == "STALE" else "continue"
 
 
+def check_discharge(state: AgentState) -> dict:
+    """Stand down with fresh all-off flags while recovery owns the network."""
+    telemetry = state.get("telemetry", {})
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+    discharge = telemetry.get("network_discharge", {})
+    if not isinstance(discharge, dict):
+        discharge = {}
+    if bool(discharge.get("active", False)):
+        controller_state = discharge.get("controller_state", "UNKNOWN")
+        decision = {
+            "schema_version": 1,
+            "turn": int(state.get("turn", 0)),
+            "timestamp": time.time(),
+            "model": str(state.get("model", "None")),
+            "status": "STANDDOWN_DISCHARGE",
+            "reason": (
+                f"Discharge active ({controller_state}); agent standing down."
+            ),
+            "flags": guard.all_off_flags(),
+        }
+        return {
+            "decision": decision,
+            "status": "STANDDOWN",
+            "raw_output": "",
+            "discharge_active": True,
+        }
+    return {"discharge_active": False}
+
+
+def _route_after_discharge(state: AgentState) -> str:
+    return "standdown" if state.get("discharge_active") else "continue"
+
+
 def read_minimap(state: AgentState) -> dict:
     telemetry = state.get("telemetry", {})
     routes = telemetry.get("routes", {})
@@ -221,7 +325,7 @@ def read_minimap(state: AgentState) -> dict:
         )
 
     lines.append("ROUTES:")
-    for route_id in sorted(guard.VALID_ROUTES):
+    for route_position, route_id in enumerate(guard.ROUTE_ORDER, start=1):
         route = routes.get(route_id, {}) if isinstance(routes, dict) else {}
         candidates = approaching.get(route_id, [])
         nearest = candidates[0] if candidates else None
@@ -229,7 +333,8 @@ def read_minimap(state: AgentState) -> dict:
             route_leg = nearest.get("route_leg", {})
             granted = bool(nearest.get("priority_granted", False))
             lines.append(
-                f"- {route_id}: active={bool(route.get('active', False))} "
+                f"{route_position}) {route_id}: "
+                f"active={bool(route.get('active', False))} "
                 f"tsp={bool(route.get('tsp_enabled', False))} "
                 f"dbl={bool(route.get('dbl_enabled', False))} "
                 f"approaching_buses={len(candidates)} "
@@ -240,7 +345,8 @@ def read_minimap(state: AgentState) -> dict:
             )
         else:
             lines.append(
-                f"- {route_id}: active={bool(route.get('active', False))} "
+                f"{route_position}) {route_id}: "
+                f"active={bool(route.get('active', False))} "
                 f"tsp={bool(route.get('tsp_enabled', False))} "
                 f"dbl={bool(route.get('dbl_enabled', False))} "
                 "approaching_buses=0 none approaching"
@@ -262,36 +368,202 @@ def read_minimap(state: AgentState) -> dict:
 
 
 def check_locked(state: AgentState) -> dict:
-    approaching = actionable_buses(state.get("telemetry", {}))
-    locked = {
-        route_id
-        for route_id, buses in approaching.items()
-        if buses and bool(buses[0].get("priority_granted", False))
-    }
+    telemetry = state.get("telemetry", {})
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+    locked = set()
+    active_buses = telemetry.get("active_buses", [])
+    if not isinstance(active_buses, list):
+        active_buses = []
+    for bus in active_buses:
+        if not isinstance(bus, dict):
+            continue
+        route_id = bus.get("route_id")
+        if route_id not in guard.VALID_ROUTES:
+            continue
+        # Vehicle leg_state describes geometry (APPROACHING,
+        # IN_INTERSECTION, TURNING, ...), while these two telemetry booleans
+        # expose the controller's grant lifecycle. Keep a route locked through
+        # both the active-green and clearing portions of an accepted grant.
+        if bool(bus.get("priority_granted", False)) or bool(
+            bus.get("priority_clearing", False)
+        ):
+            locked.add(route_id)
     minimap = state.get("minimap", "")
     if locked:
         minimap += "\nLOCKED_ROUTES=" + ",".join(sorted(locked))
     return {"locked_routes": locked, "minimap": minimap}
 
 
+def _is_gemini(model: str) -> bool:
+    return isinstance(model, str) and model.startswith("gemini-")
+
+
+def _get_gemini_client():
+    global _GEMINI_CLIENT
+    if _GEMINI_CLIENT is None:
+        if _genai is None:
+            raise RuntimeError("google-genai package not installed")
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set")
+        _GEMINI_CLIENT = _genai.Client(api_key=api_key)
+    return _GEMINI_CLIENT
+
+
+def _call_gemini(model: str, system_prompt: str, minimap: str) -> str:
+    """Call Gemini with low temperature and a hard, non-overlapping timeout."""
+    client = _get_gemini_client()
+    if _genai_types is None:
+        raise RuntimeError("google-genai package not installed")
+    call_lock = _GEMINI_CALL_LOCK
+    if not call_lock.acquire(blocking=False):
+        raise RuntimeError("previous Gemini request is still running")
+
+    result_queue = queue.Queue(maxsize=1)
+    prompt = system_prompt + "\n\n" + minimap
+
+    def request():
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=_genai_types.GenerateContentConfig(temperature=0.2),
+            )
+            outcome = (True, response)
+        except Exception as exc:
+            outcome = (False, exc)
+        finally:
+            call_lock.release()
+        result_queue.put(outcome)
+
+    request_thread = threading.Thread(
+        target=request,
+        name="gemini-agent-request",
+        daemon=True,
+    )
+    try:
+        request_thread.start()
+    except Exception:
+        call_lock.release()
+        raise
+
+    try:
+        succeeded, value = result_queue.get(timeout=GEMINI_TIMEOUT_SECONDS)
+    except queue.Empty as exc:
+        raise TimeoutError(
+            f"Gemini request exceeded {GEMINI_TIMEOUT_SECONDS:g}s timeout"
+        ) from exc
+    if not succeeded:
+        raise value
+    text = getattr(value, "text", None)
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("empty Gemini response")
+    return text
+
+
+def _ollama_format_is_unsupported(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "format" in message and any(
+        marker in message
+        for marker in (
+            "unexpected keyword",
+            "unexpected argument",
+            "unknown field",
+            "unknown parameter",
+            "not supported",
+            "unsupported",
+        )
+    )
+
+
+def _get_ollama_client():
+    """Return an Ollama client with a native HTTP request timeout when available."""
+    global _OLLAMA_CLIENT
+    if ollama is None:
+        raise RuntimeError("ollama Python package is not installed")
+    if _OLLAMA_CLIENT is None:
+        client_type = getattr(ollama, "Client", None)
+        if client_type is None:
+            # Supports lightweight test doubles and older clients; the outer
+            # thread deadline below remains authoritative.
+            return ollama
+        _OLLAMA_CLIENT = client_type(timeout=OLLAMA_TIMEOUT_SECONDS)
+    return _OLLAMA_CLIENT
+
+
+def _call_ollama(model: str, minimap: str) -> str:
+    client = _get_ollama_client()
+    call_lock = _OLLAMA_CALL_LOCK
+    if not call_lock.acquire(blocking=False):
+        raise RuntimeError("previous Ollama request is still running")
+
+    request = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": minimap},
+        ],
+        "options": {"temperature": 0.2},
+    }
+
+    result_queue = queue.Queue(maxsize=1)
+
+    def request_ollama():
+        try:
+            try:
+                response = client.chat(format=OLLAMA_OUTPUT_FORMAT, **request)
+            except Exception as exc:
+                if not _ollama_format_is_unsupported(exc):
+                    raise
+                response = client.chat(**request)
+            outcome = (True, response)
+        except Exception as exc:
+            outcome = (False, exc)
+        finally:
+            call_lock.release()
+        result_queue.put(outcome)
+
+    request_thread = threading.Thread(
+        target=request_ollama,
+        name="ollama-agent-request",
+        daemon=True,
+    )
+    try:
+        request_thread.start()
+    except Exception:
+        call_lock.release()
+        raise
+
+    try:
+        succeeded, value = result_queue.get(timeout=OLLAMA_TIMEOUT_SECONDS)
+    except queue.Empty as exc:
+        # A thread deadline cannot kill the underlying HTTP/server inference;
+        # the daemon and call lock let the agent continue without overlapping it.
+        raise TimeoutError(
+            f"Ollama request exceeded {OLLAMA_TIMEOUT_SECONDS:g}s timeout"
+        ) from exc
+    if not succeeded:
+        raise value
+    response = value
+    return response["message"]["content"]
+
+
 def ai_turn(state: AgentState) -> dict:
     model = state.get("model", "None")
     try:
-        if ollama is None:
-            raise RuntimeError("ollama Python package is not installed")
         if not model or model == "None":
-            raise RuntimeError("no Ollama model selected")
-        response = ollama.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": state.get("minimap", "")},
-            ],
-            options={"temperature": 0.2},
-        )
-        raw_output = response["message"]["content"]
+            raise RuntimeError("no model selected")
+        if _is_gemini(model):
+            raw_output = _call_gemini(
+                model,
+                SYSTEM_PROMPT,
+                state.get("minimap", ""),
+            )
+        else:
+            raw_output = _call_ollama(model, state.get("minimap", ""))
         if not isinstance(raw_output, str):
-            raise TypeError("Ollama response content is not text")
+            raise TypeError("model response content is not text")
         return {"raw_output": raw_output, "status": "OK"}
     except Exception as exc:
         return {
@@ -339,6 +611,7 @@ def hold(state: AgentState) -> dict:
         "model": str(state.get("model", "None")),
         "status": "HELD_ALL_OFF",
         "flags": guard.all_off_flags(),
+        "reason": "",
     }
     atomic_write_json(DECISION_PATH, decision)
     log_turn(state, decision)
@@ -354,6 +627,7 @@ def build_graph():
         raise RuntimeError("langgraph Python package is not installed")
     workflow = StateGraph(AgentState)
     workflow.add_node("load_save", load_save)
+    workflow.add_node("check_discharge", check_discharge)
     workflow.add_node("read_minimap", read_minimap)
     workflow.add_node("check_locked", check_locked)
     workflow.add_node("ai_turn", ai_turn)
@@ -364,7 +638,12 @@ def build_graph():
     workflow.add_conditional_edges(
         "load_save",
         _route_after_load,
-        {"continue": "read_minimap", "hold": "hold"},
+        {"continue": "check_discharge", "hold": "hold"},
+    )
+    workflow.add_conditional_edges(
+        "check_discharge",
+        _route_after_discharge,
+        {"continue": "read_minimap", "standdown": "write_decision"},
     )
     workflow.add_edge("read_minimap", "check_locked")
     workflow.add_edge("check_locked", "ai_turn")
@@ -416,6 +695,7 @@ def run_forever() -> None:
                 result = graph.invoke(
                     {
                         "telemetry": {},
+                        "discharge_active": False,
                         "minimap": "",
                         "locked_routes": set(),
                         "raw_output": "",

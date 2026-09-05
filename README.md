@@ -9,7 +9,7 @@ A desktop traffic and transit simulation of two connected signalized intersectio
 - Poisson, binomial, negative-binomial, and congestion-peak demand models.
 - Signal sequencing with green, yellow, and all-red clearance intervals.
 - Transit Signal Priority (TSP) and Dynamic Bus Lane (DBL) requests through a node-specific safety arbiter.
-- Optional whole-network Ollama/LangGraph control of all twelve TSP/DBL flags through a strict all-off safety guard.
+- Optional whole-network LangGraph control through local Ollama or keyed Gemini API models, with one strict all-off safety guard for both backends.
 - Automatic or operator-selected network discharge for gridlock recovery.
 - Smoothly resizable telemetry that scales its content, with uniform summary cards, session-only trends, and phase-cycle visualization.
 - Regression tests for routes, callbacks, collision prevention, priority, telemetry, and discharge behavior.
@@ -24,7 +24,8 @@ The application creates one `SignalController`, which owns two distinct per-node
 
 - Python 3 with Tkinter support
 - Dependencies listed in `requirements.txt`
-- Ollama installed and running locally, with at least one downloaded model, to use AI control
+- Ollama installed and running locally, with at least one downloaded model, to use local AI control
+- A `GEMINI_API_KEY` environment variable to expose Gemini models in the API selector
 
 The current application is developed and tested on Windows. Tkinter is included with the standard Windows Python installer and should not be installed from PyPI.
 
@@ -51,13 +52,19 @@ The control panel can:
 - select a demand distribution and arrival rate;
 - configure and dispatch buses on six routes;
 - enable DBL or TSP behavior;
-- select an installed Ollama model, choose a 2–15 second decision interval, and arm or disarm whole-network AI control;
+- select either an installed local Ollama model or an environment-enabled Gemini API model, choose a 2–15 second decision interval, and arm or disarm whole-network AI control;
 - pause, resume, and reset the simulation; and
 - start automatic or manually selected gridlock discharge.
 
 The telemetry dashboard reads the latest atomic JSON snapshot and maintains bounded time-series history only in memory. It can be resized from any edge; fonts, cards, diagrams, and charts compact automatically to fit the available window instead of exposing dashboard scrollbars. Closing the dashboard clears its history. `traffic_state_telemetry.json`, `ai_control.json`, `decision.json`, log files, and the `runtime/` directory are generated locally and intentionally excluded from Git.
 
 When AI control is armed, its next validated decision owns every route's TSP and DBL flags. Disarm it before making lasting manual flag changes. Missing or malformed model output cannot authorize priority; the agent and sim-side guard fall back to all flags off.
+
+The Local and API selectors are mutually exclusive and write one model ID to `ai_control.json`. Gemini uses the current `google-genai` SDK, the same prompt and guard as Ollama, a low temperature, and a 30-second hard timeout. API failures and timeouts become held all-off turns. During network discharge, the agent skips either backend entirely and writes a fresh all-off stand-down decision.
+
+The simulator also rejects a decision whose timestamp is missing, invalid, or older than the greater of 12 seconds and three configured AI ticks. This makes an orphaned decision file self-clear its TSP/DBL flags if the agent stops. Accepted grants remain route-locked through both active-green and controller-clearing telemetry states without making clearing buses reappear in the model's approaching-bus summary.
+
+Each AI turn also records a concise model-supplied `reason`, the full raw model output, and the recent passenger throughput from the telemetry snapshot used for that decision. The reason is annotation only: missing or malformed reason text never rejects otherwise-valid flags, while held decisions always leave it blank. On shutdown, the Decisions worksheet includes readable `reason` and `pax_per_min_at_turn` columns.
 
 ## Tests
 
@@ -85,7 +92,7 @@ Compile-check the application modules:
 | File | Purpose |
 | --- | --- |
 | `main.py` | Application entry point, fixed-step loop, spawning, and cross-module orchestration |
-| `agent.py` | Separate-process LangGraph turn loop and Ollama call |
+| `agent.py` | Separate-process LangGraph turn loop, Ollama/Gemini routing, timeout, discharge stand-down, and guarded decision output |
 | `guard.py` | Strict model-output extraction, validation, rejection logging, and all-off fallback |
 | `canvas_gemini.py` | Authoritative road geometry and Pygame rendering |
 | `control_panel.py` | Tkinter controls, shared configuration, and operator callbacks |

@@ -27,6 +27,14 @@ FONT_FAMILY = "Segoe UI"      # Clean UI font
 BASE_DIR = Path(__file__).resolve().parent
 AI_CONTROL_PATH = BASE_DIR / "ai_control.json"
 
+API_MODEL_REGISTRY = {
+    "GEMINI_API_KEY": [
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-pro",
+    ],
+}
+
 SYM_DOT = "\u25cf"            # ●
 SYM_PAUSE = "\u23f8"          # ⏸
 SYM_PLAY = "\u25b6"           # ▶
@@ -219,6 +227,15 @@ def get_ollama_models():
         return fallback
 
 
+def get_api_models():
+    """Return API models only for providers configured in the environment."""
+    models = ["None"]
+    for environment_variable, model_ids in API_MODEL_REGISTRY.items():
+        if os.environ.get(environment_variable):
+            models.extend(model_ids)
+    return models
+
+
 def write_ai_control(path=None):
     """Atomically mirror in-process AI controls for the agent subprocess."""
     runtime = global_config["ai_runtime"]
@@ -251,6 +268,20 @@ def write_ai_control(path=None):
                 pass
         runtime["last_status"] = "CONTROL_WRITE_ERROR"
         return False
+
+
+def set_active_ai_model(model, other_selector=None, persist=True):
+    """Select exactly one local/API model and persist the shared model ID."""
+    selected_model = str(model or "None")
+    if other_selector is not None:
+        other_selector.set("None")
+    runtime = global_config["ai_runtime"]
+    runtime["model"] = selected_model
+    if runtime.get("armed", False):
+        runtime["last_status"] = "MODEL_CHANGED_WAITING"
+    if persist:
+        write_ai_control()
+    return selected_model
 
 def create_dashboard_window():
     route_flag_buttons.clear()
@@ -581,13 +612,22 @@ def create_dashboard_window():
     ai_row1 = tk.Frame(ai_card, bg=COLOR_CARD)
     ai_row1.pack(fill="x", padx=16, pady=(0, 6))
 
-    llm_lbl = tk.Label(ai_row1, text="LLM Engine", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
+    llm_lbl = tk.Label(ai_row1, text="Local", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     llm_lbl.pack(side="left", padx=(0, 8))
 
     available_models = get_ollama_models()
+    available_api_models = get_api_models()
     selected_model = str(global_config["ai_runtime"].get("model", "None"))
-    if selected_model not in available_models:
+    if selected_model in available_api_models and selected_model != "None":
+        selected_local_model = "None"
+        selected_api_model = selected_model
+    elif selected_model in available_models:
+        selected_local_model = selected_model
+        selected_api_model = "None"
+    else:
         selected_model = "None"
+        selected_local_model = "None"
+        selected_api_model = "None"
         global_config["ai_runtime"]["model"] = selected_model
 
     llm_engine_box = ttk.Combobox(
@@ -595,18 +635,45 @@ def create_dashboard_window():
         values=available_models,
         width=22, state="readonly", style="Modern.TCombobox"
     )
-    llm_engine_box.set(selected_model)
+    llm_engine_box.set(selected_local_model)
     llm_engine_box.pack(side="left", padx=(0, 16))
 
     def on_llm_engine_selected(event):
-        selected_model_name = llm_engine_box.get()
+        selected_model_name = set_active_ai_model(
+            llm_engine_box.get(), api_engine_box, persist=False
+        )
         selected_val_lbl.config(text=selected_model_name)
-        global_config["ai_runtime"]["model"] = selected_model_name
-        if global_config["ai_runtime"].get("armed", False):
-            global_config["ai_runtime"]["last_status"] = "MODEL_CHANGED_WAITING"
         write_ai_control()
 
     llm_engine_box.bind("<<ComboboxSelected>>", on_llm_engine_selected)
+
+    api_lbl = tk.Label(
+        ai_row1,
+        text="API",
+        font=(FONT_FAMILY, 9),
+        bg=COLOR_CARD,
+        fg=COLOR_TEXT_PRIMARY,
+    )
+    api_lbl.pack(side="left", padx=(0, 8))
+
+    api_engine_box = ttk.Combobox(
+        ai_row1,
+        values=available_api_models,
+        width=22,
+        state="readonly",
+        style="Modern.TCombobox",
+    )
+    api_engine_box.set(selected_api_model)
+    api_engine_box.pack(side="left", padx=(0, 16))
+
+    def on_api_engine_selected(event):
+        selected_model_name = set_active_ai_model(
+            api_engine_box.get(), llm_engine_box, persist=False
+        )
+        selected_val_lbl.config(text=selected_model_name)
+        write_ai_control()
+
+    api_engine_box.bind("<<ComboboxSelected>>", on_api_engine_selected)
 
     def on_run_llm():
         runtime = global_config["ai_runtime"]

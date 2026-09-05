@@ -64,6 +64,8 @@ TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
 DASHBOARD_PATH = BASE_DIR / "telemetry_dashboard.py"
 AGENT_PATH = BASE_DIR / "agent.py"
 DECISION_PATH = BASE_DIR / "decision.json"
+DECISION_STALE_MULTIPLIER = 3
+DECISION_STALE_FLOOR_SEC = 12.0
 AGENT_TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
 TELEMETRY_LOG_PATH = BASE_DIR / "telemetry_log.jsonl"
 EXCEL_EXPORT_DIR = BASE_DIR / "excel_exports"
@@ -193,7 +195,14 @@ def export_session_excel(output_path=None):
         workbook = Workbook()
         decisions_sheet = workbook.active
         decisions_sheet.title = "Decisions"
-        decision_header = ["turn", "timestamp", "model", "status"]
+        decision_header = [
+            "turn",
+            "timestamp",
+            "model",
+            "status",
+            "reason",
+            "pax_per_min_at_turn",
+        ]
         for route_id in SESSION_ROUTE_IDS:
             decision_header.extend(
                 (f"{route_id}_tsp", f"{route_id}_dbl")
@@ -209,6 +218,8 @@ def export_session_excel(output_path=None):
                 decision.get("timestamp"),
                 decision.get("model"),
                 decision.get("status"),
+                decision.get("reason", ""),
+                decision.get("pax_per_min_recent"),
             ]
             for route_id in SESSION_ROUTE_IDS:
                 route_flags = flags.get(route_id, {})
@@ -302,6 +313,27 @@ def merge_ai_decision(path=None):
             decision = json.load(decision_file)
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         runtime["last_status"] = "WAITING_FOR_DECISION"
+        return False
+
+    tick_seconds = runtime.get("tick_seconds", 5)
+    try:
+        tick_seconds = float(tick_seconds or 5)
+    except (TypeError, ValueError, OverflowError):
+        tick_seconds = 5.0
+    if not math.isfinite(tick_seconds) or tick_seconds <= 0:
+        tick_seconds = 5.0
+    stale_after = max(
+        tick_seconds * DECISION_STALE_MULTIPLIER,
+        DECISION_STALE_FLOOR_SEC,
+    )
+    timestamp = decision.get("timestamp") if isinstance(decision, dict) else None
+    try:
+        age = time.time() - float(timestamp)
+    except (TypeError, ValueError, OverflowError):
+        age = None
+    if age is None or not math.isfinite(age) or age > stale_after:
+        _set_ai_flags(guard.all_off_flags())
+        runtime["last_status"] = "STALE_DECISION"
         return False
 
     try:

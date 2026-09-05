@@ -10,8 +10,10 @@ import control_panel
 
 BASE_DIR = Path(__file__).resolve().parent
 REJECT_LOG_PATH = BASE_DIR / "agent_rejects.log"
-VALID_ROUTES = set(control_panel.bus_routes_config.keys())
+ROUTE_ORDER = sorted(control_panel.bus_routes_config.keys())
+VALID_ROUTES = set(ROUTE_ORDER)
 FLAG_KEYS = {"tsp", "dbl"}
+MAX_REASON_LEN = 500
 
 
 def extract_json(raw_text: str) -> dict | None:
@@ -77,11 +79,43 @@ def validate_flags(obj: dict) -> dict | None:
     return flags
 
 
+def validate_flags_positional(obj: dict) -> dict | None:
+    """Strictly validate model arrays and map positions to canonical routes."""
+    if not isinstance(obj, dict):
+        return None
+    tsp = obj.get("tsp")
+    dbl = obj.get("dbl")
+    route_count = len(ROUTE_ORDER)
+    if not isinstance(tsp, list) or len(tsp) != route_count:
+        return None
+    if not isinstance(dbl, list) or len(dbl) != route_count:
+        return None
+    if any(not isinstance(value, bool) for value in tsp):
+        return None
+    if any(not isinstance(value, bool) for value in dbl):
+        return None
+    return {
+        route_id: {"tsp": tsp[index], "dbl": dbl[index]}
+        for index, route_id in enumerate(ROUTE_ORDER)
+    }
+
+
+def extract_reason(obj) -> str:
+    """Forgivingly extract an optional annotation without affecting flags."""
+    if not isinstance(obj, dict):
+        return ""
+    reason = obj.get("reason", "")
+    if not isinstance(reason, str):
+        return ""
+    reason = reason.strip()
+    return reason[:MAX_REASON_LEN]
+
+
 def all_off_flags() -> dict:
     """Return a fresh, complete fail-safe flag map."""
     return {
         route_id: {"tsp": False, "dbl": False}
-        for route_id in sorted(VALID_ROUTES)
+        for route_id in ROUTE_ORDER
     }
 
 
@@ -111,14 +145,18 @@ def safe_decision(raw_text: str, turn: int, model: str) -> dict:
     safe_turn = _safe_turn(turn)
     safe_model = model if isinstance(model, str) else str(model)
     safe_raw = raw_text if isinstance(raw_text, str) else str(raw_text)
+    reason = ""
     try:
-        flags = validate_flags(extract_json(safe_raw))
+        parsed = extract_json(safe_raw)
+        flags = validate_flags_positional(parsed)
+        reason = extract_reason(parsed)
     except Exception:
         flags = None
 
     if flags is None:
         status = "HELD_ALL_OFF"
         flags = all_off_flags()
+        reason = ""
         _record_rejection(safe_turn, safe_model, safe_raw)
     else:
         status = "OK"
@@ -130,4 +168,5 @@ def safe_decision(raw_text: str, turn: int, model: str) -> dict:
         "model": safe_model,
         "status": status,
         "flags": flags,
+        "reason": reason if status == "OK" else "",
     }

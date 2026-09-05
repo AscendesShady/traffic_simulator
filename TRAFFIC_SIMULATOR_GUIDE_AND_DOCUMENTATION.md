@@ -9,7 +9,7 @@ Companion documents:
 
 ## 1. General overview
 
-This guide is a source-synchronized description of the traffic simulator. `main.py` is the executable entry point; the remaining files are imported modules except `telemetry_dashboard.py`, which `main.py` launches as a child process.
+This guide is a source-synchronized description of the traffic simulator. `main.py` is the executable entry point; `main.py` launches `telemetry_dashboard.py` and `agent.py` as separate child processes, while the remaining files are imported modules.
 
 ### Canonical signal-controller architecture
 
@@ -32,6 +32,9 @@ main fixed-step loop -> SignalController per-node state
                 |
                 +-> canvas rendering
                 +-> atomic telemetry JSON -> telemetry dashboard
+                +-> atomic telemetry JSON -> LLM agent -> strict guard
+                                               |
+                                               +-> atomic decision JSON -> main merge
 ```
 
 Safety contracts:
@@ -68,13 +71,20 @@ Safety contracts:
 - Every discharge green is exclusive per node and begins only after yellow, minimum all-red, conflict-box clearance, and receiving-space validation.
 - Safe Stop returns to normal timing only after yellow, minimum all-red, and both conflict boxes are empty.
 - Collision avoidance, following distance, spillback prevention, and intersection reservations remain authoritative during discharge.
-- The LLM controls are placeholders: model selection changes only a label and RUN LLM intentionally does nothing.
+- LLM control runs outside the simulation process; strict complete-map boolean validation and an all-off fallback remain authoritative before any TSP/DBL flags are merged.
+- The control panel presents mutually exclusive Local and API model selectors. API choices appear only when their provider key is present, while `ai_control.json` carries one backend-neutral model string.
+- The agent routes `gemini-` model IDs through `google-genai` with temperature 0.2 and a 30-second hard timeout; all other IDs retain the Ollama path. Empty responses, cloud errors, and timeouts enter the same held all-off guard path.
+- While `network_discharge.active` is true, the agent skips minimap generation and every model backend, then atomically writes and logs a fresh `STANDDOWN_DISCHARGE` all-off decision.
+- A decision timestamp must be valid and no older than the greater of 12 seconds and three configured AI ticks; stale decisions fail all-off so an orphaned file cannot keep priority flags enabled.
+- Route locking uses the exported controller lifecycle booleans (`priority_granted` and `priority_clearing`), while the model-facing bus summary remains APPROACHING-only so clearing buses cannot distort its ETA or approaching count.
+- The model is prompted to emit a one-sentence `reason`, but the guard treats it only as an optional annotation: missing or malformed reasons never invalidate otherwise-correct flags, and held decisions always carry a blank reason.
+- Each turn log preserves the clean guarded reason, full raw model output, and the recent passenger-throughput value from the exact telemetry snapshot used for that decision. The Decisions Excel sheet exposes both reason and `pax_per_min_at_turn`.
 
 Run and verify:
 
 ```powershell
 .\myenv\Scripts\python.exe main.py
-.\myenv\Scripts\python.exe -m py_compile canvas_gemini.py control_panel.py main.py signal_controller.py telemetry_dashboard.py telemetry_exporter.py vehicle.py
+.\myenv\Scripts\python.exe -m py_compile agent.py guard.py canvas_gemini.py control_panel.py main.py signal_controller.py telemetry_dashboard.py telemetry_exporter.py vehicle.py
 .\myenv\Scripts\python.exe -m pytest -q
 ```
 
@@ -504,7 +514,7 @@ def draw_network(
 
 Purpose:
 
-Owns the shared global, approach, six-route, and network-discharge configuration dictionaries and builds the Tkinter control panel with normal desktop stacking. Operators can select Auto or one of six discharge corridors, start recovery, request a safe stop, and read the selected/status/reason/recommendation messages. Its per-approach model selector includes Congestion Peak. Callbacks mutate configuration only. The LLM selector is display-only and RUN LLM is intentionally a no-op.
+Owns the shared global, approach, six-route, network-discharge, and AI runtime configuration dictionaries and builds the Tkinter control panel with normal desktop stacking. Operators can select Auto or one of six discharge corridors, start recovery, request a safe stop, and read the selected/status/reason/recommendation messages. Its per-approach demand selector includes Congestion Peak. Its mutually exclusive Local and API selectors expose installed Ollama models and only those cloud models whose provider environment key exists; both write one active model ID into the same runtime control file.
 
 ### Full source: `control_panel.py`
 
@@ -537,6 +547,14 @@ FONT_FAMILY = "Segoe UI"      # Clean UI font
 
 BASE_DIR = Path(__file__).resolve().parent
 AI_CONTROL_PATH = BASE_DIR / "ai_control.json"
+
+API_MODEL_REGISTRY = {
+    "GEMINI_API_KEY": [
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-pro",
+    ],
+}
 
 SYM_DOT = "\u25cf"            # ●
 SYM_PAUSE = "\u23f8"          # ⏸
@@ -730,6 +748,15 @@ def get_ollama_models():
         return fallback
 
 
+def get_api_models():
+    """Return API models only for providers configured in the environment."""
+    models = ["None"]
+    for environment_variable, model_ids in API_MODEL_REGISTRY.items():
+        if os.environ.get(environment_variable):
+            models.extend(model_ids)
+    return models
+
+
 def write_ai_control(path=None):
     """Atomically mirror in-process AI controls for the agent subprocess."""
     runtime = global_config["ai_runtime"]
@@ -762,6 +789,20 @@ def write_ai_control(path=None):
                 pass
         runtime["last_status"] = "CONTROL_WRITE_ERROR"
         return False
+
+
+def set_active_ai_model(model, other_selector=None, persist=True):
+    """Select exactly one local/API model and persist the shared model ID."""
+    selected_model = str(model or "None")
+    if other_selector is not None:
+        other_selector.set("None")
+    runtime = global_config["ai_runtime"]
+    runtime["model"] = selected_model
+    if runtime.get("armed", False):
+        runtime["last_status"] = "MODEL_CHANGED_WAITING"
+    if persist:
+        write_ai_control()
+    return selected_model
 
 def create_dashboard_window():
     route_flag_buttons.clear()
@@ -1092,13 +1133,22 @@ def create_dashboard_window():
     ai_row1 = tk.Frame(ai_card, bg=COLOR_CARD)
     ai_row1.pack(fill="x", padx=16, pady=(0, 6))
 
-    llm_lbl = tk.Label(ai_row1, text="LLM Engine", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
+    llm_lbl = tk.Label(ai_row1, text="Local", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     llm_lbl.pack(side="left", padx=(0, 8))
 
     available_models = get_ollama_models()
+    available_api_models = get_api_models()
     selected_model = str(global_config["ai_runtime"].get("model", "None"))
-    if selected_model not in available_models:
+    if selected_model in available_api_models and selected_model != "None":
+        selected_local_model = "None"
+        selected_api_model = selected_model
+    elif selected_model in available_models:
+        selected_local_model = selected_model
+        selected_api_model = "None"
+    else:
         selected_model = "None"
+        selected_local_model = "None"
+        selected_api_model = "None"
         global_config["ai_runtime"]["model"] = selected_model
 
     llm_engine_box = ttk.Combobox(
@@ -1106,18 +1156,45 @@ def create_dashboard_window():
         values=available_models,
         width=22, state="readonly", style="Modern.TCombobox"
     )
-    llm_engine_box.set(selected_model)
+    llm_engine_box.set(selected_local_model)
     llm_engine_box.pack(side="left", padx=(0, 16))
 
     def on_llm_engine_selected(event):
-        selected_model_name = llm_engine_box.get()
+        selected_model_name = set_active_ai_model(
+            llm_engine_box.get(), api_engine_box, persist=False
+        )
         selected_val_lbl.config(text=selected_model_name)
-        global_config["ai_runtime"]["model"] = selected_model_name
-        if global_config["ai_runtime"].get("armed", False):
-            global_config["ai_runtime"]["last_status"] = "MODEL_CHANGED_WAITING"
         write_ai_control()
 
     llm_engine_box.bind("<<ComboboxSelected>>", on_llm_engine_selected)
+
+    api_lbl = tk.Label(
+        ai_row1,
+        text="API",
+        font=(FONT_FAMILY, 9),
+        bg=COLOR_CARD,
+        fg=COLOR_TEXT_PRIMARY,
+    )
+    api_lbl.pack(side="left", padx=(0, 8))
+
+    api_engine_box = ttk.Combobox(
+        ai_row1,
+        values=available_api_models,
+        width=22,
+        state="readonly",
+        style="Modern.TCombobox",
+    )
+    api_engine_box.set(selected_api_model)
+    api_engine_box.pack(side="left", padx=(0, 16))
+
+    def on_api_engine_selected(event):
+        selected_model_name = set_active_ai_model(
+            api_engine_box.get(), llm_engine_box, persist=False
+        )
+        selected_val_lbl.config(text=selected_model_name)
+        write_ai_control()
+
+    api_engine_box.bind("<<ComboboxSelected>>", on_api_engine_selected)
 
     def on_run_llm():
         runtime = global_config["ai_runtime"]
@@ -1578,11 +1655,11 @@ def create_dashboard_window():
 ```
 
 
-## 4. `main.py` — Application entry point and simulation ownership
+## 4. Runtime and guarded LLM control
 
 Purpose:
 
-Owns the vehicle list, stochastic arrivals, bounded Congestion Peak demand/backlogs, lane-aware bus dispatch, monotonic fixed-step accumulator with bounded work per Tk callback, source-relative child/dashboard paths, drawing, telemetry calls, reset, pause, and shutdown lifecycle. It freezes arrival admission and bus dispatch whenever network discharge is requested or active.
+`main.py` owns simulation orchestration, guarded decision merging, session logging, and Excel export. `agent.py` runs the whole-network LangGraph turn loop in a separate process, routes ordinary model IDs to local Ollama and `gemini-` IDs to the current Google Gen AI SDK, bounds Gemini calls with a 30-second single-flight timeout, stands down all-off during network discharge, requests a concise throughput justification, and logs the exact recent passenger throughput seen on each turn. `guard.py` strictly validates the complete six-route flag map while treating the reason as a truncated, optional annotation that can never authorize control or cause an otherwise-valid decision to be held.
 
 ### Full source: `main.py`
 
@@ -1653,6 +1730,8 @@ TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
 DASHBOARD_PATH = BASE_DIR / "telemetry_dashboard.py"
 AGENT_PATH = BASE_DIR / "agent.py"
 DECISION_PATH = BASE_DIR / "decision.json"
+DECISION_STALE_MULTIPLIER = 3
+DECISION_STALE_FLOOR_SEC = 12.0
 AGENT_TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
 TELEMETRY_LOG_PATH = BASE_DIR / "telemetry_log.jsonl"
 EXCEL_EXPORT_DIR = BASE_DIR / "excel_exports"
@@ -1782,7 +1861,14 @@ def export_session_excel(output_path=None):
         workbook = Workbook()
         decisions_sheet = workbook.active
         decisions_sheet.title = "Decisions"
-        decision_header = ["turn", "timestamp", "model", "status"]
+        decision_header = [
+            "turn",
+            "timestamp",
+            "model",
+            "status",
+            "reason",
+            "pax_per_min_at_turn",
+        ]
         for route_id in SESSION_ROUTE_IDS:
             decision_header.extend(
                 (f"{route_id}_tsp", f"{route_id}_dbl")
@@ -1798,6 +1884,8 @@ def export_session_excel(output_path=None):
                 decision.get("timestamp"),
                 decision.get("model"),
                 decision.get("status"),
+                decision.get("reason", ""),
+                decision.get("pax_per_min_recent"),
             ]
             for route_id in SESSION_ROUTE_IDS:
                 route_flags = flags.get(route_id, {})
@@ -1891,6 +1979,27 @@ def merge_ai_decision(path=None):
             decision = json.load(decision_file)
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         runtime["last_status"] = "WAITING_FOR_DECISION"
+        return False
+
+    tick_seconds = runtime.get("tick_seconds", 5)
+    try:
+        tick_seconds = float(tick_seconds or 5)
+    except (TypeError, ValueError, OverflowError):
+        tick_seconds = 5.0
+    if not math.isfinite(tick_seconds) or tick_seconds <= 0:
+        tick_seconds = 5.0
+    stale_after = max(
+        tick_seconds * DECISION_STALE_MULTIPLIER,
+        DECISION_STALE_FLOOR_SEC,
+    )
+    timestamp = decision.get("timestamp") if isinstance(decision, dict) else None
+    try:
+        age = time.time() - float(timestamp)
+    except (TypeError, ValueError, OverflowError):
+        age = None
+    if age is None or not math.isfinite(age) or age > stale_after:
+        _set_ai_flags(guard.all_off_flags())
+        runtime["last_status"] = "STALE_DECISION"
         return False
 
     try:
@@ -2423,6 +2532,780 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
+
+
+### Full source: `agent.py`
+
+```python
+"""Separate-process LangGraph/Ollama controller for route-level TSP and DBL."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import queue
+import tempfile
+import threading
+import time
+from typing import TypedDict
+
+import guard
+
+try:
+    import ollama
+except ImportError:  # The simulator still starts and the agent fails all-off.
+    ollama = None
+
+try:
+    from google import genai as _genai
+    from google.genai import types as _genai_types
+except ImportError:  # Gemini remains unavailable without the optional SDK.
+    _genai = None
+    _genai_types = None
+
+try:
+    from langgraph.graph import END, StateGraph
+except ImportError:  # Reported as an all-off dependency failure at runtime.
+    END = None
+    StateGraph = None
+
+
+BASE_DIR = Path(__file__).resolve().parent
+TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
+AI_CONTROL_PATH = BASE_DIR / "ai_control.json"
+DECISION_PATH = BASE_DIR / "decision.json"
+VERBOSE_LOG = True
+TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
+STALE_SECONDS = 3.0
+RECENT_DECISION_LIMIT = 5
+DEFAULT_CONTROL = {"armed": False, "model": "None", "tick_seconds": 5}
+GEMINI_TIMEOUT_SECONDS = 30.0
+_GEMINI_CLIENT = None
+_GEMINI_CALL_LOCK = threading.Lock()
+
+OUTPUT_SCHEMA = json.dumps(
+    {
+        "reason": (
+            "<one sentence: why these flags maximize passenger throughput "
+            "this turn>"
+        ),
+        "flags": guard.all_off_flags(),
+    },
+    indent=2,
+)
+SYSTEM_PROMPT = f"""You control TSP and DBL flags for one traffic network.
+Your objective is to maximize passengers_per_minute across the whole network.
+
+TSP gives an approaching bus an early or extended green at its target node.
+DBL enables the dynamic bus lane for that route. A 45-passenger bus can justify
+priority, but unnecessary priority delays cross traffic. Use
+queues_passengers_est to account for that tradeoff.
+
+Return EXACTLY one JSON object matching this literal schema, with all six route
+IDs and strict JSON booleans. Do not add markdown, analysis, or extra keys:
+{OUTPUT_SCHEMA}
+
+"reason" must be one sentence under about 40 words stating the main throughput
+justification for this turn's flag choices. Keep it on one line, with no line
+breaks and no quotation marks inside it if avoidable. The "flags" object matters
+most: if you can only get one thing right, get the flags right.
+
+If a route has no approaching bus, set both tsp and dbl to false. If a route is
+marked GRANTED, preserve its current tsp and dbl values and do not change it.
+"""
+
+
+class AgentState(TypedDict):
+    telemetry: dict
+    discharge_active: bool
+    minimap: str
+    locked_routes: set
+    raw_output: str
+    decision: dict
+    status: str
+    recent_decisions: list
+    turn: int
+    model: str
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    """Durably replace one JSON object without exposing a partial document."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            delete=False,
+        ) as temp_file:
+            json.dump(payload, temp_file, indent=2)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_name = Path(temp_file.name)
+        os.replace(temp_name, path)
+    except Exception:
+        if temp_name and temp_name.exists():
+            try:
+                temp_name.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def log_turn(state: AgentState, decision: dict) -> None:
+    """Append one complete, unfiltered agent-turn record without raising."""
+    if not VERBOSE_LOG:
+        return
+    try:
+        locked_routes = state.get("locked_routes", [])
+        if not isinstance(locked_routes, (list, tuple, set, frozenset)):
+            locked_routes = []
+        telemetry = state.get("telemetry", {})
+        if not isinstance(telemetry, dict):
+            telemetry = {}
+        throughput = telemetry.get("network_throughput", {})
+        if not isinstance(throughput, dict):
+            throughput = {}
+        record = {
+            "turn": decision.get("turn"),
+            "timestamp": decision.get("timestamp"),
+            "model": decision.get("model"),
+            "status": decision.get("status"),
+            "minimap": state.get("minimap", ""),
+            "raw_output": state.get("raw_output", ""),
+            "flags": decision.get("flags", {}),
+            "reason": decision.get("reason", ""),
+            "pax_per_min_recent": throughput.get(
+                "passengers_per_minute_recent"
+            ),
+            "locked_routes": sorted(locked_routes),
+            "stale": state.get("status") in ("STALE", "HELD"),
+        }
+        with TURN_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(record) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def read_ai_control(path: Path = AI_CONTROL_PATH) -> dict:
+    """Read the panel mirror; any failure is equivalent to disarmed."""
+    try:
+        with Path(path).open("r", encoding="utf-8") as control_file:
+            payload = json.load(control_file)
+        if not isinstance(payload, dict):
+            return dict(DEFAULT_CONTROL)
+        return {
+            "armed": payload.get("armed") is True,
+            "model": str(payload.get("model", "None")),
+            "tick_seconds": min(
+                15,
+                max(2, int(payload.get("tick_seconds", 5))),
+            ),
+        }
+    except Exception:
+        return dict(DEFAULT_CONTROL)
+
+
+def _read_telemetry(path: Path = TELEMETRY_PATH) -> dict | None:
+    try:
+        with Path(path).open("r", encoding="utf-8") as telemetry_file:
+            telemetry = json.load(telemetry_file)
+        return telemetry if isinstance(telemetry, dict) else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _finite_nonnegative(value, default=None):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if number < 0 or number != number or number == float("inf"):
+        return default
+    return number
+
+
+def actionable_buses(telemetry: dict) -> dict[str, list[dict]]:
+    """Return only buses still approaching a real unfinished route leg."""
+    by_route = {route_id: [] for route_id in guard.VALID_ROUTES}
+    for bus in telemetry.get("active_buses", []):
+        if not isinstance(bus, dict):
+            continue
+        route_id = bus.get("route_id")
+        if route_id not in by_route:
+            continue
+        if not isinstance(bus.get("route_leg"), dict):
+            continue
+        if bus.get("leg_state") != "APPROACHING":
+            continue
+        distance = _finite_nonnegative(bus.get("distance_to_stop_bar_px"))
+        eta = _finite_nonnegative(bus.get("eta_to_stop_bar_sec_freeflow"))
+        if distance is None or eta is None:
+            continue
+        by_route[route_id].append(bus)
+    for buses in by_route.values():
+        buses.sort(key=lambda bus: float(bus["eta_to_stop_bar_sec_freeflow"]))
+    return by_route
+
+
+def load_save(state: AgentState) -> dict:
+    telemetry = _read_telemetry()
+    if telemetry is None:
+        return {"telemetry": {}, "status": "STALE"}
+    if telemetry.get("simulation_paused", False):
+        return {"telemetry": telemetry, "status": "STALE"}
+    try:
+        age = time.time() - float(telemetry["timestamp"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return {"telemetry": telemetry, "status": "STALE"}
+    if age > STALE_SECONDS:
+        return {"telemetry": telemetry, "status": "STALE"}
+    return {"telemetry": telemetry, "status": "OK"}
+
+
+def _route_after_load(state: AgentState) -> str:
+    return "hold" if state.get("status") == "STALE" else "continue"
+
+
+def check_discharge(state: AgentState) -> dict:
+    """Stand down with fresh all-off flags while recovery owns the network."""
+    telemetry = state.get("telemetry", {})
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+    discharge = telemetry.get("network_discharge", {})
+    if not isinstance(discharge, dict):
+        discharge = {}
+    if bool(discharge.get("active", False)):
+        controller_state = discharge.get("controller_state", "UNKNOWN")
+        decision = {
+            "schema_version": 1,
+            "turn": int(state.get("turn", 0)),
+            "timestamp": time.time(),
+            "model": str(state.get("model", "None")),
+            "status": "STANDDOWN_DISCHARGE",
+            "reason": (
+                f"Discharge active ({controller_state}); agent standing down."
+            ),
+            "flags": guard.all_off_flags(),
+        }
+        return {
+            "decision": decision,
+            "status": "STANDDOWN",
+            "raw_output": "",
+            "discharge_active": True,
+        }
+    return {"discharge_active": False}
+
+
+def _route_after_discharge(state: AgentState) -> str:
+    return "standdown" if state.get("discharge_active") else "continue"
+
+
+def read_minimap(state: AgentState) -> dict:
+    telemetry = state.get("telemetry", {})
+    routes = telemetry.get("routes", {})
+    throughput = telemetry.get("network_throughput", {})
+    summary = telemetry.get("network_summary", {})
+    nodes = telemetry.get("signal_state", {}).get("nodes", {})
+    approaching = actionable_buses(telemetry)
+
+    lines = [
+        f"simulation_time_seconds={telemetry.get('simulation_time_seconds', 0)}",
+        "passengers_per_minute="
+        f"{throughput.get('passengers_per_minute', 0)}",
+        "passengers_per_minute_recent="
+        f"{throughput.get('passengers_per_minute_recent', 0)}",
+        "queues_passengers_est="
+        f"{json.dumps(summary.get('queues_passengers_est', {}), sort_keys=True)}",
+        "NODES:",
+    ]
+    for node_x, node in sorted(nodes.items(), key=lambda item: str(item[0])):
+        if not isinstance(node, dict):
+            continue
+        lines.append(
+            f"- node={node_x} phase={node.get('phase', 'UNKNOWN')} "
+            f"signals={json.dumps(node.get('signals', {}), sort_keys=True)}"
+        )
+
+    lines.append("ROUTES:")
+    for route_id in sorted(guard.VALID_ROUTES):
+        route = routes.get(route_id, {}) if isinstance(routes, dict) else {}
+        candidates = approaching.get(route_id, [])
+        nearest = candidates[0] if candidates else None
+        if nearest:
+            route_leg = nearest.get("route_leg", {})
+            granted = bool(nearest.get("priority_granted", False))
+            lines.append(
+                f"- {route_id}: active={bool(route.get('active', False))} "
+                f"tsp={bool(route.get('tsp_enabled', False))} "
+                f"dbl={bool(route.get('dbl_enabled', False))} "
+                f"approaching_buses={len(candidates)} "
+                f"nearest_eta_sec={nearest.get('eta_to_stop_bar_sec_freeflow')} "
+                f"target_node={route_leg.get('node_x')} "
+                f"passengers={int(nearest.get('passengers', 0))} "
+                f"priority={'GRANTED - do not change' if granted else 'not granted'}"
+            )
+        else:
+            lines.append(
+                f"- {route_id}: active={bool(route.get('active', False))} "
+                f"tsp={bool(route.get('tsp_enabled', False))} "
+                f"dbl={bool(route.get('dbl_enabled', False))} "
+                "approaching_buses=0 none approaching"
+            )
+
+    recent = state.get("recent_decisions", [])[-RECENT_DECISION_LIMIT:]
+    if recent:
+        compact_recent = [
+            {
+                "turn": decision.get("turn"),
+                "status": decision.get("status"),
+                "flags": decision.get("flags", {}),
+            }
+            for decision in recent
+            if isinstance(decision, dict)
+        ]
+        lines.append("RECENT_DECISIONS=" + json.dumps(compact_recent, sort_keys=True))
+    return {"minimap": "\n".join(lines)}
+
+
+def check_locked(state: AgentState) -> dict:
+    telemetry = state.get("telemetry", {})
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+    locked = set()
+    active_buses = telemetry.get("active_buses", [])
+    if not isinstance(active_buses, list):
+        active_buses = []
+    for bus in active_buses:
+        if not isinstance(bus, dict):
+            continue
+        route_id = bus.get("route_id")
+        if route_id not in guard.VALID_ROUTES:
+            continue
+        # Vehicle leg_state describes geometry (APPROACHING,
+        # IN_INTERSECTION, TURNING, ...), while these two telemetry booleans
+        # expose the controller's grant lifecycle. Keep a route locked through
+        # both the active-green and clearing portions of an accepted grant.
+        if bool(bus.get("priority_granted", False)) or bool(
+            bus.get("priority_clearing", False)
+        ):
+            locked.add(route_id)
+    minimap = state.get("minimap", "")
+    if locked:
+        minimap += "\nLOCKED_ROUTES=" + ",".join(sorted(locked))
+    return {"locked_routes": locked, "minimap": minimap}
+
+
+def _is_gemini(model: str) -> bool:
+    return isinstance(model, str) and model.startswith("gemini-")
+
+
+def _get_gemini_client():
+    global _GEMINI_CLIENT
+    if _GEMINI_CLIENT is None:
+        if _genai is None:
+            raise RuntimeError("google-genai package not installed")
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set")
+        _GEMINI_CLIENT = _genai.Client(api_key=api_key)
+    return _GEMINI_CLIENT
+
+
+def _call_gemini(model: str, system_prompt: str, minimap: str) -> str:
+    """Call Gemini with low temperature and a hard, non-overlapping timeout."""
+    client = _get_gemini_client()
+    if _genai_types is None:
+        raise RuntimeError("google-genai package not installed")
+    call_lock = _GEMINI_CALL_LOCK
+    if not call_lock.acquire(blocking=False):
+        raise RuntimeError("previous Gemini request is still running")
+
+    result_queue = queue.Queue(maxsize=1)
+    prompt = system_prompt + "\n\n" + minimap
+
+    def request():
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=_genai_types.GenerateContentConfig(temperature=0.2),
+            )
+            outcome = (True, response)
+        except Exception as exc:
+            outcome = (False, exc)
+        finally:
+            call_lock.release()
+        result_queue.put(outcome)
+
+    request_thread = threading.Thread(
+        target=request,
+        name="gemini-agent-request",
+        daemon=True,
+    )
+    try:
+        request_thread.start()
+    except Exception:
+        call_lock.release()
+        raise
+
+    try:
+        succeeded, value = result_queue.get(timeout=GEMINI_TIMEOUT_SECONDS)
+    except queue.Empty as exc:
+        raise TimeoutError(
+            f"Gemini request exceeded {GEMINI_TIMEOUT_SECONDS:g}s timeout"
+        ) from exc
+    if not succeeded:
+        raise value
+    text = getattr(value, "text", None)
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("empty Gemini response")
+    return text
+
+
+def ai_turn(state: AgentState) -> dict:
+    model = state.get("model", "None")
+    try:
+        if not model or model == "None":
+            raise RuntimeError("no model selected")
+        if _is_gemini(model):
+            raw_output = _call_gemini(
+                model,
+                SYSTEM_PROMPT,
+                state.get("minimap", ""),
+            )
+        else:
+            if ollama is None:
+                raise RuntimeError("ollama Python package is not installed")
+            response = ollama.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": state.get("minimap", "")},
+                ],
+                options={"temperature": 0.2},
+            )
+            raw_output = response["message"]["content"]
+        if not isinstance(raw_output, str):
+            raise TypeError("model response content is not text")
+        return {"raw_output": raw_output, "status": "OK"}
+    except Exception as exc:
+        return {
+            "raw_output": f"Agent error: {type(exc).__name__}: {str(exc)[:500]}",
+            "status": "INVALID",
+        }
+
+
+def anti_cheat(state: AgentState) -> dict:
+    decision = guard.safe_decision(
+        state.get("raw_output", ""),
+        state.get("turn", 0),
+        state.get("model", "None"),
+    )
+    routes = state.get("telemetry", {}).get("routes", {})
+    if decision["status"] == "OK":
+        for route_id in state.get("locked_routes", set()):
+            current = routes.get(route_id, {}) if isinstance(routes, dict) else {}
+            decision["flags"][route_id] = {
+                "tsp": bool(current.get("tsp_enabled", False)),
+                "dbl": bool(current.get("dbl_enabled", False)),
+            }
+    return {"decision": decision, "status": decision["status"]}
+
+
+def _remember_decision(state: AgentState, decision: dict) -> list:
+    recent = list(state.get("recent_decisions", []))
+    recent.append(decision)
+    return recent[-RECENT_DECISION_LIMIT:]
+
+
+def write_decision(state: AgentState) -> dict:
+    decision = state["decision"]
+    atomic_write_json(DECISION_PATH, decision)
+    log_turn(state, decision)
+    return {"recent_decisions": _remember_decision(state, decision)}
+
+
+def hold(state: AgentState) -> dict:
+    # Locked design choice: stale or missing telemetry cannot authorize priority.
+    decision = {
+        "schema_version": 1,
+        "turn": int(state.get("turn", 0)),
+        "timestamp": round(time.time(), 3),
+        "model": str(state.get("model", "None")),
+        "status": "HELD_ALL_OFF",
+        "flags": guard.all_off_flags(),
+        "reason": "",
+    }
+    atomic_write_json(DECISION_PATH, decision)
+    log_turn(state, decision)
+    return {
+        "decision": decision,
+        "status": "STALE",
+        "recent_decisions": _remember_decision(state, decision),
+    }
+
+
+def build_graph():
+    if StateGraph is None or END is None:
+        raise RuntimeError("langgraph Python package is not installed")
+    workflow = StateGraph(AgentState)
+    workflow.add_node("load_save", load_save)
+    workflow.add_node("check_discharge", check_discharge)
+    workflow.add_node("read_minimap", read_minimap)
+    workflow.add_node("check_locked", check_locked)
+    workflow.add_node("ai_turn", ai_turn)
+    workflow.add_node("anti_cheat", anti_cheat)
+    workflow.add_node("write_decision", write_decision)
+    workflow.add_node("hold", hold)
+    workflow.set_entry_point("load_save")
+    workflow.add_conditional_edges(
+        "load_save",
+        _route_after_load,
+        {"continue": "check_discharge", "hold": "hold"},
+    )
+    workflow.add_conditional_edges(
+        "check_discharge",
+        _route_after_discharge,
+        {"continue": "read_minimap", "standdown": "write_decision"},
+    )
+    workflow.add_edge("read_minimap", "check_locked")
+    workflow.add_edge("check_locked", "ai_turn")
+    workflow.add_edge("ai_turn", "anti_cheat")
+    workflow.add_edge("anti_cheat", "write_decision")
+    workflow.add_edge("write_decision", END)
+    workflow.add_edge("hold", END)
+    return workflow.compile()
+
+
+def _dependency_hold(turn: int, model: str, message: str) -> dict:
+    decision = guard.safe_decision(message, turn, model)
+    atomic_write_json(DECISION_PATH, decision)
+    log_turn(
+        {
+            "minimap": "",
+            "raw_output": message,
+            "locked_routes": set(),
+            "status": "HELD",
+        },
+        decision,
+    )
+    return decision
+
+
+def run_forever() -> None:
+    try:
+        graph = build_graph()
+        graph_error = None
+    except Exception as exc:
+        graph = None
+        graph_error = f"Agent dependency error: {type(exc).__name__}: {exc}"
+
+    turn = 0
+    recent_decisions = []
+    while True:
+        control = read_ai_control()
+        if not control["armed"]:
+            time.sleep(1.0)
+            continue
+
+        turn += 1
+        model = control["model"]
+        try:
+            if graph is None:
+                decision = _dependency_hold(turn, model, graph_error or "Agent unavailable")
+                recent_decisions = (recent_decisions + [decision])[-RECENT_DECISION_LIMIT:]
+            else:
+                result = graph.invoke(
+                    {
+                        "telemetry": {},
+                        "discharge_active": False,
+                        "minimap": "",
+                        "locked_routes": set(),
+                        "raw_output": "",
+                        "decision": {},
+                        "status": "OK",
+                        "recent_decisions": recent_decisions,
+                        "turn": turn,
+                        "model": model,
+                    }
+                )
+                recent_decisions = result.get("recent_decisions", recent_decisions)
+        except Exception as exc:
+            decision = _dependency_hold(
+                turn,
+                model,
+                f"Agent turn error: {type(exc).__name__}: {str(exc)[:500]}",
+            )
+            recent_decisions = (recent_decisions + [decision])[-RECENT_DECISION_LIMIT:]
+        time.sleep(control["tick_seconds"])
+
+
+if __name__ == "__main__":
+    try:
+        run_forever()
+    except KeyboardInterrupt:
+        pass
+```
+
+
+### Full source: `guard.py`
+
+```python
+"""Strict validation boundary for LLM-produced traffic-priority decisions."""
+
+import json
+from pathlib import Path
+import re
+import time
+
+import control_panel
+
+
+BASE_DIR = Path(__file__).resolve().parent
+REJECT_LOG_PATH = BASE_DIR / "agent_rejects.log"
+VALID_ROUTES = set(control_panel.bus_routes_config.keys())
+FLAG_KEYS = {"tsp", "dbl"}
+MAX_REASON_LEN = 500
+
+
+def extract_json(raw_text: str) -> dict | None:
+    """Extract the first balanced JSON object from potentially noisy output."""
+    try:
+        raw = raw_text if isinstance(raw_text, str) else str(raw_text)
+        raw = re.sub(
+            r"<think>.*?</think>",
+            "",
+            raw,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        raw = re.sub(r"```(?:json)?", "", raw, flags=re.IGNORECASE)
+
+        start = None
+        depth = 0
+        in_string = False
+        escaped = False
+        for index, character in enumerate(raw):
+            if start is None:
+                if character == "{":
+                    start = index
+                    depth = 1
+                continue
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                continue
+
+            if character == '"':
+                in_string = True
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    parsed = json.loads(raw[start : index + 1])
+                    return parsed if isinstance(parsed, dict) else None
+        return None
+    except Exception:
+        return None
+
+
+def validate_flags(obj: dict) -> dict | None:
+    """Return a complete strict-bool flag map, or ``None`` on any mismatch."""
+    if not isinstance(obj, dict):
+        return None
+    flags = obj.get("flags")
+    if not isinstance(flags, dict) or set(flags) != VALID_ROUTES:
+        return None
+    for route_flags in flags.values():
+        if not isinstance(route_flags, dict) or set(route_flags) != FLAG_KEYS:
+            return None
+        if not isinstance(route_flags["tsp"], bool):
+            return None
+        if not isinstance(route_flags["dbl"], bool):
+            return None
+    return flags
+
+
+def extract_reason(obj) -> str:
+    """Forgivingly extract an optional annotation without affecting flags."""
+    if not isinstance(obj, dict):
+        return ""
+    reason = obj.get("reason", "")
+    if not isinstance(reason, str):
+        return ""
+    reason = reason.strip()
+    return reason[:MAX_REASON_LEN]
+
+
+def all_off_flags() -> dict:
+    """Return a fresh, complete fail-safe flag map."""
+    return {
+        route_id: {"tsp": False, "dbl": False}
+        for route_id in sorted(VALID_ROUTES)
+    }
+
+
+def _safe_turn(turn) -> int:
+    try:
+        return int(turn)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _record_rejection(turn: int, model: str, raw_text: str) -> None:
+    try:
+        record = {
+            "turn": turn,
+            "model": model,
+            "raw": raw_text[:2000],
+        }
+        with REJECT_LOG_PATH.open("a", encoding="utf-8") as reject_log:
+            reject_log.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        # Logging must never weaken the all-off airlock.
+        pass
+
+
+def safe_decision(raw_text: str, turn: int, model: str) -> dict:
+    """Always return a complete decision; malformed output is held all-off."""
+    safe_turn = _safe_turn(turn)
+    safe_model = model if isinstance(model, str) else str(model)
+    safe_raw = raw_text if isinstance(raw_text, str) else str(raw_text)
+    reason = ""
+    try:
+        parsed = extract_json(safe_raw)
+        flags = validate_flags(parsed)
+        reason = extract_reason(parsed)
+    except Exception:
+        flags = None
+
+    if flags is None:
+        status = "HELD_ALL_OFF"
+        flags = all_off_flags()
+        reason = ""
+        _record_rejection(safe_turn, safe_model, safe_raw)
+    else:
+        status = "OK"
+
+    return {
+        "schema_version": 1,
+        "turn": safe_turn,
+        "timestamp": round(time.time(), 3),
+        "model": safe_model,
+        "status": status,
+        "flags": flags,
+        "reason": reason if status == "OK" else "",
+    }
 ```
 
 

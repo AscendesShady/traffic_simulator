@@ -13,7 +13,7 @@ from signal_controller import (
     RECOVERY_ALL_RED,
     SignalController,
 )
-from vehicle import Vehicle
+from vehicle import DBL_LANE_INDEX, Vehicle
 from tests.helpers import make_bus_for_leg
 
 
@@ -92,6 +92,11 @@ def test_every_route_leg_gets_exclusive_conflict_safe_priority(
     config["tsp_enabled"] = feature_mode in ("TSP", "COMBINED")
     config["dbl_enabled"] = feature_mode in ("DBL", "COMBINED")
     bus = make_bus_for_leg(route_id, node_x, f"BUS_{route_id}_{node_x}")
+    if feature_mode in ("DBL", "COMBINED"):
+        bus.lane_index = DBL_LANE_INDEX
+        bus.y = H_Y + (-1 if approach == "EB" else 1) * (
+            DBL_LANE_INDEX + 0.5
+        ) * LANE
     controller = SignalController({"green_time": 100}, yellow_time=2, red_clearance_time=2)
     controller.phase = 3 if approach == "EB" else 0
     other_node = 700 if node_x == 300 else 300
@@ -111,7 +116,9 @@ def test_every_route_leg_gets_exclusive_conflict_safe_priority(
     assert request["route_id"] == route_id
     assert request["node_x"] == node_x
     assert request["movement"] == movement
-    assert request["entry_lane"] == lane
+    expected_lane = DBL_LANE_INDEX if feature_mode in ("DBL", "COMBINED") else lane
+    assert request["entry_lane"] == expected_lane
+    assert request["dbl_requested"] is (feature_mode in ("DBL", "COMBINED"))
 
 
 @pytest.mark.parametrize("phase", range(6))
@@ -129,14 +136,36 @@ def test_priority_is_safe_from_every_normal_phase_and_each_feature(phase, featur
     }
 
 
-def test_r2_straight_leg_uses_lane_one_and_rejects_wrong_lane(signal_system):
+def test_dbl_eligibility_succeeds_after_early_migration(signal_system):
     config = control_panel.bus_routes_config["R2_EB_B_NB"]
     config["dbl_enabled"] = True
     bus = make_bus_for_leg("R2_EB_B_NB", 300)
+    bus.x = 100
+    bus.y = H_Y - 1.5 * LANE
+    all_red = {
+        node: {direction: "RED" for direction in ("EB", "WB", "NB", "SB")}
+        for node in INT_X
+    }
+
     assert bus.lane_index == 1
-    assert signal_system.is_bus_dbl_eligible(bus, 300)
-    bus.lane_index = 2
     assert not signal_system.is_bus_dbl_eligible(bus, 300)
+
+    for _ in range(60):
+        bus.update(
+            all_red,
+            INT_X,
+            H_Y,
+            ROAD_W,
+            STOP,
+            LANE,
+            [bus],
+            signal_system,
+        )
+        if bus.lane_index == DBL_LANE_INDEX:
+            break
+
+    assert bus.lane_index == DBL_LANE_INDEX
+    assert signal_system.is_bus_dbl_eligible(bus, 300)
     heavy_car = Vehicle(bus.x, bus.y, "EB", is_heavy=True, lane_index=1)
     assert not signal_system.is_bus_dbl_eligible(heavy_car, 300)
 

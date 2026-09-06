@@ -2,16 +2,20 @@ import ast
 import json
 from pathlib import Path
 import time
+from types import SimpleNamespace
+
+import pytest
 
 import control_panel
 import canvas_gemini as canvas
 import main
 import pygame
+import telemetry_dashboard as telemetry_dashboard_module
 from canvas_gemini import H_Y, LANE
 from signal_controller import SignalController
-from telemetry_dashboard import HISTORY_MAX_POINTS, TelemetryDashboard
+from telemetry_dashboard import HISTORY_MAX_POINTS, TelemetryDashboard, _gpu_none
 from telemetry_exporter import DEFAULT_TELEMETRY_PATH, TelemetryExporter
-from vehicle import Vehicle
+from vehicle import Bus, Vehicle
 from tests.helpers import make_bus_for_leg
 
 
@@ -20,6 +24,218 @@ def lane_options():
         "EB": [H_Y - 0.5 * LANE, H_Y - 1.5 * LANE, H_Y - 2.5 * LANE],
         "WB": [H_Y + 0.5 * LANE, H_Y + 1.5 * LANE, H_Y + 2.5 * LANE],
     }
+
+
+@pytest.fixture
+def preserve_sim_random_state():
+    state = main.random.getstate()
+    yield
+    main.random.setstate(state)
+    main.reset_all_spawner_states()
+
+
+def _collect_spawn_sequence(frame_count=240):
+    vehicles = []
+    config = {
+        "model": "Poisson",
+        "rate": 600,
+        "turn_split": 0.7,
+        "heavy_ratio": 0.25,
+    }
+    sequence = []
+    for frame in range(frame_count):
+        previous_count = len(vehicles)
+        main.try_spawn_vehicle(
+            vehicles,
+            "EB",
+            "EB",
+            -20,
+            lane_options()["EB"],
+            config,
+            min_gap=0,
+        )
+        if len(vehicles) == previous_count:
+            continue
+        vehicle = vehicles[-1]
+        sequence.append(
+            (
+                frame,
+                vehicle.is_heavy,
+                vehicle.max_speed,
+                vehicle.lane_index,
+                vehicle.target_turn,
+                vehicle.color,
+            )
+        )
+    return sequence
+
+
+def _seeded_spawn_sequence(seed):
+    control_panel.global_config["random_seed"] = seed
+    main.reset_traffic_generation()
+    return _collect_spawn_sequence()
+
+
+def test_same_seed_same_spawns(preserve_sim_random_state):
+    first = _seeded_spawn_sequence(20260906)
+    second = _seeded_spawn_sequence(20260906)
+
+    assert first
+    assert first == second
+
+
+def test_different_seed_differs(preserve_sim_random_state):
+    first = _seeded_spawn_sequence(101)
+    second = _seeded_spawn_sequence(202)
+
+    assert first
+    assert second
+    assert first != second
+
+
+def test_none_seed_nondeterministic(monkeypatch):
+    seed_calls = []
+    monkeypatch.setitem(control_panel.global_config, "random_seed", None)
+    monkeypatch.setattr(main.random, "seed", lambda value: seed_calls.append(value))
+
+    assert main.apply_configured_random_seed() is None
+    assert seed_calls == []
+
+
+def test_reset_reproduces_with_seed(preserve_sim_random_state):
+    control_panel.global_config["random_seed"] = 8675309
+    main.reset_traffic_generation()
+    before_reset = _collect_spawn_sequence()
+
+    # Consume more RNG and source state before exercising the production reset.
+    _collect_spawn_sequence(60)
+    main.reset_traffic_generation()
+    after_reset = _collect_spawn_sequence()
+
+    assert before_reset
+    assert before_reset == after_reset
+    assert all(value == 0.0 for value in main.bus_dispatch_counters.values())
+    assert main.bus_sequence_counter == 0
+
+
+def test_seed_config_accepts_integer_and_blank(monkeypatch):
+    monkeypatch.setitem(control_panel.global_config, "random_seed", None)
+
+    assert control_panel.set_random_seed(" 12345 ") == 12345
+    assert control_panel.global_config["random_seed"] == 12345
+    assert control_panel.set_random_seed("   ") is None
+    assert control_panel.global_config["random_seed"] is None
+
+
+def test_truck_passenger_count():
+    truck = Vehicle(0, 0, "EB", is_heavy=True)
+    car = Vehicle(0, 0, "EB", is_heavy=False)
+    bus = make_bus_for_leg("R1_EB_A_NB", 300, "PAX_BUS")
+
+    assert truck.passengers == 1
+    assert car.passengers == 4
+    assert isinstance(bus, Bus)
+    assert bus.passengers == 45
+
+
+def test_throughput_counts_truck_as_one(monkeypatch):
+    truck = Vehicle(canvas.WIDTH + 61, H_Y - 0.5 * LANE, "EB", is_heavy=True)
+    truck.passed_nodes.add(canvas.INT_X[0])
+    truck.update = lambda **kwargs: None
+
+    class FakeRoot:
+        def geometry(self, _value):
+            pass
+
+        def after(self, _delay, callback):
+            self.callback = callback
+
+        def mainloop(self):
+            self.callback()
+
+    class FakeProcess:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            pass
+
+    class FakeSignals:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def update(self, vehicles=None):
+            pass
+
+        def is_discharge_active(self):
+            return False
+
+        def get_all_signals(self, _nodes):
+            return {}
+
+        def get_all_dbl_states(self, _nodes, _vehicles):
+            return {}
+
+    class FakeTelemetry:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def export(self, **kwargs):
+            return False
+
+    spawned = False
+
+    def spawn_truck(vehicles, *args, **kwargs):
+        nonlocal spawned
+        if not spawned:
+            vehicles.append(truck)
+            spawned = True
+
+    approaches = {
+        key: {"active": key == "EB"}
+        for key in ("EB", "WB", "A_NB", "A_SB", "B_NB", "B_SB")
+    }
+    monotonic_values = iter((100.0, 100.02))
+
+    monkeypatch.setattr(main, "reset_session_logs", lambda: None)
+    monkeypatch.setattr(main, "SignalController", FakeSignals)
+    monkeypatch.setattr(main, "TelemetryExporter", FakeTelemetry)
+    monkeypatch.setattr(main.control_panel, "approach_configs", approaches)
+    monkeypatch.setattr(main.control_panel, "create_dashboard_window", FakeRoot)
+    monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(main.atexit, "register", lambda callback: callback)
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(main, "try_spawn_vehicle", spawn_truck)
+    monkeypatch.setattr(main, "check_and_dispatch_buses", lambda *args: None)
+    monkeypatch.setattr(main, "get_demand_telemetry", lambda: {})
+    monkeypatch.setattr(main.canvas, "draw_network", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.pygame, "init", lambda: None)
+    monkeypatch.setattr(main.pygame.font, "init", lambda: None)
+    monkeypatch.setattr(main.pygame.font, "SysFont", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        main.pygame.display,
+        "Info",
+        lambda: SimpleNamespace(current_w=1920, current_h=1080),
+    )
+    monkeypatch.setattr(main.pygame.display, "set_mode", lambda size: object())
+    monkeypatch.setattr(main.pygame.display, "set_caption", lambda title: None)
+    monkeypatch.setattr(main.pygame.display, "flip", lambda: None)
+    monkeypatch.setattr(main.pygame.event, "get", lambda: [])
+    monkeypatch.setitem(main.control_panel.global_config, "is_running", True)
+    monkeypatch.setitem(main.control_panel.global_config, "reset_triggered", False)
+    monkeypatch.setitem(main.control_panel.global_config, "is_paused", False)
+    monkeypatch.setitem(main.control_panel.global_config, "sim_speed", 1.0)
+    for key in main.network_throughput:
+        monkeypatch.setitem(main.network_throughput, key, 0)
+
+    main.main()
+
+    assert spawned is True
+    assert truck.passed_nodes == {canvas.INT_X[0]}
+    assert main.network_throughput["passengers_served_car"] == 1
+    assert main.network_throughput["passengers_served_total"] == 1
+    assert main.network_throughput["cars_served"] == 1
+    assert main.network_throughput["vehicles_served_total"] == 1
 
 
 def test_bus_dispatch_is_lane_aware():
@@ -148,6 +364,8 @@ def test_schema_v3_exposes_bus_eta_routes_and_passenger_weighted_queues():
     assert route["route_passengers_total"] == bus.passengers
     assert route["nearest_bus_id"] == "ETA_BUS"
     assert route["nearest_bus_eta_sec"] == bus_state["eta_to_stop_bar_sec_freeflow"]
+    assert bus_state["lane_index"] == bus.lane_index
+    assert bus_state["in_dbl_lane"] is True
     assert all(
         payload["network_summary"]["queues_passengers_est"][approach]
         == vehicle_count * 4
@@ -249,6 +467,33 @@ def test_dashboard_initial_window_fits_smaller_screens_and_remains_useful():
     assert TelemetryDashboard.initial_window_size(1920, 1080) == (900, 780)
     assert TelemetryDashboard.initial_window_size(1366, 768) == (900, 628)
     assert TelemetryDashboard.initial_window_size(640, 480) == (560, 500)
+
+
+def test_startup_window_layout_tiles_large_and_standard_hd_desktops():
+    large = main.calculate_startup_window_layout(2560, 1440)
+    hd = main.calculate_startup_window_layout(1920, 1080)
+
+    assert large == {
+        "mode": "tiled",
+        "canvas_position": (840, 30),
+        "control_geometry": "820x1020+10+10",
+        "telemetry_geometry": "1000x760+840+640",
+    }
+    assert hd == {
+        "mode": "tiled",
+        "canvas_position": (840, 30),
+        "control_geometry": "820x1020+10+10",
+        "telemetry_geometry": "1000x400+840+640",
+    }
+
+
+def test_startup_window_layout_uses_on_screen_cascade_when_space_is_small():
+    layout = main.calculate_startup_window_layout(1366, 768)
+
+    assert layout["mode"] == "cascade"
+    assert layout["canvas_position"] == (183, 30)
+    assert layout["control_geometry"] == "820x718+536+10"
+    assert layout["telemetry_geometry"] == "900x718+233+30"
 
 
 def test_dashboard_responsive_profile_shrinks_content_without_scrollbars():
@@ -445,6 +690,607 @@ def test_dashboard_poll_reschedules_after_unexpected_error():
     dashboard.poll_telemetry()
     assert dashboard.root.after_calls == [(250, dashboard.poll_telemetry)]
     assert dashboard.status_lbl.last["text"] == "TELEMETRY ERROR"
+
+
+def test_gpu_poller_reads_nvidia_smi_and_degrades_gracefully(monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "6144, 8192, 73, 187.5, 62\n"
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Result()
+
+    monkeypatch.setattr(telemetry_dashboard_module.subprocess, "run", fake_run)
+
+    assert telemetry_dashboard_module.poll_gpu_stats() == {
+        "vram_used_mb": 6144.0,
+        "vram_total_mb": 8192.0,
+        "gpu_util_pct": 73.0,
+        "power_w": 187.5,
+        "temp_c": 62.0,
+    }
+    assert calls[0][0][0] == "nvidia-smi"
+    assert calls[0][1]["timeout"] == 2
+
+    monkeypatch.setattr(
+        telemetry_dashboard_module.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    assert telemetry_dashboard_module.poll_gpu_stats() == _gpu_none()
+
+
+def test_llm_turn_reader_skips_partial_lines_and_deduplicates_poll(
+    tmp_path, monkeypatch
+):
+    turn_log = tmp_path / "agent_turn_log.jsonl"
+    record = {
+        "turn": 1,
+        "model": "test-model",
+        "status": "OK",
+        "flags": {},
+    }
+    turn_log.write_text(
+        json.dumps(record) + "\nnot-json\n{\"turn\":",
+        encoding="utf-8",
+    )
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.initialize_llm_monitor_state()
+
+    records, size = dashboard.safe_read_agent_turns(turn_log)
+
+    assert records == [record]
+    assert size == turn_log.stat().st_size
+
+    class FakeRoot:
+        def __init__(self):
+            self.after_calls = []
+
+        def after(self, delay, callback):
+            self.after_calls.append((delay, callback))
+
+    dashboard.root = FakeRoot()
+    dashboard.safe_read_ai_control = lambda: {
+        "armed": True,
+        "model": "test-model",
+    }
+    dashboard.safe_read_agent_turns = lambda: ([record], size)
+    dashboard.update_llm_performance_display = lambda: None
+    monkeypatch.setattr(
+        telemetry_dashboard_module, "poll_gpu_stats", lambda: _gpu_none()
+    )
+    dashboard.poll_llm_performance()
+    dashboard.poll_llm_performance()
+
+    assert len(dashboard.llm_samples) == 1
+    assert dashboard.llm_seen_turns == {1}
+    assert dashboard.root.after_calls == [
+        (
+            telemetry_dashboard_module.LLM_POLL_MILLISECONDS,
+            dashboard.poll_llm_performance,
+        ),
+        (
+            telemetry_dashboard_module.LLM_POLL_MILLISECONDS,
+            dashboard.poll_llm_performance,
+        ),
+    ]
+
+
+def test_llm_sample_rollup_reconciles_status_tokens_and_gpu():
+    flags_on = {
+        "R1": {"tsp": True, "dbl": False},
+        "R2": {"tsp": False, "dbl": True},
+    }
+    gpu = {
+        "vram_used_mb": 6000,
+        "vram_total_mb": 8192,
+        "gpu_util_pct": 80,
+        "power_w": 180,
+        "temp_c": 60,
+    }
+    first = TelemetryDashboard.build_llm_sample(
+        {
+            "turn": 1,
+            "model": "model-a",
+            "status": "OK",
+            "latency_ms": 1000,
+            "output_tokens": 20,
+            "tokens_per_sec": 10,
+            "flags": flags_on,
+        },
+        gpu,
+    )
+    second = TelemetryDashboard.build_llm_sample(
+        {
+            "turn": 2,
+            "model": "model-a",
+            "status": "HELD_ALL_OFF",
+            "latency_ms": 3000,
+            "output_tokens": None,
+            "tokens_per_sec": None,
+            "flags": {},
+        },
+        {**gpu, "vram_used_mb": 7000, "power_w": 200},
+    )
+
+    summary = TelemetryDashboard.summarize_llm_samples([first, second])
+
+    assert first["tsp_on_count"] == 1
+    assert first["dbl_on_count"] == 1
+    assert summary["turns"] == 2
+    assert summary["ok_rate_pct"] == 50.0
+    assert summary["held_rate_pct"] == 50.0
+    assert summary["avg_latency_ms"] == 2000.0
+    assert summary["avg_tokens_per_sec"] == 10.0
+    assert summary["avg_vram_used_mb"] == 6500.0
+    assert summary["peak_vram_used_mb"] == 7000.0
+    assert summary["avg_power_w"] == 190.0
+    assert summary["total_output_tokens"] == 20.0
+
+
+def test_llm_excel_export_writes_samples_and_per_model_summary(tmp_path):
+    from openpyxl import load_workbook
+
+    class FakeLabel:
+        def config(self, **kwargs):
+            self.values = kwargs
+
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.llm_export_status_lbl = FakeLabel()
+    dashboard.llm_samples = [
+        {
+            "turn": 1,
+            "timestamp": 100.0,
+            "model": "model-a",
+            "status": "OK",
+            "latency_ms": 1000.0,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "tokens_per_sec": 10.0,
+            "tsp_on_count": 1,
+            "dbl_on_count": 0,
+            "reason": "Serve the approaching bus.",
+            "vram_used_mb": 6000.0,
+            "gpu_util_pct": 80.0,
+            "power_w": 180.0,
+            "temp_c": 60.0,
+            "pax_per_min_recent": 400.0,
+        },
+        {
+            "turn": 2,
+            "timestamp": 105.0,
+            "model": "model-a",
+            "status": "HELD_ALL_OFF",
+            "latency_ms": 45000.0,
+            "input_tokens": None,
+            "output_tokens": None,
+            "tokens_per_sec": None,
+            "tsp_on_count": 0,
+            "dbl_on_count": 0,
+            "reason": "",
+            "vram_used_mb": 7000.0,
+            "gpu_util_pct": 95.0,
+            "power_w": 210.0,
+            "temp_c": 65.0,
+            "pax_per_min_recent": 350.0,
+        },
+    ]
+    destination = tmp_path / "llm_perf_test.xlsx"
+
+    assert dashboard.export_llm_performance(destination) == destination
+
+    workbook = load_workbook(destination, data_only=True)
+    try:
+        assert workbook.sheetnames == ["Samples", "Summary"]
+        samples = workbook["Samples"]
+        summary = workbook["Summary"]
+        sample_headers = [cell.value for cell in samples[1]]
+        summary_headers = [cell.value for cell in summary[1]]
+        assert samples.max_row == 3
+        assert sample_headers[:4] == ["turn", "timestamp", "model", "status"]
+        assert sample_headers[-1] == "pax_per_min_recent"
+        assert summary.max_row == 2
+        summary_row = {
+            header: summary.cell(row=2, column=index + 1).value
+            for index, header in enumerate(summary_headers)
+        }
+        assert summary_row["model"] == "model-a"
+        assert summary_row["turns"] == 2
+        assert summary_row["guard_ok_pct"] == 50.0
+        assert summary_row["held_pct"] == 50.0
+        assert summary_row["avg_latency_ms"] == 23000.0
+        assert summary_row["total_output_tokens"] == 20.0
+    finally:
+        workbook.close()
+    assert dashboard.llm_export_status_lbl.values["fg"] == "#2ECC71"
+
+    dashboard.llm_samples = []
+    empty_destination = tmp_path / "must_not_exist.xlsx"
+    assert dashboard.export_llm_performance(empty_destination) is None
+    assert not empty_destination.exists()
+    assert dashboard.llm_export_status_lbl.values["text"] == "No samples yet"
+
+
+def test_export_all_creates_four_sheets(tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+
+    class FakeLabel:
+        def config(self, **kwargs):
+            self.values = kwargs
+
+    route_id = telemetry_dashboard_module.ROUTE_ORDER[0]
+    decision_log = tmp_path / "agent_turn_log.jsonl"
+    telemetry_log = tmp_path / "telemetry_log.jsonl"
+    decision_log.write_text(
+        json.dumps(
+            {
+                "turn": 3,
+                "timestamp": 100.0,
+                "model": "model-a",
+                "status": "OK",
+                "reason": "Serve route one.",
+                "pax_per_min_recent": 180.0,
+                "flags": {route_id: {"tsp": True, "dbl": False}},
+                "locked_routes": [route_id],
+                "minimap": "ROUTES:\n1) route one",
+                "raw_output": '{"tsp":[true]}',
+            }
+        )
+        + "\nnot-json\n",
+        encoding="utf-8",
+    )
+    telemetry_log.write_text(
+        json.dumps(
+            {
+                "frame": 120,
+                "sim_time_s": 2.0,
+                "passengers_served_total": 49,
+                "passengers_served_bus": 45,
+                "passengers_served_car": 4,
+                "buses_served": 1,
+                "cars_served": 1,
+                "pax_per_min_cumulative": 1470.0,
+                "pax_per_min_recent": 49.0,
+                "vehicles_in_network": 8,
+                "ai_armed": True,
+                "ai_last_status": "OK",
+                "queues_vehicles": {"EB": 2},
+                "queues_passengers_est": {"EB": 8},
+            }
+        )
+        + "\n{\"partial\":",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        telemetry_dashboard_module, "AGENT_TURN_LOG_FILE", decision_log
+    )
+    monkeypatch.setattr(
+        telemetry_dashboard_module, "TELEMETRY_LOG_FILE", telemetry_log
+    )
+
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.export_all_status_lbl = FakeLabel()
+    dashboard.llm_samples = [
+        {
+            "turn": 3,
+            "timestamp": 100.0,
+            "model": "model-a",
+            "status": "OK",
+            "latency_ms": 800.0,
+            "input_tokens": 120,
+            "output_tokens": 24,
+            "tokens_per_sec": 30.0,
+            "tsp_on_count": 1,
+            "dbl_on_count": 0,
+            "reason": "Serve route one.",
+            "vram_used_mb": 5000.0,
+            "gpu_util_pct": 70.0,
+            "power_w": 150.0,
+            "temp_c": 58.0,
+            "pax_per_min_recent": 49.0,
+        }
+    ]
+    destination = tmp_path / "combined.xlsx"
+
+    assert dashboard.export_all(destination) == destination
+
+    workbook = load_workbook(destination, data_only=True)
+    try:
+        assert workbook.sheetnames == [
+            "Decisions",
+            "Telemetry",
+            "LLM Performance",
+            "LLM Summary",
+        ]
+        assert all(workbook[name].max_row == 2 for name in workbook.sheetnames)
+        decision_headers = [cell.value for cell in workbook["Decisions"][1]]
+        assert workbook["Decisions"].cell(
+            row=2,
+            column=decision_headers.index(f"{route_id}_tsp") + 1,
+        ).value is True
+        telemetry_headers = [cell.value for cell in workbook["Telemetry"][1]]
+        assert workbook["Telemetry"].cell(
+            row=2,
+            column=telemetry_headers.index("ai_armed") + 1,
+        ).value is True
+        assert workbook["LLM Performance"]["C2"].value == "model-a"
+        assert workbook["LLM Summary"]["A2"].value == "model-a"
+    finally:
+        workbook.close()
+    assert dashboard.export_all_status_lbl.values["fg"] == "#2ECC71"
+
+
+def test_export_all_missing_logs_ok(tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+
+    class FakeLabel:
+        def config(self, **kwargs):
+            self.values = kwargs
+
+    monkeypatch.setattr(
+        telemetry_dashboard_module,
+        "AGENT_TURN_LOG_FILE",
+        tmp_path / "missing_decisions.jsonl",
+    )
+    monkeypatch.setattr(
+        telemetry_dashboard_module,
+        "TELEMETRY_LOG_FILE",
+        tmp_path / "missing_telemetry.jsonl",
+    )
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.export_all_status_lbl = FakeLabel()
+    dashboard.llm_samples = [
+        {"turn": 1, "model": "model-a", "status": "OK"}
+    ]
+    destination = tmp_path / "missing_logs.xlsx"
+
+    assert dashboard.export_all(destination) == destination
+
+    workbook = load_workbook(destination, data_only=True)
+    try:
+        assert workbook["Decisions"].max_row == 1
+        assert workbook["Telemetry"].max_row == 1
+        assert workbook["LLM Performance"].max_row == 2
+        assert workbook["LLM Summary"].max_row == 2
+    finally:
+        workbook.close()
+
+
+def test_export_all_empty_writes_nothing(tmp_path, monkeypatch):
+    class FakeLabel:
+        def config(self, **kwargs):
+            self.values = kwargs
+
+    monkeypatch.setattr(
+        telemetry_dashboard_module,
+        "AGENT_TURN_LOG_FILE",
+        tmp_path / "missing_decisions.jsonl",
+    )
+    monkeypatch.setattr(
+        telemetry_dashboard_module,
+        "TELEMETRY_LOG_FILE",
+        tmp_path / "missing_telemetry.jsonl",
+    )
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.export_all_status_lbl = FakeLabel()
+    dashboard.llm_samples = []
+    destination = tmp_path / "must_not_exist.xlsx"
+
+    assert dashboard.export_all(destination) is None
+    assert not destination.exists()
+    assert dashboard.export_all_status_lbl.values == {
+        "text": "Nothing to export yet",
+        "fg": telemetry_dashboard_module.COLOR_WARNING,
+    }
+
+
+def test_combined_decisions_matches_session_columns(tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+
+    class FakeLabel:
+        def config(self, **kwargs):
+            self.values = kwargs
+
+    decision_log = tmp_path / "agent_turn_log.jsonl"
+    decision_log.write_text(
+        json.dumps(
+            {
+                "turn": 1,
+                "model": "model-a",
+                "status": "OK",
+                "flags": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    missing_telemetry = tmp_path / "missing_telemetry.jsonl"
+    monkeypatch.setattr(
+        telemetry_dashboard_module, "AGENT_TURN_LOG_FILE", decision_log
+    )
+    monkeypatch.setattr(
+        telemetry_dashboard_module, "TELEMETRY_LOG_FILE", missing_telemetry
+    )
+    monkeypatch.setattr(main, "AGENT_TURN_LOG_PATH", decision_log)
+    monkeypatch.setattr(main, "TELEMETRY_LOG_PATH", missing_telemetry)
+
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.export_all_status_lbl = FakeLabel()
+    dashboard.llm_samples = []
+    combined_destination = tmp_path / "combined.xlsx"
+    session_destination = tmp_path / "session.xlsx"
+
+    assert dashboard.export_all(combined_destination) == combined_destination
+    assert main.export_session_excel(session_destination) == session_destination
+
+    combined = load_workbook(combined_destination, data_only=True)
+    session = load_workbook(session_destination, data_only=True)
+    try:
+        combined_headers = [cell.value for cell in combined["Decisions"][1]]
+        session_headers = [cell.value for cell in session["Decisions"][1]]
+        assert combined_headers == session_headers
+        assert combined_headers == telemetry_dashboard_module.DECISION_EXPORT_HEADERS
+    finally:
+        combined.close()
+        session.close()
+
+
+def test_summary_snapshot_export_reconciles_live_telemetry(tmp_path):
+    from openpyxl import load_workbook
+
+    class FakeLabel:
+        def config(self, **kwargs):
+            self.values = kwargs
+
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.summary_export_status_lbl = FakeLabel()
+    dashboard.latest_telemetry = {
+        "timestamp": time.time(),
+        "frame_number": 120,
+        "simulation_time_seconds": 2.0,
+        "simulation_paused": False,
+        "simulation_speed": 1.0,
+        "network_summary": {
+            "total_vehicles": 10,
+            "total_buses": 2,
+            "passenger_volume": 122,
+            "queues": {"EB": 3},
+            "queues_passengers_est": {"EB": 12},
+            "pending_demand": 1,
+        },
+        "network_throughput": {
+            "passengers_served_total": 90,
+            "passengers_per_minute_recent": 45.0,
+        },
+        "network_discharge": {"active": False, "status": "IDLE"},
+        "demand_generation": {
+            "EB": {
+                "active": True,
+                "model": "Poisson",
+                "configured_rate_vpm": 20,
+                "effective_rate_vpm": 20.0,
+                "pending_arrivals": 1,
+                "peak_active": False,
+            }
+        },
+        "routes": {
+            "R1_EB_A_NB": {
+                "route_name": "EB to Node A",
+                "active": True,
+                "tsp_enabled": True,
+                "dbl_enabled": False,
+                "buses_on_route": 2,
+            }
+        },
+        "signal_state": {
+            "nodes": {
+                "300": {
+                    "node_x": 300,
+                    "phase": "EW_GREEN",
+                    "phase_index": 0,
+                    "phase_timer_frames": 20,
+                    "priority_state": "NORMAL",
+                    "priority_timer_frames": 0,
+                    "signals": {
+                        "EB": "GREEN",
+                        "WB": "GREEN",
+                        "NB": "RED",
+                        "SB": "RED",
+                    },
+                    "active_request": None,
+                    "queued_requests": [],
+                    "reservation_count": 1,
+                }
+            }
+        },
+    }
+    destination = tmp_path / "summary.xlsx"
+
+    assert dashboard.export_summary_snapshot(destination) == destination
+
+    workbook = load_workbook(destination, data_only=True)
+    try:
+        assert workbook.sheetnames == [
+            "Overview",
+            "Queues & Demand",
+            "Routes",
+            "Signal Nodes",
+        ]
+        overview = {
+            row[0]: row[1]
+            for row in workbook["Overview"].iter_rows(
+                min_row=2, values_only=True
+            )
+        }
+        assert overview["network_summary.total_vehicles"] == 10
+        assert overview["network_throughput.passengers_served_total"] == 90
+        assert workbook["Queues & Demand"]["A2"].value == "EB"
+        assert workbook["Routes"]["A2"].value == "R1_EB_A_NB"
+        assert workbook["Signal Nodes"]["A2"].value == "300"
+    finally:
+        workbook.close()
+    assert dashboard.summary_export_status_lbl.values["fg"] == "#2ECC71"
+
+    dashboard.latest_telemetry = None
+    empty_destination = tmp_path / "no_summary.xlsx"
+    assert dashboard.export_summary_snapshot(empty_destination) is None
+    assert not empty_destination.exists()
+
+
+def test_session_trends_export_uses_only_in_memory_history(tmp_path):
+    from openpyxl import load_workbook
+
+    class FakeLabel:
+        def config(self, **kwargs):
+            self.values = kwargs
+
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.initialize_history_state()
+    dashboard.draw_trend_charts = lambda: None
+    dashboard.trends_export_status_lbl = FakeLabel()
+    dashboard.record_history_sample(
+        dashboard_sample(60, 1.0, vehicles=8, buses=1, queued=2, pending=3)
+    )
+    dashboard.record_history_sample(
+        dashboard_sample(120, 2.0, vehicles=12, buses=2, queued=6, pending=1)
+    )
+    destination = tmp_path / "trends.xlsx"
+
+    assert dashboard.export_session_trends(destination) == destination
+
+    workbook = load_workbook(destination, data_only=True)
+    try:
+        assert workbook.sheetnames == ["Session Trends", "Summary"]
+        trends = workbook["Session Trends"]
+        assert trends.max_row == 3
+        assert [cell.value for cell in trends[1]] == [
+            "time_seconds",
+            "vehicles",
+            "buses",
+            "road_queue",
+            "pending_demand",
+            "congestion_pct",
+        ]
+        summary = {
+            row[0]: row[1]
+            for row in workbook["Summary"].iter_rows(
+                min_row=2, values_only=True
+            )
+        }
+        assert summary["samples"] == 2
+        assert summary["average_vehicles"] == 10.0
+        assert summary["peak_road_queue"] == 6
+    finally:
+        workbook.close()
+    assert dashboard.trends_export_status_lbl.values["fg"] == "#2ECC71"
+
+    dashboard.clear_history()
+    empty_destination = tmp_path / "no_trends.xlsx"
+    assert dashboard.export_session_trends(empty_destination) is None
+    assert not empty_destination.exists()
 
 
 def test_runtime_paths_are_source_relative():

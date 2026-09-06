@@ -63,6 +63,7 @@ global_config = {
     "is_paused": False,
     "sim_speed": 1.0,        # 0.5x to 3.0x speed multiplier
     "green_time": 240,       # Signal green phase duration in frames
+    "random_seed": None,     # None = OS entropy; int = reproducible traffic
     "reset_triggered": False,# Flag to wipe canvas vehicles
     "is_running": True,      # Master execution flag
     "discharge_selection": DISCHARGE_AUTO,
@@ -85,6 +86,14 @@ global_config = {
         "last_turn": 0,
     },
 }
+
+
+def set_random_seed(value):
+    """Store a validated traffic seed; blank input restores OS entropy."""
+    text = "" if value is None else str(value).strip()
+    normalized = None if not text else int(text)
+    global_config["random_seed"] = normalized
+    return normalized
 
 # ----------------------------------------------------------
 # 6 SIMULTANEOUS BUS ROUTES (NODE B CORRECTED TO X=700)
@@ -466,6 +475,50 @@ def create_dashboard_window():
         style="Global.Horizontal.TScale", command=update_speed, length=80
     )
     speed_slider.pack(side="left", padx=2)
+
+    seed_group = tk.Frame(controls_row, bg=COLOR_CARD)
+    seed_group.pack(side="left", padx=(12, 0))
+
+    tk.Label(
+        seed_group, text="Seed:", font=(FONT_FAMILY, 8, "bold"),
+        bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY
+    ).pack(side="left", padx=(0, 4))
+
+    seed_entry = tk.Entry(
+        seed_group, width=8, font=(FONT_FAMILY, 8),
+        bg=COLOR_CARD_ALT, fg=COLOR_TEXT_PRIMARY,
+        insertbackground=COLOR_TEXT_PRIMARY, relief="flat"
+    )
+    configured_seed = global_config.get("random_seed")
+    if configured_seed is not None:
+        seed_entry.insert(0, str(configured_seed))
+    seed_entry.pack(side="left", padx=(0, 4), ipady=2)
+
+    def apply_seed_from_entry(_event=None):
+        try:
+            seed = set_random_seed(seed_entry.get())
+        except (TypeError, ValueError):
+            status_text.config(text="Seed must be an integer", fg=COLOR_DANGER)
+            return
+        if seed is None:
+            status_text.config(
+                text="Random seed cleared; applies on reset", fg=COLOR_TEXT_SECONDARY
+            )
+        else:
+            status_text.config(
+                text=f"Seed {seed} set; applies on reset", fg=COLOR_SUCCESS
+            )
+
+    seed_btn = tk.Button(
+        seed_group, text="SET", font=(FONT_FAMILY, 8, "bold"),
+        bg=COLOR_CARD_BORDER, fg=COLOR_TEXT_PRIMARY,
+        activebackground="#475569", activeforeground=COLOR_TEXT_PRIMARY,
+        bd=0, padx=7, pady=2, cursor="hand2", relief="flat",
+        command=apply_seed_from_entry,
+    )
+    seed_btn.pack(side="left")
+    seed_entry.bind("<Return>", apply_seed_from_entry)
+    seed_entry.bind("<FocusOut>", apply_seed_from_entry)
 
     # 2.25 NETWORK GRIDLOCK RECOVERY CARD
     recovery_card = tk.Frame(

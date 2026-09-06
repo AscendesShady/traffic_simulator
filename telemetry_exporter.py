@@ -8,7 +8,7 @@ import time
 
 import canvas_gemini as canvas
 import control_panel
-from vehicle import Bus
+from vehicle import Bus, DBL_LANE_INDEX
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -92,6 +92,10 @@ class TelemetryExporter:
             "y": round(bus.y, 1),
             "speed": round(bus.speed, 2),
             "passengers": bus.passengers,
+            "lane_index": bus.lane_index,
+            "in_dbl_lane": bool(
+                leg is not None and bus.lane_index == DBL_LANE_INDEX
+            ),
             "target_node_x": target_node,
             "distance_to_stop_bar_px": round(distance, 1),
             "eta_to_stop_bar_sec_freeflow": round(eta_frames_freeflow / 60.0, 2),
@@ -123,6 +127,9 @@ class TelemetryExporter:
         throughput_state=None,
     ):
         queues = self.compute_queue_counts(vehicles)
+        # Queue counts are aggregated by approach, so vehicle type is no longer
+        # available here. This documented car-occupancy approximation slightly
+        # overestimates queued passengers whenever trucks are present.
         queues_passengers = {
             approach: vehicle_count * CAR_OCCUPANCY
             for approach, vehicle_count in queues.items()

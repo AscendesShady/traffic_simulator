@@ -7,7 +7,7 @@ from typing import Any
 
 import control_panel
 from canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
-from vehicle import Bus
+from vehicle import Bus, DBL_LANE_INDEX
 
 RED = "RED"
 YELLOW = "YELLOW"
@@ -1248,16 +1248,21 @@ class SignalController:
         dist = self.distance_to_node_stop_bar(bus, target_node)
         return 0 <= dist <= 250
 
-    def is_bus_dbl_eligible(self, bus, target_node, all_vehicles=None):
+    def is_dbl_enabled_for_bus_leg(self, bus, target_node):
+        """Return the same live DBL intent used by priority eligibility."""
         if not isinstance(bus, Bus):
             return False
         live_cfg = self._live_route_config(bus)
         if not live_cfg.get("dbl_enabled", False):
             return False
         leg = bus.get_active_route_leg(INT_X)
-        if not leg or leg["node_x"] != target_node:
+        return bool(leg and leg["node_x"] == target_node)
+
+    def is_bus_dbl_eligible(self, bus, target_node, all_vehicles=None):
+        if not self.is_dbl_enabled_for_bus_leg(bus, target_node):
             return False
-        if bus.lane_index != leg["entry_lane"]:
+        leg = bus.get_active_route_leg(INT_X)
+        if bus.lane_index != DBL_LANE_INDEX:
             return False
         dist = self.distance_to_node_stop_bar(bus, target_node)
         return 0 <= dist <= 250
@@ -1289,7 +1294,7 @@ class SignalController:
             node_x=leg["node_x"],
             originating_approach=approach,
             movement=leg["movement"],
-            entry_lane=leg["entry_lane"],
+            entry_lane=DBL_LANE_INDEX if dbl_requested else leg["entry_lane"],
             exit_direction=leg["exit_direction"],
             conflicting_approaches=conflicts,
             requested_at_frame=self.frame_number,

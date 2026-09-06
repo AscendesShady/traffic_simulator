@@ -105,8 +105,20 @@ justification for this turn's flag choices. Keep it on one line, with no line
 breaks and no quotation marks inside it if avoidable. The "tsp" and "dbl"
 arrays matter most: each must contain exactly {len(guard.ROUTE_ORDER)} booleans.
 
-If a route has no approaching bus, set both tsp and dbl to false. If a route is
-marked GRANTED, preserve its current tsp and dbl values and do not change it.
+DECIDE EACH TURN FROM THE CURRENT STATE ONLY. Do not carry flags forward from
+previous turns. For every route, look at its approaching_buses count in the
+minimap THIS turn:
+
+- If a route shows "approaching_buses=0" or "none approaching", you MUST set
+  BOTH its tsp and dbl to false, even if it had priority before. A route with no
+  approaching bus gains nothing from priority and only delays cross traffic.
+- Only set tsp or dbl true for a route that has an approaching bus this turn
+  AND where priority improves passenger throughput.
+
+Example: if only route 1 has an approaching bus, the correct output is
+tsp=[true,false,false,false,false,false] and
+dbl=[false,false,false,false,false,false]. Every other position is false
+because those routes have no bus.
 """
 
 
@@ -116,6 +128,7 @@ class AgentState(TypedDict):
     minimap: str
     locked_routes: set
     raw_output: str
+    call_metrics: dict
     decision: dict
     status: str
     recent_decisions: list
@@ -163,6 +176,22 @@ def log_turn(state: AgentState, decision: dict) -> None:
         throughput = telemetry.get("network_throughput", {})
         if not isinstance(throughput, dict):
             throughput = {}
+        call_metrics = state.get("call_metrics", {}) or {}
+        if not isinstance(call_metrics, dict):
+            call_metrics = {}
+        output_tokens = call_metrics.get("output_tokens")
+        eval_duration_ns = call_metrics.get("eval_duration_ns")
+        tokens_per_sec = None
+        numeric_output = isinstance(output_tokens, (int, float)) and not isinstance(
+            output_tokens, bool
+        )
+        numeric_duration = isinstance(
+            eval_duration_ns, (int, float)
+        ) and not isinstance(eval_duration_ns, bool)
+        if numeric_output and numeric_duration and eval_duration_ns > 0:
+            tokens_per_sec = round(
+                output_tokens / (eval_duration_ns / 1_000_000_000.0), 2
+            )
         record = {
             "turn": decision.get("turn"),
             "timestamp": decision.get("timestamp"),
@@ -175,6 +204,10 @@ def log_turn(state: AgentState, decision: dict) -> None:
             "pax_per_min_recent": throughput.get(
                 "passengers_per_minute_recent"
             ),
+            "latency_ms": call_metrics.get("latency_ms"),
+            "input_tokens": call_metrics.get("input_tokens"),
+            "output_tokens": output_tokens,
+            "tokens_per_sec": tokens_per_sec,
             "locked_routes": sorted(locked_routes),
             "stale": state.get("status") in ("STALE", "HELD"),
         }
@@ -352,18 +385,6 @@ def read_minimap(state: AgentState) -> dict:
                 "approaching_buses=0 none approaching"
             )
 
-    recent = state.get("recent_decisions", [])[-RECENT_DECISION_LIMIT:]
-    if recent:
-        compact_recent = [
-            {
-                "turn": decision.get("turn"),
-                "status": decision.get("status"),
-                "flags": decision.get("flags", {}),
-            }
-            for decision in recent
-            if isinstance(decision, dict)
-        ]
-        lines.append("RECENT_DECISIONS=" + json.dumps(compact_recent, sort_keys=True))
     return {"minimap": "\n".join(lines)}
 
 
@@ -411,7 +432,9 @@ def _get_gemini_client():
     return _GEMINI_CLIENT
 
 
-def _call_gemini(model: str, system_prompt: str, minimap: str) -> str:
+def _call_gemini(
+    model: str, system_prompt: str, minimap: str
+) -> tuple[str, dict]:
     """Call Gemini with low temperature and a hard, non-overlapping timeout."""
     client = _get_gemini_client()
     if _genai_types is None:
@@ -459,7 +482,14 @@ def _call_gemini(model: str, system_prompt: str, minimap: str) -> str:
     text = getattr(value, "text", None)
     if not isinstance(text, str) or not text.strip():
         raise RuntimeError("empty Gemini response")
-    return text
+    usage = getattr(value, "usage_metadata", None)
+    metrics = {
+        "input_tokens": getattr(usage, "prompt_token_count", None),
+        "output_tokens": getattr(usage, "candidates_token_count", None),
+        "eval_duration_ns": None,
+        "total_duration_ns": None,
+    }
+    return text, metrics
 
 
 def _ollama_format_is_unsupported(exc: Exception) -> bool:
@@ -492,7 +522,7 @@ def _get_ollama_client():
     return _OLLAMA_CLIENT
 
 
-def _call_ollama(model: str, minimap: str) -> str:
+def _call_ollama(model: str, minimap: str) -> tuple[str, dict]:
     client = _get_ollama_client()
     call_lock = _OLLAMA_CALL_LOCK
     if not call_lock.acquire(blocking=False):
@@ -546,29 +576,57 @@ def _call_ollama(model: str, minimap: str) -> str:
     if not succeeded:
         raise value
     response = value
-    return response["message"]["content"]
+    content = response["message"]["content"]
+    metrics = {
+        "input_tokens": response.get("prompt_eval_count"),
+        "output_tokens": response.get("eval_count"),
+        "eval_duration_ns": response.get("eval_duration"),
+        "total_duration_ns": response.get("total_duration"),
+    }
+    return content, metrics
 
 
 def ai_turn(state: AgentState) -> dict:
     model = state.get("model", "None")
+    started = time.time()
     try:
         if not model or model == "None":
             raise RuntimeError("no model selected")
         if _is_gemini(model):
-            raw_output = _call_gemini(
+            raw_output, call_metrics = _call_gemini(
                 model,
                 SYSTEM_PROMPT,
                 state.get("minimap", ""),
             )
         else:
-            raw_output = _call_ollama(model, state.get("minimap", ""))
+            raw_output, call_metrics = _call_ollama(
+                model, state.get("minimap", "")
+            )
         if not isinstance(raw_output, str):
             raise TypeError("model response content is not text")
-        return {"raw_output": raw_output, "status": "OK"}
+        if not isinstance(call_metrics, dict):
+            call_metrics = {}
+        latency_ms = round((time.time() - started) * 1000.0, 1)
+        return {
+            "raw_output": raw_output,
+            "status": "OK",
+            "call_metrics": {
+                **call_metrics,
+                "latency_ms": latency_ms,
+            },
+        }
     except Exception as exc:
+        latency_ms = round((time.time() - started) * 1000.0, 1)
         return {
             "raw_output": f"Agent error: {type(exc).__name__}: {str(exc)[:500]}",
             "status": "INVALID",
+            "call_metrics": {
+                "latency_ms": latency_ms,
+                "input_tokens": None,
+                "output_tokens": None,
+                "eval_duration_ns": None,
+                "total_duration_ns": None,
+            },
         }
 
 
@@ -699,6 +757,7 @@ def run_forever() -> None:
                         "minimap": "",
                         "locked_routes": set(),
                         "raw_output": "",
+                        "call_metrics": {},
                         "decision": {},
                         "status": "OK",
                         "recent_decisions": recent_decisions,

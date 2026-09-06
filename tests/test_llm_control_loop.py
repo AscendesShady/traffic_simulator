@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ def agent_state(**overrides):
         "minimap": "",
         "locked_routes": set(),
         "raw_output": "",
+        "call_metrics": {},
         "decision": {},
         "status": "OK",
         "recent_decisions": [],
@@ -627,6 +629,62 @@ def test_minimap_uses_only_approaching_unfinished_bus_legs():
         assert f"{position}) {route_id}:" in minimap_update["minimap"]
 
 
+def test_minimap_has_no_recent_decisions():
+    old_flags = valid_flags(tsp_route="R1_EB_A_NB", dbl_route="R4_WB_A_SB")
+    state = agent_state(
+        telemetry={"routes": {}, "active_buses": []},
+        recent_decisions=[
+            {"turn": 7, "status": "OK", "flags": old_flags},
+        ],
+    )
+
+    minimap = agent.read_minimap(state)["minimap"]
+
+    assert "RECENT_DECISIONS" not in minimap
+    assert '"R1_EB_A_NB"' not in minimap
+    assert '"R4_WB_A_SB"' not in minimap
+
+
+def test_minimap_still_has_routes_and_nodes():
+    telemetry = {
+        "simulation_time_seconds": 42.0,
+        "routes": {
+            route_id: {
+                "active": route_id == "R1_EB_A_NB",
+                "tsp_enabled": False,
+                "dbl_enabled": False,
+            }
+            for route_id in guard.ROUTE_ORDER
+        },
+        "network_throughput": {
+            "passengers_per_minute": 80.0,
+            "passengers_per_minute_recent": 95.0,
+        },
+        "network_summary": {"queues_passengers_est": {"EB": 20, "WB": 12}},
+        "signal_state": {
+            "nodes": {
+                "300": {"phase": "EW_GREEN", "signals": {"EB": "GREEN"}},
+                "780": {"phase": "NS_GREEN", "signals": {"NB": "GREEN"}},
+            }
+        },
+        "active_buses": [],
+    }
+
+    minimap = agent.read_minimap(agent_state(telemetry=telemetry))["minimap"]
+
+    assert "simulation_time_seconds=42.0" in minimap
+    assert "passengers_per_minute=80.0" in minimap
+    assert "passengers_per_minute_recent=95.0" in minimap
+    assert 'queues_passengers_est={"EB": 20, "WB": 12}' in minimap
+    assert "NODES:" in minimap
+    assert "node=300 phase=EW_GREEN" in minimap
+    assert "node=780 phase=NS_GREEN" in minimap
+    assert "ROUTES:" in minimap
+    for position, route_id in enumerate(guard.ROUTE_ORDER, start=1):
+        assert f"{position}) {route_id}:" in minimap
+    assert "approaching_buses=0 none approaching" in minimap
+
+
 def test_granted_route_stays_locked_through_clearing():
     clearing = {
         "bus_id": "CLEARING",
@@ -754,30 +812,29 @@ def test_ollama_timeout_holds_all_off(monkeypatch):
     monkeypatch.setattr(agent, "_OLLAMA_CALL_LOCK", threading.Lock())
     monkeypatch.setattr(agent, "OLLAMA_TIMEOUT_SECONDS", 0.02)
 
+    state = agent_state()
     started_at = time.perf_counter()
-    with pytest.raises(
-        TimeoutError, match=r"Ollama request exceeded 0.02s timeout"
-    ):
-        agent._call_ollama("test-model", "whole network")
+    failed = agent.ai_turn(state)
     elapsed = time.perf_counter() - started_at
 
     assert started.is_set()
     assert elapsed < 0.15
-
-    # ai_turn already converts this exception into its guarded invalid path.
-    monkeypatch.setattr(
-        agent,
-        "_call_ollama",
-        lambda *args: (_ for _ in ()).throw(TimeoutError("timed out")),
-    )
-    state = agent_state()
-    failed = agent.ai_turn(state)
     guarded = agent.anti_cheat({**state, **failed})
 
     assert failed["status"] == "INVALID"
     assert "TimeoutError" in failed["raw_output"]
+    assert failed["call_metrics"]["latency_ms"] >= 10.0
+    assert failed["call_metrics"]["input_tokens"] is None
+    assert failed["call_metrics"]["output_tokens"] is None
     assert guarded["decision"]["status"] == "HELD_ALL_OFF"
     assert guarded["decision"]["flags"] == guard.all_off_flags()
+
+    agent.log_turn({**state, **failed}, guarded["decision"])
+    logged = json.loads(agent.TURN_LOG_PATH.read_text(encoding="utf-8"))
+    assert logged["latency_ms"] is not None
+    assert logged["input_tokens"] is None
+    assert logged["output_tokens"] is None
+    assert logged["tokens_per_sec"] is None
 
     release.set()
     assert finished.wait(timeout=0.2)
@@ -799,21 +856,46 @@ def test_ollama_normal_call_unaffected(monkeypatch):
         @staticmethod
         def chat(**kwargs):
             calls.append(("chat", kwargs))
-            return {"message": {"content": expected}}
+            return {
+                "message": {"content": expected},
+                "prompt_eval_count": 120,
+                "eval_count": 30,
+                "eval_duration": 2_000_000_000,
+                "total_duration": 3_000_000_000,
+            }
 
     monkeypatch.setattr(agent, "ollama", SimpleNamespace(Client=FakeClient))
     monkeypatch.setattr(agent, "_OLLAMA_CLIENT", None)
     monkeypatch.setattr(agent, "_OLLAMA_CALL_LOCK", threading.Lock())
 
-    raw = agent._call_ollama("test-model", "whole network")
+    raw, metrics = agent._call_ollama("test-model", "whole network")
     decision = guard.safe_decision(raw, turn=1, model="test-model")
 
     assert raw == expected
     assert calls[0] == ("init", {"timeout": agent.OLLAMA_TIMEOUT_SECONDS})
     assert calls[1][0] == "chat"
     assert calls[1][1]["format"] == agent.OLLAMA_OUTPUT_FORMAT
+    assert metrics == {
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "eval_duration_ns": 2_000_000_000,
+        "total_duration_ns": 3_000_000_000,
+    }
     assert decision["status"] == "OK"
     assert decision["flags"]["R1_EB_A_NB"]["tsp"] is True
+
+    agent.log_turn(
+        agent_state(
+            raw_output=raw,
+            call_metrics={**metrics, "latency_ms": 3100.0},
+        ),
+        decision,
+    )
+    logged = json.loads(agent.TURN_LOG_PATH.read_text(encoding="utf-8"))
+    assert logged["latency_ms"] == 3100.0
+    assert logged["input_tokens"] == 120
+    assert logged["output_tokens"] == 30
+    assert logged["tokens_per_sec"] == 15.0
 
 
 def test_ollama_format_fallback_still_works_under_timeout(
@@ -858,7 +940,15 @@ def test_gemini_routing(monkeypatch):
         "_call_gemini",
         lambda model, system_prompt, minimap: (
             calls.append((model, system_prompt, minimap))
-            or json.dumps(positional_output(reason="Cloud route."))
+            or (
+                json.dumps(positional_output(reason="Cloud route.")),
+                {
+                    "input_tokens": 42,
+                    "output_tokens": 12,
+                    "eval_duration_ns": None,
+                    "total_duration_ns": None,
+                },
+            )
         ),
     )
     monkeypatch.setattr(
@@ -890,7 +980,13 @@ def test_gemini_call_uses_key_prompt_and_low_temperature(monkeypatch):
         @staticmethod
         def generate_content(**kwargs):
             calls.append(kwargs)
-            return SimpleNamespace(text="  guarded JSON  ")
+            return SimpleNamespace(
+                text="  guarded JSON  ",
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=42,
+                    candidates_token_count=12,
+                ),
+            )
 
     class FakeGenai:
         @staticmethod
@@ -908,13 +1004,21 @@ def test_gemini_call_uses_key_prompt_and_low_temperature(monkeypatch):
     monkeypatch.setattr(agent, "_GEMINI_CLIENT", None)
     monkeypatch.setattr(agent, "_GEMINI_CALL_LOCK", threading.Lock())
 
-    text = agent._call_gemini("gemini-2.5-flash", "system", "minimap")
+    text, metrics = agent._call_gemini(
+        "gemini-2.5-flash", "system", "minimap"
+    )
 
     assert text == "  guarded JSON  "
     assert calls[0] == {"api_key": "test-secret"}
     assert calls[1]["model"] == "gemini-2.5-flash"
     assert calls[1]["contents"] == "system\n\nminimap"
     assert calls[1]["config"].options == {"temperature": 0.2}
+    assert metrics == {
+        "input_tokens": 42,
+        "output_tokens": 12,
+        "eval_duration_ns": None,
+        "total_duration_ns": None,
+    }
 
 
 def test_gemini_failure_holds_all_off(monkeypatch):
@@ -1181,7 +1285,7 @@ def test_telemetry_logging_failure_is_nonfatal(tmp_path, monkeypatch):
     assert main._last_telemetry_log_frame is None
 
 
-def test_session_start_removes_only_session_logs(tmp_path, monkeypatch):
+def test_reset_clears_session_logs(tmp_path, monkeypatch):
     telemetry_log = tmp_path / "telemetry_log.jsonl"
     turn_log = tmp_path / "agent_turn_log.jsonl"
     unrelated = tmp_path / "keep.txt"
@@ -1198,6 +1302,54 @@ def test_session_start_removes_only_session_logs(tmp_path, monkeypatch):
     assert not turn_log.exists()
     assert unrelated.read_text(encoding="utf-8") == "keep"
     assert main._last_telemetry_log_frame is None
+
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    main_body = source.split("def main():", 1)[1]
+    assert main_body.index("reset_session_logs()") < main_body.index(
+        "pygame.init()"
+    )
+    reset_block = main_body.split(
+        'if control_panel.global_config["reset_triggered"]:', 1
+    )[1].split("sim_speed =", 1)[0]
+    assert "reset_session_logs()" in reset_block
+
+
+def test_reset_isolates_runs(tmp_path, monkeypatch):
+    telemetry_log = tmp_path / "telemetry_log.jsonl"
+    turn_log = tmp_path / "agent_turn_log.jsonl"
+    monkeypatch.setattr(main, "TELEMETRY_LOG_PATH", telemetry_log)
+    monkeypatch.setattr(main, "AGENT_TURN_LOG_PATH", turn_log)
+
+    telemetry_log.write_text(
+        json.dumps({"run": "A", "frame": 60}) + "\n",
+        encoding="utf-8",
+    )
+    turn_log.write_text(
+        json.dumps({"run": "A", "turn": 1}) + "\n",
+        encoding="utf-8",
+    )
+
+    main.reset_session_logs()
+
+    telemetry_log.write_text(
+        json.dumps({"run": "B", "frame": 60}) + "\n",
+        encoding="utf-8",
+    )
+    turn_log.write_text(
+        json.dumps({"run": "B", "turn": 1}) + "\n",
+        encoding="utf-8",
+    )
+
+    telemetry_rows = [
+        json.loads(line)
+        for line in telemetry_log.read_text(encoding="utf-8").splitlines()
+    ]
+    turn_rows = [
+        json.loads(line)
+        for line in turn_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert telemetry_rows == [{"run": "B", "frame": 60}]
+    assert turn_rows == [{"run": "B", "turn": 1}]
 
 
 def test_excel_export_builds_decisions_and_telemetry_sheets(

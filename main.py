@@ -4,6 +4,7 @@ import sys
 import random
 import math
 import json
+import os
 import subprocess
 import atexit
 import time
@@ -79,6 +80,72 @@ SESSION_ROUTE_IDS = (
     "R6_WB_ONLY",
 )
 _last_telemetry_log_frame = None
+
+
+def apply_configured_random_seed():
+    """Initialize the traffic RNG from the operator's current seed setting."""
+    seed = control_panel.global_config.get("random_seed")
+    if seed is not None:
+        normalized_seed = int(seed)
+        random.seed(normalized_seed)
+        print(f"[SIM] Deterministic run, seed={normalized_seed}")
+        return normalized_seed
+    print("[SIM] Nondeterministic run (no seed set)")
+    return None
+
+
+def calculate_startup_window_layout(screen_width, screen_height):
+    """Return screen-aware positions for control, canvas, and telemetry windows."""
+    try:
+        screen_width = max(1, int(screen_width))
+        screen_height = max(1, int(screen_height))
+    except (TypeError, ValueError, OverflowError):
+        screen_width, screen_height = 1920, 1080
+
+    margin = 10
+    gap = 10
+    canvas_top = 30
+    taskbar_reserve = 40
+    usable_bottom = screen_height - taskbar_reserve
+    usable_height = usable_bottom - margin
+    control_width = min(820, screen_width - 2 * margin)
+    control_height = min(1020, usable_height)
+    right_x = margin + control_width + gap
+    right_width = screen_width - right_x - margin
+    telemetry_y = canvas_top + canvas.HEIGHT + gap
+    telemetry_height = usable_bottom - telemetry_y
+
+    if right_width >= canvas.WIDTH and telemetry_height >= 400:
+        telemetry_width = min(max(900, canvas.WIDTH), right_width)
+        return {
+            "mode": "tiled",
+            "canvas_position": (right_x, canvas_top),
+            "control_geometry": (
+                f"{control_width}x{control_height}+{margin}+{margin}"
+            ),
+            "telemetry_geometry": (
+                f"{telemetry_width}x{min(780, telemetry_height)}+"
+                f"{right_x}+{telemetry_y}"
+            ),
+        }
+
+    # Small desktops cannot contain all three full interfaces without overlap.
+    # Keep every window wholly on-screen and use a predictable cascade instead.
+    telemetry_width = min(900, screen_width - 2 * margin)
+    telemetry_height = min(780, usable_height)
+    canvas_x = max(margin, (screen_width - canvas.WIDTH) // 2)
+    control_x = max(margin, screen_width - control_width - margin)
+    telemetry_x = max(margin, (screen_width - telemetry_width) // 2)
+    return {
+        "mode": "cascade",
+        "canvas_position": (canvas_x, canvas_top),
+        "control_geometry": (
+            f"{control_width}x{control_height}+{control_x}+{margin}"
+        ),
+        "telemetry_geometry": (
+            f"{telemetry_width}x{telemetry_height}+{telemetry_x}+30"
+        ),
+    }
 
 
 def reset_session_logs():
@@ -358,12 +425,21 @@ def merge_ai_decision(path=None):
 
 
 def reset_all_spawner_states():
-    """Clear stochastic, burst, and congestion backlog state."""
-    global post_discharge_meter_frames_remaining
+    """Clear vehicle and bus source state for a fresh traffic episode."""
+    global post_discharge_meter_frames_remaining, bus_sequence_counter
     for state in spawner_states.values():
         state.clear()
         state.update(_new_spawner_state())
+    for route_id in bus_dispatch_counters:
+        bus_dispatch_counters[route_id] = 0.0
+    bus_sequence_counter = 0
     post_discharge_meter_frames_remaining = 0
+
+
+def reset_traffic_generation():
+    """Reset every traffic source and restart its configured RNG sequence."""
+    reset_all_spawner_states()
+    return apply_configured_random_seed()
 
 
 def begin_post_discharge_metering():
@@ -656,11 +732,22 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
 
 
 def main():
+    # Seeding makes traffic generation reproducible, not LLM inference. The
+    # valid benchmark is the same seed with one ARMED and one DISARMED run;
+    # same-seed ARMED runs may diverge because model decisions can differ.
+    apply_configured_random_seed()
     reset_session_logs()
     pygame.init()
     pygame.font.init()
     font = pygame.font.SysFont("Consolas", 13, bold=True)
 
+    display_info = pygame.display.Info()
+    startup_layout = calculate_startup_window_layout(
+        display_info.current_w,
+        display_info.current_h,
+    )
+    canvas_x, canvas_y = startup_layout["canvas_position"]
+    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{canvas_x},{canvas_y}"
     screen = pygame.display.set_mode((canvas.WIDTH, canvas.HEIGHT))
     pygame.display.set_caption("Urban Network Simulation")
 
@@ -680,12 +767,18 @@ def main():
     
     # 1. Start Control Panel
     root = control_panel.create_dashboard_window()
+    root.geometry(startup_layout["control_geometry"])
 
     # 2. Start Decoupled Telemetry Dashboard as a Subprocess
     print("Launching Telemetry Dashboard...")
+    dashboard_environment = os.environ.copy()
+    dashboard_environment["TRAFFIC_TELEMETRY_GEOMETRY"] = startup_layout[
+        "telemetry_geometry"
+    ]
     dashboard_proc = subprocess.Popen(
         [sys.executable, str(DASHBOARD_PATH)],
         cwd=str(BASE_DIR),
+        env=dashboard_environment,
     )
 
     print("Launching LLM Control Agent...")
@@ -744,9 +837,13 @@ def main():
 
         if control_panel.global_config["reset_triggered"]:
             vehicles.clear()
-            reset_all_spawner_states()
+            reset_traffic_generation()
             signals.reset_discharge()
+            # Export before RESET to preserve the previous run: RESET clears
+            # both session logs so the next benchmark run is isolated.
+            reset_session_logs()
             network_throughput.update({key: 0 for key in network_throughput})
+            master_frame_count = 0
             control_panel.global_config["reset_triggered"] = False
 
         sim_speed = control_panel.global_config.get("sim_speed", 1.0)

@@ -1,6 +1,12 @@
 # vehicle.py
 import pygame
 
+
+CAR_PASSENGERS = 4
+TRUCK_PASSENGERS = 1
+DBL_LANE_INDEX = 2
+
+
 class Vehicle:
     def __init__(self, x, y, direction, max_speed=1.0, color=(50, 150, 250), is_heavy=False, target_turn="STRAIGHT", lane_index=2, assigned_node_x=None):
         self.x = float(x)
@@ -15,7 +21,7 @@ class Vehicle:
         self.passed_nodes = set()
         self.length = 28 if is_heavy else 18
         self.width = 12 if is_heavy else 10
-        self.passengers = 4
+        self.passengers = TRUCK_PASSENGERS if is_heavy else CAR_PASSENGERS
         self.leg_state = "APPROACHING"
         self.intersection_entry_approaches = {}
         self.intersection_entry_movements = {}
@@ -358,17 +364,45 @@ class Bus(Vehicle):
         required_lane = leg["entry_lane"] if leg else self.lane_index
         self.must_hold_for_lane = False
 
-        if self.target_turn == "LEFT" and self.lane_index != required_lane:
-            dist_to_intersection = abs(self.x - target_node_x) if self.direction in ("EB", "WB") else abs(self.y - h_y)
-            if dist_to_intersection < 250.0:
-                desired_y = h_y - (2.5 * lane_w) if self.direction == "EB" else h_y + (2.5 * lane_w)
-                if self.is_target_lane_clear(desired_y, all_vehicles):
-                    if abs(self.y - desired_y) > 1.0: self.y += 0.5 if self.y < desired_y else -0.5
-                    else:
-                        self.y = desired_y
-                        self.lane_index = required_lane
-                if self.lane_index != required_lane:
-                    self.must_hold_for_lane = True
+        dist_to_intersection = (
+            abs(self.x - target_node_x)
+            if self.direction in ("EB", "WB")
+            else abs(self.y - h_y)
+        )
+        dbl_enabled_for_leg = bool(
+            leg
+            and signal_controller
+            and signal_controller.is_dbl_enabled_for_bus_leg(self, target_node_x)
+        )
+        turn_lane_change_due = (
+            self.target_turn == "LEFT" and dist_to_intersection < 250.0
+        )
+
+        # A DBL-enabled bus occupies the continuous outer lane as early as
+        # traffic permits. Close to a left turn, its configured turn lane wins
+        # if that lane ever differs from the DBL lane.
+        if turn_lane_change_due:
+            target_lane = required_lane
+        elif dbl_enabled_for_leg:
+            target_lane = DBL_LANE_INDEX
+        else:
+            target_lane = required_lane
+        lane_change_due = (
+            dbl_enabled_for_leg or turn_lane_change_due
+        ) and self.lane_index != target_lane
+        if lane_change_due:
+            lane_offset = (target_lane + 0.5) * lane_w
+            desired_y = (
+                h_y - lane_offset if self.direction == "EB" else h_y + lane_offset
+            )
+            if self.is_target_lane_clear(desired_y, all_vehicles):
+                if abs(self.y - desired_y) > 1.0:
+                    self.y += 0.5 if self.y < desired_y else -0.5
+                else:
+                    self.y = desired_y
+                    self.lane_index = target_lane
+            if self.lane_index != target_lane:
+                self.must_hold_for_lane = True
 
         super().update(signal_data, int_x_list, h_y, road_w, stop_offset, lane_w, all_vehicles, signal_controller)
 

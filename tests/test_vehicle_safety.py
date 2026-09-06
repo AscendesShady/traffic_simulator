@@ -3,7 +3,7 @@ import pytest
 import control_panel
 from canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
 from signal_controller import SignalController
-from vehicle import Bus, Vehicle
+from vehicle import Bus, DBL_LANE_INDEX, Vehicle
 from tests.helpers import make_bus_for_leg, rectangles_overlap
 
 
@@ -175,6 +175,93 @@ def test_r1_bus_follows_left_turner_before_entire_node_is_empty():
 
     assert follower.x > starting_x or follower.direction == "NB"
     assert 300 in follower.passed_nodes
+
+
+def test_dbl_route_bus_moves_to_outer_lane_early():
+    config = control_panel.bus_routes_config["R2_EB_B_NB"]
+    config["dbl_enabled"] = True
+    bus = make_bus_for_leg("R2_EB_B_NB", 300, "EARLY_DBL")
+    bus.x = -100
+    bus.y = H_Y - 1.5 * LANE
+    controller = SignalController({"green_time": 999})
+    starting_y = bus.y
+
+    assert bus.target_turn == "STRAIGHT"
+    assert bus.distance_to_node_stop_bar(300, H_Y, ROAD_W, STOP) > 250
+
+    bus.update(
+        signals_for("EB", "GREEN"),
+        INT_X,
+        H_Y,
+        ROAD_W,
+        STOP,
+        LANE,
+        [bus],
+        controller,
+    )
+
+    assert bus.y < starting_y
+    assert bus.lane_index == 1
+
+
+def test_left_turn_lane_change_still_works():
+    config = control_panel.bus_routes_config["R2_EB_B_NB"]
+    config["dbl_enabled"] = False
+    bus = make_bus_for_leg("R2_EB_B_NB", 700, "LEFT_NO_DBL")
+    bus.x = 500
+    bus.y = H_Y - 1.5 * LANE
+    bus.lane_index = 1
+    controller = SignalController({"green_time": 999})
+
+    for _ in range(60):
+        bus.update(
+            signals_for("EB", "RED"),
+            INT_X,
+            H_Y,
+            ROAD_W,
+            STOP,
+            LANE,
+            [bus],
+            controller,
+        )
+        if bus.lane_index == DBL_LANE_INDEX:
+            break
+
+    assert bus.target_turn == "LEFT"
+    assert bus.lane_index == DBL_LANE_INDEX
+    assert bus.y == H_Y - 2.5 * LANE
+
+
+def test_dbl_migration_respects_clear_lane():
+    config = control_panel.bus_routes_config["R2_EB_B_NB"]
+    config["dbl_enabled"] = True
+    bus = make_bus_for_leg("R2_EB_B_NB", 300, "BLOCKED_DBL")
+    bus.x = -100
+    bus.y = H_Y - 1.5 * LANE
+    blocker = Vehicle(
+        bus.x,
+        H_Y - 2.5 * LANE,
+        "EB",
+        max_speed=0,
+        lane_index=DBL_LANE_INDEX,
+    )
+    controller = SignalController({"green_time": 999})
+    starting_y = bus.y
+
+    bus.update(
+        signals_for("EB", "GREEN"),
+        INT_X,
+        H_Y,
+        ROAD_W,
+        STOP,
+        LANE,
+        [bus, blocker],
+        controller,
+    )
+
+    assert bus.y == starting_y
+    assert bus.lane_index == 1
+    assert bus.must_hold_for_lane is True
 
 
 def test_dbl_car_ahead_does_not_deadlock_bus():

@@ -3,10 +3,12 @@ import pytest
 import control_panel
 from canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
 from signal_controller import (
+    ACTIVE_STALL_TIMEOUT,
     ALL_RED_CLEARANCE,
     CONFLICT_YELLOW,
     COMPLETED,
     DENIED,
+    INFEASIBLE_GRANT,
     NORMAL,
     PRIORITY_ACTIVE,
     PRIORITY_CLEARING,
@@ -339,3 +341,148 @@ def test_queued_timeout_is_terminal_and_cannot_renew_in_place():
     )
     assert retry["attempt_number"] == 2
     assert retry["request_id"] == "PRIORITY_000003"
+
+
+@pytest.mark.parametrize(
+    "wrong_lane,must_hold_for_lane",
+    ((True, False), (False, True)),
+)
+def test_infeasible_grant_denied_not_activated(
+    wrong_lane, must_hold_for_lane
+):
+    route_id = "R4_WB_A_SB"
+    control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
+    bus = make_bus_for_leg(route_id, 300, "INFEASIBLE_BUS")
+    if wrong_lane:
+        bus.lane_index = 1
+        bus.y = H_Y + 1.5 * LANE
+    bus.must_hold_for_lane = must_hold_for_lane
+    controller = SignalController(
+        {"green_time": 20}, yellow_time=2, red_clearance_time=2
+    )
+
+    observed = []
+    for _ in range(20):
+        controller.update([bus])
+        observed.append(controller.nodes[300].priority_state)
+        if controller.nodes[300].terminal_history:
+            break
+
+    assert PRIORITY_ACTIVE not in observed
+    assert RECOVERY_ALL_RED in observed
+    assert controller.nodes[300].priority_state == NORMAL
+    terminal = controller.nodes[300].terminal_history[-1]
+    assert terminal["state"] == DENIED
+    assert terminal["denial_or_cancel_reason"] == INFEASIBLE_GRANT
+
+
+def test_feasible_grant_still_activates():
+    route_id = "R1_EB_A_NB"
+    control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
+    bus = make_bus_for_leg(route_id, 300, "FEASIBLE_BUS")
+    controller = SignalController(
+        {"green_time": 20}, yellow_time=2, red_clearance_time=2
+    )
+
+    observed = advance_to_priority(controller, [bus], 300)
+
+    assert observed[-1] == PRIORITY_ACTIVE
+    assert controller.nodes[300].active_start_frame == controller.frame_number
+    assert controller.nodes[300].last_progress_frame == controller.frame_number
+    assert controller.nodes[300].last_stop_bar_distance == pytest.approx(
+        controller.distance_to_node_stop_bar(bus, 300)
+    )
+
+
+def test_active_stall_times_out_safely():
+    route_id = "R1_EB_A_NB"
+    control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
+    bus = make_bus_for_leg(route_id, 300, "STALLED_BUS")
+    controller = SignalController(
+        {"green_time": 20},
+        yellow_time=2,
+        red_clearance_time=2,
+        priority_active_stall_frames=3,
+        priority_active_max_frames=100,
+    )
+    advance_to_priority(controller, [bus], 300)
+
+    for _ in range(controller.priority_active_stall_frames + 1):
+        controller.update([bus])
+
+    node = controller.nodes[300]
+    assert node.priority_state == RECOVERY_ALL_RED
+    assert node.active_request.denial_or_cancel_reason == ACTIVE_STALL_TIMEOUT
+    assert set(controller.get_all_signals()[300].values()) == {"RED"}
+
+
+def test_active_progress_resets_stall_watchdog():
+    route_id = "R1_EB_A_NB"
+    control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
+    bus = make_bus_for_leg(route_id, 300, "SLOW_PROGRESS_BUS")
+    bus.x -= 100
+    controller = SignalController(
+        {"green_time": 20},
+        yellow_time=2,
+        red_clearance_time=2,
+        priority_active_stall_frames=2,
+        priority_active_max_frames=100,
+    )
+    advance_to_priority(controller, [bus], 300)
+
+    for _ in range(12):
+        bus.x += 0.3
+        controller.update([bus])
+        assert controller.nodes[300].priority_state == PRIORITY_ACTIVE
+
+
+def test_absolute_max_hold_enforced():
+    route_id = "R1_EB_A_NB"
+    control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
+    bus = make_bus_for_leg(route_id, 300, "MAX_HOLD_BUS")
+    bus.x -= 100
+    controller = SignalController(
+        {"green_time": 20},
+        yellow_time=2,
+        red_clearance_time=2,
+        priority_active_stall_frames=100,
+        priority_active_max_frames=4,
+    )
+    advance_to_priority(controller, [bus], 300)
+
+    for _ in range(controller.priority_active_max_frames + 1):
+        bus.x += 0.6
+        controller.update([bus])
+
+    node = controller.nodes[300]
+    assert node.priority_state == RECOVERY_ALL_RED
+    assert node.active_request.denial_or_cancel_reason == ACTIVE_STALL_TIMEOUT
+    assert set(controller.get_all_signals()[300].values()) == {"RED"}
+
+
+def test_gridlock_scenario_recovers():
+    route_id = "R4_WB_A_SB"
+    control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
+    bus = make_bus_for_leg(route_id, 300, "GRIDLOCK_WB_BUS")
+    bus.lane_index = 1
+    bus.y = H_Y + 1.5 * LANE
+    bus.must_hold_for_lane = True
+    controller = SignalController(
+        {"green_time": 2}, yellow_time=1, red_clearance_time=1
+    )
+    observed_priority = []
+    northbound_served = False
+
+    for _ in range(30):
+        controller.update([bus])
+        observed_priority.append(controller.nodes[300].priority_state)
+        if controller.get_all_signals()[300]["NB"] == "GREEN":
+            northbound_served = True
+            break
+
+    assert PRIORITY_ACTIVE not in observed_priority
+    assert RECOVERY_ALL_RED in observed_priority
+    assert northbound_served is True
+    terminal = controller.nodes[300].terminal_history[-1]
+    assert terminal["state"] == DENIED
+    assert terminal["denial_or_cancel_reason"] == INFEASIBLE_GRANT

@@ -24,6 +24,10 @@ RECOVERY_ALL_RED = "RECOVERY_ALL_RED"
 COMPLETED = "COMPLETED"
 DENIED = "DENIED"
 CANCELLED = "CANCELLED"
+INFEASIBLE_GRANT = "INFEASIBLE_GRANT"
+ACTIVE_STALL_TIMEOUT = "ACTIVE_STALL_TIMEOUT"
+
+PRIORITY_PROGRESS_EPSILON = 0.5
 
 DISCHARGE_INACTIVE = "INACTIVE"
 DISCHARGE_TRANSITION_YELLOW = "TRANSITION_YELLOW"
@@ -112,6 +116,9 @@ class NodeState:
     reservations: dict[int, dict[str, Any]] = field(default_factory=dict)
     terminal_history: list[dict[str, Any]] = field(default_factory=list)
     suppressed_keys: set[tuple[str, int, int]] = field(default_factory=set)
+    active_start_frame: int | None = None
+    last_progress_frame: int | None = None
+    last_stop_bar_distance: float | None = None
 
 
 class SignalController:
@@ -127,21 +134,31 @@ class SignalController:
         discharge_max_green=600,
         discharge_stall_time=180,
         discharge_queue_target=0,
+        priority_active_stall_frames=300,
+        priority_active_max_frames=900,
     ):
         self.global_config = global_config
         self.yellow_time = max(1, int(yellow_time))
         self.red_clearance_time = max(1, int(red_clearance_time))
         self.priority_request_timeout = max(1, int(priority_request_timeout))
-        self.frame_number = 0
-        self.nodes = {node_x: NodeState() for node_x in INT_X}
-        self._request_sequence = 0
-        self._attempt_counts: dict[tuple[str, int, int], int] = {}
+        self.priority_active_stall_frames = max(
+            1, int(priority_active_stall_frames)
+        )
+        self.priority_active_max_frames = max(1, int(priority_active_max_frames))
         self.discharge_min_green = max(1, int(discharge_min_green))
         self.discharge_max_green = max(
             self.discharge_min_green, int(discharge_max_green)
         )
         self.discharge_stall_time = max(1, int(discharge_stall_time))
         self.discharge_queue_target = max(0, int(discharge_queue_target))
+        self.reset_all_state()
+
+    def reset_all_state(self):
+        """Restore construction-time runtime state while preserving configuration."""
+        self.frame_number = 0
+        self.nodes = {node_x: NodeState() for node_x in INT_X}
+        self._request_sequence = 0
+        self._attempt_counts: dict[tuple[str, int, int], int] = {}
         self.discharge_active = False
         self.discharge_mode = control_panel.DISCHARGE_AUTO
         self.discharge_state = DISCHARGE_INACTIVE
@@ -168,6 +185,8 @@ class SignalController:
             plan_name: -self.discharge_max_green
             for plan_name in DISCHARGE_PLAN_STAGES
         }
+        self.global_config["discharge_start_requested"] = False
+        self.global_config["discharge_stop_requested"] = False
         self._publish_discharge_status()
 
     # Backward-compatible Node A getters plus broadcast setup setters.
@@ -250,7 +269,7 @@ class SignalController:
         return self._publish_discharge_status()
 
     def reset_discharge(self):
-        """Return recovery control to a clean idle state after a full reset."""
+        """Return only the network-recovery subsystem to its idle state."""
         self.discharge_active = False
         self.discharge_mode = control_panel.DISCHARGE_AUTO
         self.discharge_state = DISCHARGE_INACTIVE
@@ -1415,6 +1434,40 @@ class SignalController:
         node.priority_state = RECOVERY_ALL_RED
         node.priority_timer = 0
 
+    @staticmethod
+    def _bus_can_use_grant(request, node_x, vehicles):
+        """Return whether the requested bus is physically positioned to proceed."""
+        bus = request.bus
+        leg = bus.get_active_route_leg(INT_X)
+        return bool(
+            bus in (vehicles or [])
+            and leg
+            and leg["node_x"] == node_x
+            and leg["route_leg_index"] == request.route_leg_index
+            and bus.lane_index == request.entry_lane
+            and not getattr(bus, "must_hold_for_lane", False)
+        )
+
+    def _start_priority_watchdog(self, node, request, node_x):
+        node.active_start_frame = self.frame_number
+        node.last_progress_frame = self.frame_number
+        node.last_stop_bar_distance = self.distance_to_node_stop_bar(
+            request.bus, node_x
+        )
+
+    @staticmethod
+    def _stop_priority_watchdog(node):
+        node.active_start_frame = None
+        node.last_progress_frame = None
+        node.last_stop_bar_distance = None
+
+    def _deny_active_grant(self, node, request, reason):
+        request.denial_or_cancel_reason = reason
+        request.state = RECOVERY_ALL_RED
+        node.priority_state = RECOVERY_ALL_RED
+        node.priority_timer = 0
+        self._stop_priority_watchdog(node)
+
     def _priority_update(self, node_x, node, vehicles):
         live_queue = []
         for queued_request in node.request_queue:
@@ -1463,9 +1516,18 @@ class SignalController:
                 node.priority_timer >= self.red_clearance_time
                 and self.is_intersection_clear(node_x, vehicles)
             ):
-                node.priority_state = PRIORITY_ACTIVE
-                request.state = PRIORITY_ACTIVE
-                node.priority_timer = 0
+                if self._bus_can_use_grant(request, node_x, vehicles):
+                    node.priority_state = PRIORITY_ACTIVE
+                    request.state = PRIORITY_ACTIVE
+                    node.priority_timer = 0
+                    self._start_priority_watchdog(node, request, node_x)
+                else:
+                    # Keep the denied request attached until RECOVERY_ALL_RED
+                    # completes, so the normal conflict-safe recovery path can
+                    # record it and resume ordinary signal service.
+                    self._deny_active_grant(
+                        node, request, INFEASIBLE_GRANT
+                    )
             return
         if node.priority_state == PRIORITY_ACTIVE:
             if not request.bus.is_front_bumper_upstream(
@@ -1473,6 +1535,31 @@ class SignalController:
             ):
                 node.priority_state = PRIORITY_CLEARING
                 request.state = PRIORITY_CLEARING
+                self._stop_priority_watchdog(node)
+                return
+            distance = self.distance_to_node_stop_bar(request.bus, node_x)
+            if (
+                node.last_stop_bar_distance is None
+                or distance
+                < node.last_stop_bar_distance - PRIORITY_PROGRESS_EPSILON
+            ):
+                node.last_progress_frame = self.frame_number
+                node.last_stop_bar_distance = distance
+            if node.active_start_frame is None:
+                self._start_priority_watchdog(node, request, node_x)
+                return
+            stalled = (
+                self.frame_number - node.last_progress_frame
+                > self.priority_active_stall_frames
+            )
+            over_max = (
+                self.frame_number - node.active_start_frame
+                > self.priority_active_max_frames
+            )
+            if stalled or over_max:
+                self._deny_active_grant(
+                    node, request, ACTIVE_STALL_TIMEOUT
+                )
             return
         if node.priority_state == PRIORITY_CLEARING:
             if node_x in request.bus.passed_nodes:
@@ -1490,7 +1577,11 @@ class SignalController:
                 node.timer = 0
                 node.priority_state = NORMAL
                 node.priority_timer = 0
-                if request.denial_or_cancel_reason == "REQUEST_TIMEOUT":
+                if request.denial_or_cancel_reason in (
+                    "REQUEST_TIMEOUT",
+                    INFEASIBLE_GRANT,
+                    ACTIVE_STALL_TIMEOUT,
+                ):
                     terminal_state = DENIED
                 elif request.denial_or_cancel_reason:
                     terminal_state = CANCELLED
@@ -1498,6 +1589,7 @@ class SignalController:
                     terminal_state = COMPLETED
                 self._finalize_request(node, request, terminal_state)
                 node.active_request = None
+                self._stop_priority_watchdog(node)
 
     def update(self, vehicles=None):
         vehicles = vehicles or []

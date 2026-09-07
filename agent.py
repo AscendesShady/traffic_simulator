@@ -40,7 +40,13 @@ VERBOSE_LOG = True
 TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
 STALE_SECONDS = 3.0
 RECENT_DECISION_LIMIT = 5
-DEFAULT_CONTROL = {"armed": False, "model": "None", "tick_seconds": 5}
+DEFAULT_CONTROL = {
+    "armed": False,
+    "model": "None",
+    "tick_seconds": 5,
+    "simulation_running": False,
+}
+FRAME_RESET_MARGIN = 100
 GEMINI_TIMEOUT_SECONDS = 30.0
 OLLAMA_TIMEOUT_SECONDS = 45.0
 _GEMINI_CLIENT = None
@@ -231,6 +237,7 @@ def read_ai_control(path: Path = AI_CONTROL_PATH) -> dict:
                 15,
                 max(2, int(payload.get("tick_seconds", 5))),
             ),
+            "simulation_running": payload.get("simulation_running") is True,
         }
     except Exception:
         return dict(DEFAULT_CONTROL)
@@ -243,6 +250,38 @@ def _read_telemetry(path: Path = TELEMETRY_PATH) -> dict | None:
         return telemetry if isinstance(telemetry, dict) else None
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return None
+
+
+def _telemetry_frame_number(telemetry):
+    if not isinstance(telemetry, dict):
+        return None
+    value = telemetry.get("frame_number")
+    if isinstance(value, bool):
+        return None
+    try:
+        frame_number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return frame_number if frame_number >= 0 else None
+
+
+def _track_run_boundary(turn, recent_decisions, last_frame, telemetry):
+    """Clear per-run agent state when telemetry jumps back to frame zero."""
+    current_frame = _telemetry_frame_number(telemetry)
+    reset_detected = bool(
+        current_frame is not None
+        and last_frame is not None
+        and (
+            current_frame < last_frame - FRAME_RESET_MARGIN
+            or (current_frame == 0 and last_frame > 0)
+        )
+    )
+    if reset_detected:
+        turn = 0
+        recent_decisions = []
+    if current_frame is not None:
+        last_frame = current_frame
+    return turn, recent_decisions, last_frame, reset_detected
 
 
 def _finite_nonnegative(value, default=None):
@@ -737,9 +776,22 @@ def run_forever() -> None:
 
     turn = 0
     recent_decisions = []
+    last_frame = None
     while True:
         control = read_ai_control()
-        if not control["armed"]:
+        telemetry = _read_telemetry()
+        turn, recent_decisions, last_frame, _reset_detected = _track_run_boundary(
+            turn, recent_decisions, last_frame, telemetry
+        )
+        telemetry_says_stopped = bool(
+            isinstance(telemetry, dict)
+            and telemetry.get("simulation_running") is False
+        )
+        if (
+            not control["armed"]
+            or not control["simulation_running"]
+            or telemetry_says_stopped
+        ):
             time.sleep(1.0)
             continue
 

@@ -38,6 +38,7 @@ API_MODEL_REGISTRY = {
 SYM_DOT = "\u25cf"            # ●
 SYM_PAUSE = "\u23f8"          # ⏸
 SYM_PLAY = "\u25b6"           # ▶
+SYM_STOP = "\u25a0"           # ■
 SYM_RESET = "\u21ba"          # ↺
 SYM_BUS = "\u1f68c"           # 🚌
 
@@ -65,7 +66,9 @@ global_config = {
     "green_time": 240,       # Signal green phase duration in frames
     "random_seed": None,     # None = OS entropy; int = reproducible traffic
     "reset_triggered": False,# Flag to wipe canvas vehicles
-    "is_running": True,      # Master execution flag
+    "start_requested": False,# START requests a fresh run from frame zero
+    "is_running": False,     # Sim launches idle; START begins a fresh run
+    "run_has_started": False,# Distinguishes launch-idle from a completed STOP
     "discharge_selection": DISCHARGE_AUTO,
     "discharge_start_requested": False,
     "discharge_stop_requested": False,
@@ -94,6 +97,24 @@ def set_random_seed(value):
     normalized = None if not text else int(text)
     global_config["random_seed"] = normalized
     return normalized
+
+
+def request_start_stop():
+    """Request a fresh START, or STOP the active run without clearing data."""
+    if global_config.get("is_running", False):
+        global_config["is_running"] = False
+        global_config["start_requested"] = False
+        return "STOPPED"
+    global_config["start_requested"] = True
+    return "START_REQUESTED"
+
+
+def request_pause_resume():
+    """Toggle an active run's pause without changing its run lifecycle."""
+    if not global_config.get("is_running", False):
+        return bool(global_config.get("is_paused", False))
+    global_config["is_paused"] = not global_config.get("is_paused", False)
+    return global_config["is_paused"]
 
 # ----------------------------------------------------------
 # 6 SIMULTANEOUS BUS ROUTES (NODE B CORRECTED TO X=700)
@@ -252,6 +273,7 @@ def write_ai_control(path=None):
         "armed": bool(runtime.get("armed", False)),
         "model": str(runtime.get("model", "None")),
         "tick_seconds": min(15, max(2, int(runtime.get("tick_seconds", 5)))),
+        "simulation_running": bool(global_config.get("is_running", False)),
     }
     destination = AI_CONTROL_PATH if path is None else Path(path)
     temp_name = None
@@ -367,12 +389,12 @@ def create_dashboard_window():
     status_badge = tk.Frame(header_frame, bg=COLOR_BG)
     status_badge.pack(side="right")
 
-    dot_lbl = tk.Label(status_badge, text=SYM_DOT, font=(FONT_FAMILY, 11), bg=COLOR_BG, fg=COLOR_SUCCESS)
+    dot_lbl = tk.Label(status_badge, text=SYM_DOT, font=(FONT_FAMILY, 11), bg=COLOR_BG, fg=COLOR_TEXT_SECONDARY)
     dot_lbl.pack(side="left", padx=(0, 4))
 
     status_text = tk.Label(
-        status_badge, text="System Normal", font=(FONT_FAMILY, 10, "bold"),
-        bg=COLOR_BG, fg=COLOR_SUCCESS
+        status_badge, text="Idle — press START", font=(FONT_FAMILY, 10, "bold"),
+        bg=COLOR_BG, fg=COLOR_TEXT_SECONDARY
     )
     status_text.pack(side="left")
 
@@ -392,16 +414,20 @@ def create_dashboard_window():
     controls_row = tk.Frame(global_card, bg=COLOR_CARD)
     controls_row.pack(fill="x", padx=16, pady=(0, 6))
 
+    def toggle_start_stop():
+        request_start_stop()
+        write_ai_control()
+
+    start_stop_btn = tk.Button(
+        controls_row, text=f"{SYM_PLAY} START", font=(FONT_FAMILY, 8, "bold"),
+        bg=COLOR_SUCCESS, fg=COLOR_TEXT_PRIMARY, activebackground="#24A35A",
+        activeforeground=COLOR_TEXT_PRIMARY, bd=0, padx=12, pady=4,
+        cursor="hand2", relief="flat", command=toggle_start_stop
+    )
+    start_stop_btn.pack(side="left", padx=(0, 8))
+
     def toggle_pause():
-        global_config["is_paused"] = not global_config["is_paused"]
-        if global_config["is_paused"]:
-            pause_btn.config(text=f"{SYM_PLAY} RESUME", bg=COLOR_SUCCESS)
-            dot_lbl.config(fg=COLOR_WARNING)
-            status_text.config(text="Simulation Paused", fg=COLOR_WARNING)
-        else:
-            pause_btn.config(text=f"{SYM_PAUSE} PAUSE", bg=COLOR_ACCENT)
-            dot_lbl.config(fg=COLOR_SUCCESS)
-            status_text.config(text="System Normal", fg=COLOR_SUCCESS)
+        request_pause_resume()
 
     pause_btn = tk.Button(
         controls_row, text=f"{SYM_PAUSE} PAUSE", font=(FONT_FAMILY, 8, "bold"),
@@ -422,7 +448,43 @@ def create_dashboard_window():
         cursor="hand2", relief="flat"
     )
     reset_btn.config(command=trigger_reset)
-    reset_btn.pack(side="left", padx=(0, 16))
+    reset_btn.pack(side="left", padx=(0, 10))
+
+    def refresh_simulation_status():
+        running = bool(global_config.get("is_running", False))
+        starting = bool(global_config.get("start_requested", False))
+        paused = bool(global_config.get("is_paused", False))
+        if running:
+            start_stop_btn.config(text=f"{SYM_STOP} STOP", bg=COLOR_DANGER)
+            pause_btn.config(state="normal")
+            if paused:
+                pause_btn.config(text=f"{SYM_PLAY} RESUME", bg=COLOR_SUCCESS)
+                dot_lbl.config(fg=COLOR_WARNING)
+                status_text.config(text="Paused", fg=COLOR_WARNING)
+            else:
+                pause_btn.config(text=f"{SYM_PAUSE} PAUSE", bg=COLOR_ACCENT)
+                dot_lbl.config(fg=COLOR_SUCCESS)
+                status_text.config(text="Running", fg=COLOR_SUCCESS)
+        else:
+            start_stop_btn.config(text=f"{SYM_PLAY} START", bg=COLOR_SUCCESS)
+            pause_btn.config(
+                state="disabled", text=f"{SYM_PAUSE} PAUSE", bg=COLOR_CARD_BORDER
+            )
+            dot_lbl.config(fg=COLOR_TEXT_SECONDARY)
+            if starting:
+                status_text.config(text="Starting fresh run…", fg=COLOR_WARNING)
+            elif global_config.get("run_has_started", False):
+                status_text.config(
+                    text="Stopped — export or START new run",
+                    fg=COLOR_TEXT_SECONDARY,
+                )
+            else:
+                status_text.config(
+                    text="Idle — press START", fg=COLOR_TEXT_SECONDARY
+                )
+        root.after(100, refresh_simulation_status)
+
+    root.after(100, refresh_simulation_status)
 
     green_group = tk.Frame(controls_row, bg=COLOR_CARD)
     green_group.pack(side="left", padx=(0, 16))

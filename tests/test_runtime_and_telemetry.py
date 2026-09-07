@@ -1,4 +1,5 @@
 import ast
+import inspect
 import json
 from pathlib import Path
 import time
@@ -125,6 +126,116 @@ def test_seed_config_accepts_integer_and_blank(monkeypatch):
     assert control_panel.global_config["random_seed"] == 12345
     assert control_panel.set_random_seed("   ") is None
     assert control_panel.global_config["random_seed"] is None
+
+
+def test_sim_launches_stopped():
+    assert control_panel.global_config["is_running"] is False
+    assert control_panel.global_config["start_requested"] is False
+    source = inspect.getsource(main.main)
+    assert "if is_running and not is_paused and not run_just_reset:" in source
+    assert 'if not control_panel.global_config.get("is_running"' not in source
+
+
+def test_start_performs_full_reset(tmp_path, monkeypatch):
+    telemetry_log = tmp_path / "telemetry_log.jsonl"
+    turn_log = tmp_path / "agent_turn_log.jsonl"
+    telemetry_log.write_text("old telemetry\n", encoding="utf-8")
+    turn_log.write_text("old turn\n", encoding="utf-8")
+    monkeypatch.setattr(main, "TELEMETRY_LOG_PATH", telemetry_log)
+    monkeypatch.setattr(main, "AGENT_TURN_LOG_PATH", turn_log)
+    seed_applications = []
+    monkeypatch.setattr(
+        main,
+        "reset_traffic_generation",
+        lambda: seed_applications.append(
+            control_panel.global_config.get("random_seed")
+        ),
+    )
+
+    class FakeSignals:
+        frame_number = 99
+
+        def reset_all_state(self):
+            self.frame_number = 0
+
+    class FakeTelemetry:
+        reset_count = 0
+
+        def reset_session(self):
+            self.reset_count += 1
+
+    signals = FakeSignals()
+    telemetry = FakeTelemetry()
+    vehicles = [object(), object()]
+    for key in main.network_throughput:
+        main.network_throughput[key] = 99
+    monkeypatch.setitem(control_panel.global_config, "random_seed", 4242)
+
+    frame = main.perform_full_reset(vehicles, signals, telemetry)
+
+    assert frame == 0
+    assert vehicles == []
+    assert signals.frame_number == 0
+    assert telemetry.reset_count == 1
+    assert seed_applications == [4242]
+    assert not telemetry_log.exists()
+    assert not turn_log.exists()
+    assert set(main.network_throughput.values()) == {0}
+
+
+def test_stop_preserves_logs(tmp_path, monkeypatch):
+    telemetry_log = tmp_path / "telemetry_log.jsonl"
+    turn_log = tmp_path / "agent_turn_log.jsonl"
+    telemetry_log.write_text("completed telemetry\n", encoding="utf-8")
+    turn_log.write_text("completed turns\n", encoding="utf-8")
+    monkeypatch.setitem(control_panel.global_config, "is_running", True)
+    monkeypatch.setitem(control_panel.global_config, "start_requested", False)
+
+    result = control_panel.request_start_stop()
+
+    assert result == "STOPPED"
+    assert control_panel.global_config["is_running"] is False
+    assert telemetry_log.read_text(encoding="utf-8") == "completed telemetry\n"
+    assert turn_log.read_text(encoding="utf-8") == "completed turns\n"
+
+
+def test_start_after_stop_is_fresh(tmp_path, monkeypatch):
+    telemetry_log = tmp_path / "telemetry_log.jsonl"
+    turn_log = tmp_path / "agent_turn_log.jsonl"
+    telemetry_log.write_text("run A\n", encoding="utf-8")
+    turn_log.write_text("run A\n", encoding="utf-8")
+    monkeypatch.setattr(main, "TELEMETRY_LOG_PATH", telemetry_log)
+    monkeypatch.setattr(main, "AGENT_TURN_LOG_PATH", turn_log)
+    monkeypatch.setattr(main, "reset_traffic_generation", lambda: None)
+
+    class FakeSignals:
+        def reset_all_state(self):
+            pass
+
+    monkeypatch.setitem(control_panel.global_config, "is_running", True)
+    assert control_panel.request_start_stop() == "STOPPED"
+    assert telemetry_log.exists() and turn_log.exists()
+    assert control_panel.request_start_stop() == "START_REQUESTED"
+
+    frame = main.perform_full_reset([object()], FakeSignals())
+
+    assert frame == 0
+    assert not telemetry_log.exists()
+    assert not turn_log.exists()
+
+
+def test_pause_still_independent(monkeypatch):
+    monkeypatch.setitem(control_panel.global_config, "is_running", True)
+    monkeypatch.setitem(control_panel.global_config, "is_paused", False)
+
+    assert control_panel.request_pause_resume() is True
+    assert control_panel.global_config["is_running"] is True
+    assert control_panel.request_pause_resume() is False
+    assert control_panel.global_config["is_running"] is True
+
+    assert control_panel.request_start_stop() == "STOPPED"
+    assert control_panel.request_pause_resume() is False
+    assert control_panel.global_config["is_running"] is False
 
 
 def test_truck_passenger_count():

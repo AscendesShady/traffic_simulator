@@ -258,6 +258,7 @@ def test_control_panel_writes_atomic_agent_control_and_discovers_models(
         "armed": True,
         "model": "local-model:latest",
         "tick_seconds": 9,
+        "simulation_running": False,
     }
     assert list(tmp_path.iterdir()) == [destination]
 
@@ -1200,7 +1201,25 @@ def test_read_ai_control_is_fail_closed_and_clamps_tick(tmp_path):
         "armed": True,
         "model": "m",
         "tick_seconds": 15,
+        "simulation_running": False,
     }
+
+
+def test_agent_turn_resets_on_frame_drop():
+    previous_decisions = [{"turn": 66}, {"turn": 67}]
+
+    turn, recent, last_frame, reset_detected = agent._track_run_boundary(
+        67,
+        previous_decisions,
+        11_300,
+        {"frame_number": 0, "simulation_running": True},
+    )
+    turn += 1
+
+    assert reset_detected is True
+    assert turn == 1
+    assert recent == []
+    assert last_frame == 0
 
 
 def test_paused_or_old_telemetry_routes_to_stale_hold(monkeypatch):
@@ -1304,14 +1323,12 @@ def test_reset_clears_session_logs(tmp_path, monkeypatch):
     assert main._last_telemetry_log_frame is None
 
     source = Path(main.__file__).read_text(encoding="utf-8")
+    reset_helper = source.split("def perform_full_reset", 1)[1].split(
+        "def begin_post_discharge_metering", 1
+    )[0]
+    assert "reset_session_logs()" in reset_helper
     main_body = source.split("def main():", 1)[1]
-    assert main_body.index("reset_session_logs()") < main_body.index(
-        "pygame.init()"
-    )
-    reset_block = main_body.split(
-        'if control_panel.global_config["reset_triggered"]:', 1
-    )[1].split("sim_speed =", 1)[0]
-    assert "reset_session_logs()" in reset_block
+    assert main_body.count("perform_full_reset(vehicles, signals, telemetry)") == 2
 
 
 def test_reset_isolates_runs(tmp_path, monkeypatch):

@@ -442,6 +442,18 @@ def reset_traffic_generation():
     return apply_configured_random_seed()
 
 
+def perform_full_reset(vehicles, signals, telemetry=None):
+    """Restore all per-run simulation state and return the frame-zero value."""
+    vehicles.clear()
+    reset_traffic_generation()
+    signals.reset_all_state()
+    if telemetry is not None:
+        telemetry.reset_session()
+    reset_session_logs()
+    network_throughput.update({key: 0 for key in network_throughput})
+    return 0
+
+
 def begin_post_discharge_metering():
     """Start a bounded low-rate admission period after recovery."""
     global post_discharge_meter_frames_remaining
@@ -735,8 +747,6 @@ def main():
     # Seeding makes traffic generation reproducible, not LLM inference. The
     # valid benchmark is the same seed with one ARMED and one DISARMED run;
     # same-seed ARMED runs may diverge because model decisions can differ.
-    apply_configured_random_seed()
-    reset_session_logs()
     pygame.init()
     pygame.font.init()
     font = pygame.font.SysFont("Consolas", 13, bold=True)
@@ -822,10 +832,7 @@ def main():
         now = time.monotonic()
         elapsed = min(max(0.0, now - last_wall_time), max_catchup_seconds)
         last_wall_time = now
-
-        if not control_panel.global_config.get("is_running", True):
-            pygame.quit()
-            sys.exit()
+        run_just_reset = False
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -835,21 +842,31 @@ def main():
                 except Exception: pass
                 sys.exit()
 
-        if control_panel.global_config["reset_triggered"]:
-            vehicles.clear()
-            reset_traffic_generation()
-            signals.reset_discharge()
+        if control_panel.global_config.get("start_requested", False):
+            master_frame_count = perform_full_reset(vehicles, signals, telemetry)
+            time_accumulator = 0.0
+            discharge_was_active = False
+            control_panel.global_config["is_paused"] = False
+            control_panel.global_config["reset_triggered"] = False
+            control_panel.global_config["is_running"] = True
+            control_panel.global_config["run_has_started"] = True
+            control_panel.global_config["start_requested"] = False
+            control_panel.write_ai_control()
+            run_just_reset = True
+        elif control_panel.global_config["reset_triggered"]:
+            master_frame_count = perform_full_reset(vehicles, signals, telemetry)
+            time_accumulator = 0.0
+            discharge_was_active = False
             # Export before RESET to preserve the previous run: RESET clears
             # both session logs so the next benchmark run is isolated.
-            reset_session_logs()
-            network_throughput.update({key: 0 for key in network_throughput})
-            master_frame_count = 0
             control_panel.global_config["reset_triggered"] = False
+            run_just_reset = True
 
         sim_speed = control_panel.global_config.get("sim_speed", 1.0)
+        is_running = control_panel.global_config.get("is_running", False)
         is_paused = control_panel.global_config.get("is_paused", False)
 
-        if not is_paused:
+        if is_running and not is_paused and not run_just_reset:
             time_accumulator += elapsed * sim_speed
 
             # FIXED TIMESTEP LOOP: Physics, Signals, Spawners run exactly at 60Hz intervals
@@ -930,7 +947,7 @@ def main():
             signal_data=active_signal_data, 
             dbl_states=active_dbl_data, 
             font=font,
-            is_paused=is_paused
+            is_paused=is_paused or not is_running
         )
 
         for v in vehicles:

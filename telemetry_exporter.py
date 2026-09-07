@@ -25,6 +25,12 @@ class TelemetryExporter:
         self._trend_window_seconds = 30.0
         self._last_total_served = 0
 
+    def reset_session(self):
+        """Clear per-run rate history and force the next export at frame zero."""
+        self.frame_counter = self.export_interval - 1
+        self._throughput_samples.clear()
+        self._last_total_served = 0
+
     def compute_queue_counts(self, vehicles):
         queues = {"EB": 0, "WB": 0, "A_NB": 0, "A_SB": 0, "B_NB": 0, "B_SB": 0}
         for vehicle in vehicles:
@@ -225,6 +231,9 @@ class TelemetryExporter:
             "timestamp": round(time.time(), 3),
             "frame_number": frame_number,
             "simulation_time_seconds": round(simulation_seconds, 3),
+            "simulation_running": bool(
+                control_panel.global_config.get("is_running", False)
+            ),
             "simulation_paused": bool(control_panel.global_config.get("is_paused", False)),
             "simulation_speed": float(control_panel.global_config.get("sim_speed", 1.0)),
             "signal_state": {

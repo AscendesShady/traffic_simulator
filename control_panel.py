@@ -318,8 +318,10 @@ def create_dashboard_window():
     route_flag_buttons.clear()
     root = tk.Tk()
     root.title("Traffic & Transit Control Dashboard")
-    # Increased height slightly to accommodate the new AI control section
-    root.geometry("820x1020")
+    # Sized to the layout's natural width so no card is clipped. Kept at or
+    # below 890 px: main.calculate_startup_window_layout only tiles the canvas
+    # beside this window while the remaining desktop width stays >= 1000 px.
+    root.geometry("880x1030")
     # Use normal desktop stacking. Forced topmost made the Pygame canvas slide
     # underneath this window and also made focus/drag interaction feel sticky.
     root.attributes("-topmost", False)
@@ -378,7 +380,7 @@ def create_dashboard_window():
 
     # 1. HEADER & STATUS
     header_frame = tk.Frame(root, bg=COLOR_BG)
-    header_frame.pack(fill="x", padx=20, pady=(16, 8))
+    header_frame.pack(fill="x", padx=20, pady=(14, 6))
 
     title_label = tk.Label(
         header_frame, text="NETWORK CONTROL DASHBOARD",
@@ -403,16 +405,16 @@ def create_dashboard_window():
         root, bg=COLOR_CARD, highlightbackground=COLOR_CARD_BORDER,
         highlightthickness=1, bd=0
     )
-    global_card.pack(fill="x", padx=20, pady=4, ipady=4)
+    global_card.pack(fill="x", padx=20, pady=5, ipady=4)
 
     g_title = tk.Label(
         global_card, text="Global Simulation Controls",
         font=(FONT_FAMILY, 11, "bold"), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY
     )
-    g_title.pack(anchor="w", padx=16, pady=(8, 6))
+    g_title.pack(anchor="w", padx=16, pady=(7, 5))
 
     controls_row = tk.Frame(global_card, bg=COLOR_CARD)
-    controls_row.pack(fill="x", padx=16, pady=(0, 6))
+    controls_row.pack(fill="x", padx=16, pady=(0, 8))
 
     def toggle_start_stop():
         request_start_stop()
@@ -486,8 +488,14 @@ def create_dashboard_window():
 
     root.after(100, refresh_simulation_status)
 
-    green_group = tk.Frame(controls_row, bg=COLOR_CARD)
-    green_group.pack(side="left", padx=(0, 16))
+    # Run parameters sit on their own row. Sharing one row with the action
+    # buttons required 806 px inside a 748 px card, which clipped the seed
+    # control off the right edge.
+    params_row = tk.Frame(global_card, bg=COLOR_CARD)
+    params_row.pack(fill="x", padx=16, pady=(0, 6))
+
+    green_group = tk.Frame(params_row, bg=COLOR_CARD)
+    green_group.pack(side="left", padx=(0, 28))
 
     green_title_lbl = tk.Label(
         green_group, text="Green Time:", font=(FONT_FAMILY, 8, "bold"),
@@ -512,8 +520,8 @@ def create_dashboard_window():
     )
     green_slider.pack(side="left", padx=2)
 
-    speed_group = tk.Frame(controls_row, bg=COLOR_CARD)
-    speed_group.pack(side="left")
+    speed_group = tk.Frame(params_row, bg=COLOR_CARD)
+    speed_group.pack(side="left", padx=(0, 28))
 
     speed_title_lbl = tk.Label(
         speed_group, text="Speed:", font=(FONT_FAMILY, 8, "bold"),
@@ -538,8 +546,8 @@ def create_dashboard_window():
     )
     speed_slider.pack(side="left", padx=2)
 
-    seed_group = tk.Frame(controls_row, bg=COLOR_CARD)
-    seed_group.pack(side="left", padx=(12, 0))
+    seed_group = tk.Frame(params_row, bg=COLOR_CARD)
+    seed_group.pack(side="left")
 
     tk.Label(
         seed_group, text="Seed:", font=(FONT_FAMILY, 8, "bold"),
@@ -587,10 +595,10 @@ def create_dashboard_window():
         root, bg=COLOR_CARD, highlightbackground=COLOR_DANGER,
         highlightthickness=1, bd=0
     )
-    recovery_card.pack(fill="x", padx=20, pady=3)
+    recovery_card.pack(fill="x", padx=20, pady=5)
 
     recovery_controls = tk.Frame(recovery_card, bg=COLOR_CARD)
-    recovery_controls.pack(fill="x", padx=16, pady=(2, 2))
+    recovery_controls.pack(fill="x", padx=16, pady=(3, 3))
 
     tk.Label(
         recovery_controls, text="GRIDLOCK DISCHARGE:",
@@ -715,17 +723,17 @@ def create_dashboard_window():
         root, bg=COLOR_CARD, highlightbackground=COLOR_WARNING,
         highlightthickness=1, bd=0
     )
-    ai_card.pack(fill="x", padx=20, pady=4, ipady=4)
+    ai_card.pack(fill="x", padx=20, pady=5, ipady=4)
 
     ai_title = tk.Label(
         ai_card, text="AI / LLM CONTROL",
         font=(FONT_FAMILY, 11, "bold"), bg=COLOR_CARD, fg=COLOR_WARNING
     )
-    ai_title.pack(anchor="w", padx=16, pady=(8, 6))
+    ai_title.pack(anchor="w", padx=16, pady=(7, 5))
 
     # First row: Controls
     ai_row1 = tk.Frame(ai_card, bg=COLOR_CARD)
-    ai_row1.pack(fill="x", padx=16, pady=(0, 6))
+    ai_row1.pack(fill="x", padx=16, pady=(0, 5))
 
     llm_lbl = tk.Label(ai_row1, text="Local", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     llm_lbl.pack(side="left", padx=(0, 8))
@@ -819,7 +827,7 @@ def create_dashboard_window():
 
     # Second row: Selected Model Label
     ai_row2 = tk.Frame(ai_card, bg=COLOR_CARD)
-    ai_row2.pack(fill="x", padx=16, pady=(0, 2))
+    ai_row2.pack(fill="x", padx=16, pady=(0, 6))
 
     sel_lbl = tk.Label(ai_row2, text="Selected: ", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     sel_lbl.pack(side="left")
@@ -862,17 +870,15 @@ def create_dashboard_window():
         fg=COLOR_TEXT_PRIMARY,
     ).pack(side="right")
 
-    # Third row: Control Scope Label
-    ai_row3 = tk.Frame(ai_card, bg=COLOR_CARD)
-    ai_row3.pack(fill="x", padx=16, pady=(0, 6))
-
-    ctrl_lbl = tk.Label(ai_row3, text="Control: ", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
+    # Control scope shares the "Selected" row. It is static text, and the row
+    # it used to own cost the vertical space the run-parameter row now needs.
+    ctrl_lbl = tk.Label(ai_row2, text="     Control: ", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     ctrl_lbl.pack(side="left")
-    
-    ctrl_val_lbl = tk.Label(ai_row3, text="TSP + DBL", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_ACCENT)
+
+    ctrl_val_lbl = tk.Label(ai_row2, text="TSP + DBL", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_ACCENT)
     ctrl_val_lbl.pack(side="left")
-    
-    ctrl_rest_lbl = tk.Label(ai_row3, text=" for all bus routes", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
+
+    ctrl_rest_lbl = tk.Label(ai_row2, text=" for all bus routes", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     ctrl_rest_lbl.pack(side="left")
 
     def refresh_llm_status():
@@ -914,10 +920,10 @@ def create_dashboard_window():
         root, bg=COLOR_CARD, highlightbackground=COLOR_CARD_BORDER,
         highlightthickness=1, bd=0
     )
-    transit_card.pack(fill="x", padx=20, pady=4, ipady=6)
+    transit_card.pack(fill="x", padx=20, pady=5, ipady=4)
 
     t_header = tk.Frame(transit_card, bg=COLOR_CARD)
-    t_header.pack(fill="x", padx=16, pady=(8, 6))
+    t_header.pack(fill="x", padx=16, pady=(7, 5))
 
     t_title = tk.Label(
         t_header, text="Bus Routes Manager (DBL / TSP Control)",
@@ -1073,13 +1079,13 @@ def create_dashboard_window():
 
     # 4. PER-APPROACH PARAMETERS SECTION
     approaches_container = tk.Frame(root, bg=COLOR_BG)
-    approaches_container.pack(fill="both", expand=True, padx=20, pady=4)
+    approaches_container.pack(fill="both", expand=True, padx=20, pady=5)
 
     sec_title = tk.Label(
         approaches_container, text="Per-Approach General Traffic Parameters",
         font=(FONT_FAMILY, 11, "bold"), bg=COLOR_BG, fg=COLOR_TEXT_PRIMARY
     )
-    sec_title.pack(anchor="w", pady=(2, 4))
+    sec_title.pack(anchor="w", pady=(2, 3))
 
     GEN_COL_WIDTHS = [150, 150, 140, 140, 140]
 

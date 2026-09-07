@@ -108,8 +108,8 @@ def calculate_startup_window_layout(screen_width, screen_height):
     taskbar_reserve = 40
     usable_bottom = screen_height - taskbar_reserve
     usable_height = usable_bottom - margin
-    control_width = min(820, screen_width - 2 * margin)
-    control_height = min(1020, usable_height)
+    control_width = min(880, screen_width - 2 * margin)
+    control_height = min(1030, usable_height)
     right_x = margin + control_width + gap
     right_width = screen_width - right_x - margin
     telemetry_y = canvas_top + canvas.HEIGHT + gap

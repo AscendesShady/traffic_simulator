@@ -8,7 +8,7 @@ import time
 
 import canvas_gemini as canvas
 import control_panel
-from vehicle import Bus, DBL_LANE_INDEX
+from vehicle import Bus, DBL_LANE_INDEX, dbl_lane_is_obstructed
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -152,6 +152,11 @@ class TelemetryExporter:
             for vehicle in vehicles
             if isinstance(vehicle, Bus)
         ]
+        bus_objects = {
+            vehicle.bus_id: vehicle
+            for vehicle in vehicles
+            if isinstance(vehicle, Bus)
+        }
         routes_block = {}
         for route_id, route_config in control_panel.bus_routes_config.items():
             route_buses = [bus for bus in buses if bus["route_id"] == route_id]
@@ -161,6 +166,20 @@ class TelemetryExporter:
                     route_buses,
                     key=lambda bus: bus["eta_to_stop_bar_sec_freeflow"],
                 )
+            # Whether the nearest approaching bus could actually complete a
+            # DBL merge right now. With no approaching bus there is nothing to
+            # judge, so the route reports False rather than a guess.
+            nearest_object = (
+                bus_objects.get(nearest["bus_id"]) if nearest else None
+            )
+            dbl_lane_obstructed = bool(
+                nearest is not None
+                and nearest["route_leg"] is not None
+                and nearest_object is not None
+                and dbl_lane_is_obstructed(
+                    nearest_object, vehicles, canvas.H_Y, canvas.LANE
+                )
+            )
             routes_block[route_id] = {
                 "route_name": route_config.get("name", route_id),
                 "active": bool(route_config.get("active", False)),
@@ -183,6 +202,10 @@ class TelemetryExporter:
                 "nearest_bus_priority_pending": (
                     bool(nearest["priority_transitioning"]) if nearest else False
                 ),
+                "nearest_bus_in_dbl_lane": (
+                    bool(nearest["in_dbl_lane"]) if nearest else False
+                ),
+                "dbl_lane_obstructed": dbl_lane_obstructed,
             }
         approaching = [
             bus

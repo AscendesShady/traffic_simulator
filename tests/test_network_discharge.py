@@ -6,6 +6,7 @@ from canvas_gemini import HEIGHT, H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
 from signal_controller import (
     DISCHARGE_ACTIVE,
     DISCHARGE_ALL_RED,
+    DISCHARGE_DUE_LEG_GRACE_FRAMES,
     DISCHARGE_INACTIVE,
     DISCHARGE_RECOVERY_FAILED,
     DISCHARGE_STOPPING_ALL_RED,
@@ -316,7 +317,15 @@ def test_auto_reranks_when_latched_candidate_unready():
 
     alternative = vertical_vehicle(700, "NB")
     vehicles.append(alternative)
-    controller.update(vehicles)
+    # The clockwise rotation holds its due leg for a bounded grace period, so
+    # a persistently blocked leg is handed over to the next servable leg
+    # rather than stalling recovery.
+    advance_until(
+        controller,
+        vehicles,
+        lambda: controller.discharge_state == DISCHARGE_ACTIVE,
+        limit=DISCHARGE_DUE_LEG_GRACE_FRAMES + 60,
+    )
 
     assert controller.discharge_state == DISCHARGE_ACTIVE
     assert controller.discharge_plan_name == "Node B Northbound"

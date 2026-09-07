@@ -5,6 +5,55 @@ import pygame
 CAR_PASSENGERS = 4
 TRUCK_PASSENGERS = 1
 DBL_LANE_INDEX = 2
+# How long a bus may hold for a blocked DBL merge before giving the merge up
+# for the current leg. 300 frames is about five seconds at 60 Hz.
+DBL_MERGE_ABANDON_FRAMES = 300
+# Speed at or below which a vehicle counts as stopped for blocking checks.
+SLOW_VEHICLE_SPEED = 0.5
+
+
+def corridor_blockers(mover, desired_y, all_vehicles):
+    """Same-direction vehicles occupying `mover`'s lane-change corridor.
+
+    Shared by the live merge check and by telemetry, so the obstruction the
+    model is told about is the same one that actually stops a merge.
+    """
+    corridor_min = min(mover.y, desired_y) - mover.width / 2.0
+    corridor_max = max(mover.y, desired_y) + mover.width / 2.0
+    blockers = []
+    for other in all_vehicles or []:
+        if other is mover or other.direction != mover.direction:
+            continue
+        other_min = other.y - other.width / 2.0
+        other_max = other.y + other.width / 2.0
+        if not (other_min < corridor_max and other_max > corridor_min):
+            continue
+        if abs(other.x - mover.x) < (mover.length + other.length) / 2.0 + 15:
+            blockers.append(other)
+    return blockers
+
+
+def dbl_lane_center_y(direction, h_y, lane_w=22):
+    """Centre line of the DBL lane for an EB or WB approach."""
+    offset = (DBL_LANE_INDEX + 0.5) * lane_w
+    return h_y - offset if direction == "EB" else h_y + offset
+
+
+def dbl_lane_is_obstructed(bus, all_vehicles, h_y, lane_w=22):
+    """Whether `bus` currently could not complete a merge into the DBL lane.
+
+    Only stopped or crawling traffic counts: a vehicle moving through the
+    corridor at speed clears on its own and should not be reported to the
+    model as an obstruction. A bus already in the DBL lane is never
+    obstructed, since it no longer needs the merge.
+    """
+    if getattr(bus, "lane_index", None) == DBL_LANE_INDEX:
+        return False
+    desired_y = dbl_lane_center_y(bus.direction, h_y, lane_w)
+    return any(
+        other.speed <= SLOW_VEHICLE_SPEED
+        for other in corridor_blockers(bus, desired_y, all_vehicles)
+    )
 
 
 class Vehicle:
@@ -317,6 +366,10 @@ class Bus(Vehicle):
             route_info.get("waypoints", {}).keys(),
             reverse=(direction == "WB"),
         )
+        # Per-leg DBL merge tracking. See the invariant in update().
+        self.dbl_merge_hold_frames = 0
+        self.dbl_merge_abandoned_for_leg = False
+        self._dbl_merge_leg_key = None
 
     def get_active_route_leg(self, int_x_list):
         """Return canonical metadata for the next unfinished route leg."""
@@ -344,17 +397,7 @@ class Bus(Vehicle):
         return None
 
     def is_target_lane_clear(self, desired_y, all_vehicles):
-        corridor_min = min(self.y, desired_y) - self.width / 2.0
-        corridor_max = max(self.y, desired_y) + self.width / 2.0
-        for other in all_vehicles:
-            if other is self: continue
-            if other.direction == self.direction:
-                other_min = other.y - other.width / 2.0
-                other_max = other.y + other.width / 2.0
-                lateral_overlap = other_min < corridor_max and other_max > corridor_min
-                if lateral_overlap and abs(other.x - self.x) < (self.length + other.length) / 2.0 + 15:
-                    return False
-        return True
+        return not corridor_blockers(self, desired_y, all_vehicles)
 
     def update(self, signal_data, int_x_list, h_y, road_w=132, stop_offset=10, lane_w=22, all_vehicles=None, signal_controller=None):
         if all_vehicles is None: all_vehicles = []
@@ -363,6 +406,14 @@ class Bus(Vehicle):
         self.target_turn = leg["movement"] if leg else "STRAIGHT"
         required_lane = leg["entry_lane"] if leg else self.lane_index
         self.must_hold_for_lane = False
+
+        # DBL merge state is tracked per leg: a lane blocked at one node must
+        # not disable DBL for the rest of the route, where it may be clear.
+        leg_key = (leg["node_x"], leg["route_leg_index"]) if leg else None
+        if leg_key != self._dbl_merge_leg_key:
+            self._dbl_merge_leg_key = leg_key
+            self.dbl_merge_hold_frames = 0
+            self.dbl_merge_abandoned_for_leg = False
 
         dist_to_intersection = (
             abs(self.x - target_node_x)
@@ -378,24 +429,34 @@ class Bus(Vehicle):
             self.target_turn == "LEFT" and dist_to_intersection < 250.0
         )
 
+        # INVARIANT: DBL must never leave a bus worse off than no DBL at all.
+        # A merge that stays blocked past DBL_MERGE_ABANDON_FRAMES is given up
+        # for this leg, and the bus runs in its configured lane exactly as an
+        # unequipped bus would, rather than holding upstream indefinitely.
+        if not dbl_enabled_for_leg:
+            self.dbl_merge_hold_frames = 0
+            self.dbl_merge_abandoned_for_leg = False
+        dbl_merge_due = dbl_enabled_for_leg and not self.dbl_merge_abandoned_for_leg
+
         # A DBL-enabled bus occupies the continuous outer lane as early as
         # traffic permits. Close to a left turn, its configured turn lane wins
         # if that lane ever differs from the DBL lane.
         if turn_lane_change_due:
             target_lane = required_lane
-        elif dbl_enabled_for_leg:
+        elif dbl_merge_due:
             target_lane = DBL_LANE_INDEX
         else:
             target_lane = required_lane
         lane_change_due = (
-            dbl_enabled_for_leg or turn_lane_change_due
+            dbl_merge_due or turn_lane_change_due
         ) and self.lane_index != target_lane
         if lane_change_due:
             lane_offset = (target_lane + 0.5) * lane_w
             desired_y = (
                 h_y - lane_offset if self.direction == "EB" else h_y + lane_offset
             )
-            if self.is_target_lane_clear(desired_y, all_vehicles):
+            lane_clear = self.is_target_lane_clear(desired_y, all_vehicles)
+            if lane_clear:
                 if abs(self.y - desired_y) > 1.0:
                     self.y += 0.5 if self.y < desired_y else -0.5
                 else:
@@ -403,6 +464,35 @@ class Bus(Vehicle):
                     self.lane_index = target_lane
             if self.lane_index != target_lane:
                 self.must_hold_for_lane = True
+
+            # Only a DBL-driven merge may be abandoned. A LEFT turn genuinely
+            # needs its turn lane, and a leg whose configured lane already is
+            # the DBL lane would block identically with DBL switched off, so
+            # neither case is one that DBL made worse.
+            abandonable = (
+                dbl_merge_due
+                and not turn_lane_change_due
+                and required_lane != DBL_LANE_INDEX
+            )
+            if abandonable and not lane_clear:
+                self.dbl_merge_hold_frames += 1
+                if self.dbl_merge_hold_frames > DBL_MERGE_ABANDON_FRAMES:
+                    self.dbl_merge_abandoned_for_leg = True
+                    # Settle fully back into the configured lane so the bus
+                    # stops holding and the priority feasibility gate, which
+                    # compares lane_index against the request entry lane, can
+                    # still grant TSP to a bus that never got its DBL merge.
+                    self.must_hold_for_lane = False
+                    normal_offset = (required_lane + 0.5) * lane_w
+                    self.y = (
+                        h_y - normal_offset
+                        if self.direction == "EB"
+                        else h_y + normal_offset
+                    )
+                    self.lane_index = required_lane
+
+        if dbl_enabled_for_leg and self.lane_index == DBL_LANE_INDEX:
+            self.dbl_merge_hold_frames = 0
 
         super().update(signal_data, int_x_list, h_y, road_w, stop_offset, lane_w, all_vehicles, signal_controller)
 

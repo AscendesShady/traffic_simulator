@@ -121,6 +121,12 @@ minimap THIS turn:
 - Only set tsp or dbl true for a route that has an approaching bus this turn
   AND where priority improves passenger throughput.
 
+DBL only helps if the bus can actually enter the dynamic bus lane. If a route
+shows dbl_lane_obstructed=true, do NOT enable dbl for that route: the bus
+cannot merge and enabling it wastes the lane. Prefer tsp, which needs no lane
+change, for a bus whose dbl lane is blocked. A route showing dbl=true with
+nearest_bus_in_dbl_lane=false is evidence the dbl you enabled is not working.
+
 Example: if only route 1 has an approaching bus, the correct output is
 tsp=[true,false,false,false,false,false] and
 dbl=[false,false,false,false,false,false]. Every other position is false
@@ -409,6 +415,10 @@ def read_minimap(state: AgentState) -> dict:
                 f"active={bool(route.get('active', False))} "
                 f"tsp={bool(route.get('tsp_enabled', False))} "
                 f"dbl={bool(route.get('dbl_enabled', False))} "
+                f"dbl_lane_obstructed="
+                f"{bool(route.get('dbl_lane_obstructed', False))} "
+                f"nearest_bus_in_dbl_lane="
+                f"{bool(route.get('nearest_bus_in_dbl_lane', False))} "
                 f"approaching_buses={len(candidates)} "
                 f"nearest_eta_sec={nearest.get('eta_to_stop_bar_sec_freeflow')} "
                 f"target_node={route_leg.get('node_x')} "
@@ -421,6 +431,10 @@ def read_minimap(state: AgentState) -> dict:
                 f"active={bool(route.get('active', False))} "
                 f"tsp={bool(route.get('tsp_enabled', False))} "
                 f"dbl={bool(route.get('dbl_enabled', False))} "
+                f"dbl_lane_obstructed="
+                f"{bool(route.get('dbl_lane_obstructed', False))} "
+                f"nearest_bus_in_dbl_lane="
+                f"{bool(route.get('nearest_bus_in_dbl_lane', False))} "
                 "approaching_buses=0 none approaching"
             )
 

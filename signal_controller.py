@@ -61,6 +61,26 @@ DISCHARGE_PLAN_STAGES = {
     "Node B Southbound": (DischargeStage("Node B southbound", ((700, "SB"),)),),
 }
 
+# Auto recovery walks each node clockwise (N -> E -> S -> W), with the two
+# corridors acting as the shared east and west legs. Legs with nothing waiting
+# are skipped, so the rotation never spends a green on an empty approach.
+DISCHARGE_CLOCKWISE_ORDER = (
+    "Node A Northbound",
+    "Eastbound Corridor",
+    "Node A Southbound",
+    "Westbound Corridor",
+    "Node B Northbound",
+    "Node B Southbound",
+)
+assert set(DISCHARGE_CLOCKWISE_ORDER) == set(DISCHARGE_PLAN_STAGES)
+# Upper bound on how long the rotation waits for the leg whose turn it is
+# before it may skip ahead. A leg is usually blocked only while the previous
+# stage's vehicles clear the box, so a short grace keeps the order exact.
+# The effective grace is also capped against discharge_stall_time so the
+# hold can never outlive the watchdog and turn a transient block into a
+# spurious RECOVERY_FAILED.
+DISCHARGE_DUE_LEG_GRACE_FRAMES = 120
+
 
 @dataclass
 class PriorityRequest:
@@ -185,6 +205,9 @@ class SignalController:
             plan_name: -self.discharge_max_green
             for plan_name in DISCHARGE_PLAN_STAGES
         }
+        self._discharge_cycle_index = 0
+        self._discharge_due_wait_frames = 0
+        self._discharge_due_plan: str | None = None
         self.global_config["discharge_start_requested"] = False
         self.global_config["discharge_stop_requested"] = False
         self._publish_discharge_status()
@@ -418,16 +441,6 @@ class SignalController:
                     result[node_x].add(vehicle.direction)
         return result
 
-    @staticmethod
-    def _candidate_drains_blocker(candidate, occupants):
-        stage = DISCHARGE_PLAN_STAGES[candidate["plan"]][
-            candidate["stage_index"]
-        ]
-        return any(
-            approach in occupants.get(node_x, set())
-            for node_x, approach in stage.greens
-        )
-
     def _dependency_bonus(self, plan_name):
         bonus = 0
         left_exit = {"EB": "NB", "WB": "SB", "NB": "WB", "SB": "EB"}
@@ -486,6 +499,71 @@ class SignalController:
             )
         )
         return ranked
+
+    def _next_clockwise_candidate(self, vehicles):
+        """Return the next servable plan in clockwise order, or None.
+
+        The scan starts at the current cycle position so recovery works
+        around the network one leg at a time. Legs with no waiting vehicles
+        are skipped entirely. Among the legs that do have vehicles the first
+        ready one wins, so a leg momentarily blocked by cross traffic cannot
+        stall the whole rotation; if none is ready the due leg is returned so
+        the caller waits on it under the existing stall timer.
+        """
+        order_length = len(DISCHARGE_CLOCKWISE_ORDER)
+        servable = []
+        for offset in range(order_length):
+            index = (self._discharge_cycle_index + offset) % order_length
+            plan_name = DISCHARGE_CLOCKWISE_ORDER[index]
+            stage_index = self._first_relevant_stage_index(plan_name, vehicles)
+            if stage_index is None:
+                continue
+            stage = DISCHARGE_PLAN_STAGES[plan_name][stage_index]
+            ready, reason = self._stage_readiness(stage, vehicles)
+            servable.append(
+                {
+                    "plan": plan_name,
+                    "stage_index": stage_index,
+                    "ready": ready,
+                    "reason": reason,
+                    "cycle_index": index,
+                }
+            )
+        if not servable:
+            self._discharge_due_plan = None
+            self._discharge_due_wait_frames = 0
+            return None
+
+        due = servable[0]
+        if due["plan"] != self._discharge_due_plan:
+            self._discharge_due_plan = due["plan"]
+            self._discharge_due_wait_frames = 0
+        if due["ready"]:
+            self._discharge_due_wait_frames = 0
+            return due
+
+        # Hold the rotation on the due leg while its block looks transient,
+        # but always yield before the stall watchdog would fail recovery.
+        self._discharge_due_wait_frames += 1
+        grace = min(
+            DISCHARGE_DUE_LEG_GRACE_FRAMES, max(0, self.discharge_stall_time // 2)
+        )
+        if self._discharge_due_wait_frames <= grace:
+            return due
+        return next(
+            (item for item in servable if item["ready"]),
+            due,
+        )
+
+    def _advance_discharge_cycle(self, completed_plan):
+        """Move the clockwise cursor past the leg that just finished."""
+        try:
+            position = DISCHARGE_CLOCKWISE_ORDER.index(completed_plan)
+        except ValueError:
+            return
+        self._discharge_cycle_index = (position + 1) % len(
+            DISCHARGE_CLOCKWISE_ORDER
+        )
 
     def _recommend_discharge_plan(self, vehicles, exclude=None):
         ranked = self._rank_discharge_candidates(vehicles, exclude=exclude)
@@ -637,6 +715,8 @@ class SignalController:
 
         self.discharge_state = DISCHARGE_ACTIVE
         self.discharge_timer = 0
+        self._discharge_due_wait_frames = 0
+        self._discharge_due_plan = None
         self._discharge_green_map = dict(stage.greens)
         self.discharge_reason = reason
         self.discharge_recommendation = (
@@ -663,23 +743,7 @@ class SignalController:
 
         if self.discharge_plan_name is None:
             if self.discharge_mode == control_panel.DISCHARGE_AUTO:
-                ranked = self._rank_discharge_candidates(vehicles)
-                occupants = self._box_occupant_directions(vehicles)
-                candidate = (
-                    next(
-                        (
-                            item
-                            for item in ranked
-                            if item["ready"]
-                            and self._candidate_drains_blocker(item, occupants)
-                        ),
-                        None,
-                    )
-                    or next(
-                        (item for item in ranked if item["ready"]), None
-                    )
-                    or (ranked[0] if ranked else None)
-                )
+                candidate = self._next_clockwise_candidate(vehicles)
                 if candidate is None:
                     self._set_discharge_waiting(
                         "No queued approach currently requires a discharge green",
@@ -721,6 +785,7 @@ class SignalController:
         self._discharge_last_served[completed_plan] = self.frame_number
         self.discharge_cycles += 1
         if self.discharge_mode == control_panel.DISCHARGE_AUTO:
+            self._advance_discharge_cycle(completed_plan)
             self.discharge_plan_name = None
             self.discharge_stage_index = 0
             self._set_discharge_waiting(

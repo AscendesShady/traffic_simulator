@@ -586,15 +586,15 @@ def test_startup_window_layout_tiles_large_and_standard_hd_desktops():
 
     assert large == {
         "mode": "tiled",
-        "canvas_position": (840, 30),
-        "control_geometry": "820x1020+10+10",
-        "telemetry_geometry": "1000x760+840+640",
+        "canvas_position": (900, 30),
+        "control_geometry": "880x1030+10+10",
+        "telemetry_geometry": "1000x760+900+640",
     }
     assert hd == {
         "mode": "tiled",
-        "canvas_position": (840, 30),
-        "control_geometry": "820x1020+10+10",
-        "telemetry_geometry": "1000x400+840+640",
+        "canvas_position": (900, 30),
+        "control_geometry": "880x1030+10+10",
+        "telemetry_geometry": "1000x400+900+640",
     }
 
 
@@ -603,7 +603,7 @@ def test_startup_window_layout_uses_on_screen_cascade_when_space_is_small():
 
     assert layout["mode"] == "cascade"
     assert layout["canvas_position"] == (183, 30)
-    assert layout["control_geometry"] == "820x718+536+10"
+    assert layout["control_geometry"] == "880x718+476+10"
     assert layout["telemetry_geometry"] == "900x718+233+30"
 
 

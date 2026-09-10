@@ -35,10 +35,10 @@ HISTORY_SAMPLE_SECONDS = 1.0
 HISTORY_MAX_POINTS = 600
 LLM_POLL_MILLISECONDS = 1000
 WINDOW_DEFAULT_WIDTH = 900
-WINDOW_DEFAULT_HEIGHT = 780
+WINDOW_DEFAULT_HEIGHT = 430
 WINDOW_MIN_WIDTH = 480
-WINDOW_MIN_HEIGHT = 400
-WINDOW_INITIAL_MIN_HEIGHT = 500
+WINDOW_MIN_HEIGHT = 320
+WINDOW_INITIAL_MIN_HEIGHT = 360
 WINDOW_SCREEN_MARGIN_X = 80
 WINDOW_SCREEN_MARGIN_Y = 140
 WINDOW_GEOMETRY_ENV = "TRAFFIC_TELEMETRY_GEOMETRY"
@@ -73,6 +73,34 @@ TELEMETRY_EXPORT_HEADERS = [
     "queues_vehicles",
     "queues_passengers_est",
 ]
+
+# Summary KPI strip: label shown after the value, in display order.
+SUMMARY_KPIS = (
+    ("VEH", "vehicles"),
+    ("BUS", "buses"),
+    ("PAX", "passengers"),
+    ("Q", "queued"),
+    ("AVGQ", "delay"),
+    ("CONG", "congestion"),
+    ("TSP", "tsp"),
+    ("DBL", "dbl"),
+    ("SIM", "timer"),
+)
+
+# Hover text for the deliberately compact KPI strip. Keep this keyed by the
+# underlying metric rather than display order so every abbreviation has one
+# clear, testable definition.
+KPI_TOOLTIPS = {
+    "vehicles": "Vehicles currently in the network",
+    "buses": "Buses currently in the network",
+    "passengers": "Passengers currently carried by network vehicles",
+    "queued": "Queued road vehicles / pending arrivals",
+    "delay": "Average queued vehicles over recent samples",
+    "congestion": "Queued vehicles as a percentage of network traffic",
+    "tsp": "Transit Signal Priority: active / pending",
+    "dbl": "Dynamic Bus Lane: active / pending",
+    "timer": "Elapsed simulation time",
+}
 
 LLM_PERFORMANCE_HEADERS = [
     "turn",
@@ -167,6 +195,99 @@ def poll_gpu_stats():
         return _gpu_none()
 
 
+class HoverTooltip:
+    """Small delayed tooltip shared by one widget region and its children."""
+
+    def __init__(self, widget, text, delay_ms=350):
+        self.widget = widget
+        self.text = str(text)
+        self.delay_ms = max(0, int(delay_ms))
+        self.after_id = None
+        self.hide_after_id = None
+        self.tip_window = None
+        self.targets = []
+        self.add_target(widget)
+
+    def add_target(self, widget):
+        """Make another widget part of the same uninterrupted hover region."""
+        if widget in self.targets:
+            return
+        self.targets.append(widget)
+        widget.bind("<Enter>", self.schedule, add="+")
+        widget.bind("<Leave>", self.schedule_hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+        widget.bind("<Destroy>", self.hide, add="+")
+
+    def schedule(self, _event=None):
+        self.cancel_pending_hide()
+        self.cancel_pending()
+        if self.tip_window is not None:
+            return
+        self.after_id = self.widget.after(self.delay_ms, self.show)
+
+    def schedule_hide(self, _event=None):
+        self.cancel_pending()
+        self.cancel_pending_hide()
+        # Entering a child produces a leave event on its parent in Tk. A short
+        # deferral lets the child's Enter cancel this hide, making the entire
+        # KPI card behave as one continuous target without flicker.
+        self.hide_after_id = self.widget.after(60, self.hide)
+
+    def cancel_pending(self):
+        if self.after_id is None:
+            return
+        try:
+            self.widget.after_cancel(self.after_id)
+        except tk.TclError:
+            pass
+        self.after_id = None
+
+    def cancel_pending_hide(self):
+        if self.hide_after_id is None:
+            return
+        try:
+            self.widget.after_cancel(self.hide_after_id)
+        except tk.TclError:
+            pass
+        self.hide_after_id = None
+
+    def show(self):
+        self.after_id = None
+        if self.tip_window is not None or not self.text:
+            return
+        try:
+            x_pos = self.widget.winfo_pointerx() + 12
+            y_pos = self.widget.winfo_pointery() + 16
+            tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x_pos}+{y_pos}")
+            tk.Label(
+                tip,
+                text=self.text,
+                font=(FONT_FAMILY, 9),
+                bg="#111827",
+                fg=COLOR_TEXT_PRIMARY,
+                relief="solid",
+                borderwidth=1,
+                padx=8,
+                pady=5,
+            ).pack()
+            self.tip_window = tip
+        except tk.TclError:
+            self.tip_window = None
+
+    def hide(self, _event=None):
+        self.cancel_pending()
+        self.cancel_pending_hide()
+        tip = self.tip_window
+        self.tip_window = None
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+
+
 class TelemetryDashboard:
     def __init__(self, root):
         self.root = root
@@ -244,11 +365,11 @@ class TelemetryDashboard:
 
     def build_ui(self):
         header = tk.Frame(self.root, bg=COLOR_BG)
-        header.pack(fill="x", padx=20, pady=(15, 10))
+        header.pack(fill="x", padx=14, pady=(8, 4))
         self.header_title_lbl = tk.Label(
             header,
-            text="LIVE TELEMETRY DASHBOARD",
-            font=(FONT_FAMILY, 16, "bold"),
+            text="LIVE NETWORK TELEMETRY",
+            font=(FONT_FAMILY, 13, "bold"),
             bg=COLOR_BG,
             fg=COLOR_TEXT_PRIMARY,
         )
@@ -269,10 +390,8 @@ class TelemetryDashboard:
             font=(FONT_FAMILY, 9, "bold"),
             padding=(16, 7),
         )
-        export_bar = tk.Frame(self.root, bg=COLOR_BG)
-        export_bar.pack(fill="x", padx=20, pady=(0, 4))
         self.export_all_btn = tk.Button(
-            export_bar,
+            header,
             text="EXPORT ALL",
             command=self.export_all,
             font=(FONT_FAMILY, 8, "bold"),
@@ -284,29 +403,36 @@ class TelemetryDashboard:
             padx=10,
             pady=3,
         )
-        self.export_all_btn.pack(side="right")
+        self.export_all_btn.pack(side="right", padx=(10, 0))
         self.export_all_status_lbl = tk.Label(
-            export_bar,
+            header,
             text="",
             font=(FONT_FAMILY, 8),
             bg=COLOR_BG,
             fg=COLOR_SUCCESS,
         )
-        self.export_all_status_lbl.pack(side="right", padx=(8, 8))
+        self.export_all_status_lbl.pack(side="right", padx=(8, 0))
         self.notebook = ttk.Notebook(
             self.root,
             style="Telemetry.TNotebook",
         )
-        self.notebook.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(0, 8))
         self.summary_tab, self.summary_content = self.create_responsive_tab()
-        self.trends_tab, self.trends_content = self.create_responsive_tab()
-        self.llm_tab, self.llm_content = self.create_responsive_tab()
+        (
+            self.trends_tab,
+            self.trends_content,
+            self.trends_scroll_canvas,
+        ) = self.create_scrollable_tab()
+        (
+            self.llm_tab,
+            self.llm_content,
+            self.llm_scroll_canvas,
+        ) = self.create_scrollable_tab()
         self.notebook.add(self.summary_tab, text="SUMMARY")
         self.notebook.add(self.trends_tab, text="SESSION TRENDS")
         self.notebook.add(self.llm_tab, text="LLM PERFORMANCE")
 
         summary_controls = tk.Frame(self.summary_content, bg=COLOR_BG)
-        summary_controls.pack(fill="x", padx=20, pady=(4, 0))
         self.summary_export_hint_lbl = tk.Label(
             summary_controls,
             text="CURRENT AUTHORITATIVE SNAPSHOT",
@@ -314,7 +440,6 @@ class TelemetryDashboard:
             bg=COLOR_BG,
             fg=COLOR_TEXT_SECONDARY,
         )
-        self.summary_export_hint_lbl.pack(side="left")
         self.summary_export_status_lbl = tk.Label(
             summary_controls,
             text="",
@@ -322,74 +447,54 @@ class TelemetryDashboard:
             bg=COLOR_BG,
             fg=COLOR_SUCCESS,
         )
-        self.summary_export_status_lbl.pack(side="right", padx=(8, 8))
-        self.summary_export_btn = tk.Button(
-            summary_controls,
-            text="EXPORT TO EXCEL",
-            command=self.export_summary_snapshot,
-            font=(FONT_FAMILY, 8, "bold"),
-            bg=COLOR_ACCENT,
-            fg=COLOR_TEXT_PRIMARY,
-            activebackground=COLOR_CARD_BORDER,
-            activeforeground=COLOR_TEXT_PRIMARY,
-            relief="flat",
-            padx=9,
-            pady=3,
-        )
-        self.summary_export_btn.pack(side="right")
+        # Per-tab export buttons were removed: EXPORT ALL is the single
+        # export. The status label stays unpacked so export_summary_snapshot,
+        # which EXPORT ALL reuses, still has somewhere to report.
 
-        self.metrics_frame = tk.Frame(self.summary_content, bg=COLOR_BG)
-        self.metrics_frame.pack(fill="x", padx=20, pady=5)
+        # One dense KPI strip replaces the old 3x3 card grid: the same
+        # numbers in roughly a fifth of the vertical space.
+        self.metrics_frame = tk.Frame(
+            self.summary_content,
+            bg=COLOR_CARD,
+            highlightbackground=COLOR_CARD_BORDER,
+            highlightthickness=1,
+        )
+        self.metrics_frame.pack(fill="x", padx=10, pady=(4, 3))
         self.vars = {}
         self.metric_cards = []
         self.metric_title_labels = []
-        metrics_layout = [
-            [("Active Vehicles", "vehicles"), ("Active Buses", "buses"), ("Passenger Vol", "passengers")],
-            [("Road/Demand Queue", "queued"), ("Avg Queue (20s)", "delay"), ("Congestion", "congestion")],
-            [("TSP Active/Pending", "tsp"), ("DBL Active/Pending", "dbl"), ("Sim Timer", "timer")],
-        ]
-        for column_index in range(3):
-            self.metrics_frame.grid_columnconfigure(
-                column_index, weight=1, uniform="summary_metric_columns"
+        self.metric_tooltips = []
+        for index, (title, key) in enumerate(SUMMARY_KPIS):
+            if index:
+                separator = tk.Frame(
+                    self.metrics_frame, bg=COLOR_CARD_BORDER, width=1
+                )
+                separator.pack(side="left", fill="y", pady=4)
+            cell = tk.Frame(self.metrics_frame, bg=COLOR_CARD)
+            cell.pack(side="left", fill="both", expand=True, padx=5, pady=3)
+            value = tk.Label(
+                cell,
+                text="--",
+                font=(FONT_FAMILY, 13, "bold"),
+                bg=COLOR_CARD,
+                fg=COLOR_ACCENT,
             )
-        for row_index, row in enumerate(metrics_layout):
-            self.metrics_frame.grid_rowconfigure(
-                row_index, weight=1, uniform="summary_metric_rows"
+            value.pack(side="left")
+            title_label = tk.Label(
+                cell,
+                text=title,
+                font=(FONT_FAMILY, 8, "bold"),
+                bg=COLOR_CARD,
+                fg=COLOR_TEXT_SECONDARY,
             )
-            for column_index, (title, key) in enumerate(row):
-                card = tk.Frame(
-                    self.metrics_frame,
-                    bg=COLOR_CARD,
-                    highlightbackground=COLOR_CARD_BORDER,
-                    highlightthickness=1,
-                )
-                card.grid(
-                    row=row_index,
-                    column=column_index,
-                    sticky="nsew",
-                    padx=5,
-                    pady=5,
-                )
-                title_label = tk.Label(
-                    card,
-                    text=title,
-                    font=(FONT_FAMILY, 9, "bold"),
-                    bg=COLOR_CARD,
-                    fg=COLOR_TEXT_SECONDARY,
-                    anchor="w",
-                )
-                title_label.pack(fill="x", padx=10, pady=(8, 0))
-                value = tk.Label(
-                    card,
-                    text="--",
-                    font=(FONT_FAMILY, 18, "bold"),
-                    bg=COLOR_CARD,
-                    fg=COLOR_ACCENT,
-                )
-                value.pack(fill="x", anchor="w", padx=10, pady=(0, 8))
-                self.metric_cards.append(card)
-                self.metric_title_labels.append(title_label)
-                self.vars[key] = value
+            title_label.pack(side="left", padx=(3, 0))
+            self.metric_cards.append(cell)
+            self.metric_title_labels.append(title_label)
+            tooltip = HoverTooltip(cell, KPI_TOOLTIPS[key])
+            tooltip.add_target(value)
+            tooltip.add_target(title_label)
+            self.metric_tooltips.append(tooltip)
+            self.vars[key] = value
 
         recovery_card = tk.Frame(
             self.summary_content,
@@ -398,6 +503,20 @@ class TelemetryDashboard:
             highlightthickness=1,
         )
         recovery_card.pack(fill="x", padx=25, pady=(7, 3))
+        self.recovery_card = recovery_card
+        # Idle is the overwhelmingly common case, so the panel shows a single
+        # line then and expands to full diagnostics only when recovery is
+        # actually doing something.
+        self.discharge_compact_lbl = tk.Label(
+            recovery_card,
+            text="STATUS: NORMAL CONTROL",
+            font=(FONT_FAMILY, 8, "bold"),
+            bg=COLOR_CARD,
+            fg=COLOR_TEXT_SECONDARY,
+            anchor="w",
+        )
+        self.discharge_detail_widgets = []
+        self.discharge_expanded = True
         self.recovery_title_lbl = tk.Label(
             recovery_card,
             text="NETWORK GRIDLOCK RECOVERY",
@@ -444,6 +563,14 @@ class TelemetryDashboard:
             justify="left",
         )
         self.discharge_recommendation_lbl.pack(fill="x", padx=10, pady=(0, 6))
+        self.discharge_detail_widgets = [
+            self.recovery_title_lbl,
+            self.discharge_selected_lbl,
+            self.discharge_status_lbl,
+            self.discharge_reason_lbl,
+            self.discharge_recommendation_lbl,
+        ]
+        self.set_discharge_expanded(False)
 
         self.build_phase_cycle_ui()
 
@@ -482,6 +609,8 @@ class TelemetryDashboard:
         )
         self.build_trends_ui()
         self.build_llm_performance_ui()
+        self.bind_tab_mousewheel(self.trends_content, self.trends_scroll_canvas)
+        self.bind_tab_mousewheel(self.llm_content, self.llm_scroll_canvas)
 
     def create_responsive_tab(self):
         """Return a tab whose content reflows with the available window size."""
@@ -490,12 +619,88 @@ class TelemetryDashboard:
         content.pack(fill="both", expand=True)
         return tab, content
 
+    def create_scrollable_tab(self):
+        """Return a width-responsive tab with vertical overflow scrolling.
+
+        The inner frame always tracks the viewport width, so shrinking the
+        dashboard never introduces horizontal scrolling.  Only content that
+        genuinely cannot remain legible at the available height scrolls.
+        """
+        tab = tk.Frame(self.notebook, bg=COLOR_BG)
+        canvas = tk.Canvas(
+            tab,
+            bg=COLOR_BG,
+            highlightthickness=0,
+            borderwidth=0,
+            takefocus=False,
+        )
+        scrollbar = ttk.Scrollbar(
+            tab,
+            orient="vertical",
+            command=canvas.yview,
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        content = tk.Frame(canvas, bg=COLOR_BG)
+        content_window = canvas.create_window(
+            (0, 0), window=content, anchor="nw"
+        )
+
+        def refresh_scroll_region(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_content_width(event):
+            canvas.itemconfigure(content_window, width=max(1, event.width))
+            canvas.after_idle(refresh_scroll_region)
+
+        content.bind("<Configure>", refresh_scroll_region, add="+")
+        canvas.bind("<Configure>", fit_content_width, add="+")
+        return tab, content, canvas
+
+    @staticmethod
+    def scroll_tab_with_wheel(event, canvas):
+        """Scroll one tab with Windows/macOS wheel or Linux wheel buttons."""
+        delta = getattr(event, "delta", 0)
+        button = getattr(event, "num", None)
+        if delta:
+            units = -1 if delta > 0 else 1
+        elif button == 4:
+            units = -1
+        elif button == 5:
+            units = 1
+        else:
+            return None
+        canvas.yview_scroll(units * 3, "units")
+        return "break"
+
+    def bind_tab_mousewheel(self, widget, canvas):
+        """Bind wheel scrolling to a tab and every widget currently inside it."""
+        widget.bind(
+            "<MouseWheel>",
+            lambda event: self.scroll_tab_with_wheel(event, canvas),
+            add="+",
+        )
+        widget.bind(
+            "<Button-4>",
+            lambda event: self.scroll_tab_with_wheel(event, canvas),
+            add="+",
+        )
+        widget.bind(
+            "<Button-5>",
+            lambda event: self.scroll_tab_with_wheel(event, canvas),
+            add="+",
+        )
+        for child in widget.winfo_children():
+            self.bind_tab_mousewheel(child, canvas)
+
     @staticmethod
     def responsive_profile(width, height):
         """Return bounded dimensions and fonts for the current client area."""
         width = max(WINDOW_MIN_WIDTH, int(width))
         height = max(WINDOW_MIN_HEIGHT, int(height))
-        scale = max(0.60, min(1.0, min(width / 900.0, height / 780.0)))
+        scale = max(0.60, min(1.0, min(width / 900.0, height / 430.0)))
         compact = width < 700 or height < 700
         return {
             "compact": compact,
@@ -505,10 +710,10 @@ class TelemetryDashboard:
             "metric_title_font": max(6, round(9 * scale)),
             "metric_value_font": max(11, min(16, round(18 * scale))),
             "detail_font": max(6, round(8 * scale)),
-            "metric_row_height": max(34, min(58, round(height * 0.07))),
+            "metric_row_height": max(26, min(40, round(height * 0.07))),
             "phase_height": max(35, min(85, round(height * 0.11))),
             "node_height": max(45, min(100, round(height * 0.13))),
-            "chart_height": max(72, min(150, round((height - 165) / 3))),
+            "chart_height": max(72, min(150, round((height - 120) / 3))),
             "wraplength": max(310, width - 92),
         }
 
@@ -555,15 +760,13 @@ class TelemetryDashboard:
                 uniform="summary_metric_rows",
                 minsize=profile["metric_row_height"],
             )
+        # The KPI strip is packed, not gridded: each cell sits side by side.
         for card, title_label in zip(self.metric_cards, self.metric_title_labels):
-            card.grid_configure(padx=metric_pad, pady=metric_pad)
+            card.pack_configure(padx=metric_pad, pady=max(2, metric_pad - 2))
             title_label.config(
                 font=(FONT_FAMILY, profile["metric_title_font"], "bold")
             )
-            title_label.pack_configure(
-                padx=5 if compact else 10,
-                pady=(1 if compact else 4, 0),
-            )
+            title_label.pack_configure(padx=(2 if compact else 3, 0), pady=0)
         for value_label in self.vars.values():
             value_label.config(
                 font=(FONT_FAMILY, profile["metric_value_font"], "bold")
@@ -579,11 +782,7 @@ class TelemetryDashboard:
         self.export_all_status_lbl.config(font=detail_font)
         self.summary_export_hint_lbl.config(font=detail_bold_font)
         self.summary_export_status_lbl.config(font=detail_font)
-        self.summary_export_btn.config(font=detail_bold_font)
-        self.summary_export_hint_lbl.master.pack_configure(
-            padx=8 if compact else 20,
-            pady=(1, 0) if compact else (4, 0),
-        )
+
         self.recovery_title_lbl.config(font=detail_bold_font)
         self.discharge_selected_lbl.config(font=detail_bold_font)
         self.discharge_status_lbl.config(font=detail_bold_font)
@@ -599,10 +798,15 @@ class TelemetryDashboard:
             padx=10 if compact else 25,
             pady=(3, 2) if compact else (7, 3),
         )
-        self.recovery_title_lbl.pack_configure(pady=(3 if compact else 6, 0))
-        self.discharge_recommendation_lbl.pack_configure(
-            pady=(0, 3 if compact else 6)
-        )
+        # pack_configure re-packs a hidden widget, which would undo the
+        # collapsed recovery panel, so only touch these while expanded.
+        if getattr(self, "discharge_expanded", True):
+            self.recovery_title_lbl.pack_configure(
+                pady=(3 if compact else 6, 0)
+            )
+            self.discharge_recommendation_lbl.pack_configure(
+                pady=(0, 3 if compact else 6)
+            )
 
         self.phase_title_lbl.config(
             font=(FONT_FAMILY, max(8, profile["section_font"] - 1), "bold")
@@ -655,7 +859,6 @@ class TelemetryDashboard:
             font=(FONT_FAMILY, profile["detail_font"]),
         )
         self.clear_history_btn.config(font=detail_bold_font)
-        self.trends_export_btn.config(font=detail_bold_font)
         self.trends_export_status_lbl.config(font=detail_font)
         for chart in self.trend_charts:
             chart["title_label"].config(
@@ -676,7 +879,6 @@ class TelemetryDashboard:
             padx=10 if compact else 24,
             pady=(0, 1 if compact else 2),
         )
-        self.llm_export_btn.config(font=detail_bold_font)
         self.llm_idle_lbl.master.pack_configure(
             padx=8 if compact else 20,
             pady=(4, 2) if compact else (10, 4),
@@ -719,6 +921,26 @@ class TelemetryDashboard:
         self.draw_phase_cycle(self.latest_telemetry)
         self.draw_node_intersections()
         self.draw_trend_charts()
+
+    DISCHARGE_QUIET_STATES = frozenset({"IDLE", "INACTIVE", "", "COMPLETED"})
+
+    def set_discharge_expanded(self, expanded):
+        """Show full recovery diagnostics only while they carry information."""
+        if getattr(self, "discharge_expanded", None) == bool(expanded):
+            return
+        self.discharge_expanded = bool(expanded)
+        if expanded:
+            self.discharge_compact_lbl.pack_forget()
+            for widget in self.discharge_detail_widgets:
+                widget.pack(fill="x", padx=10)
+            self.recovery_title_lbl.pack_configure(anchor="w", pady=(6, 1))
+            self.discharge_recommendation_lbl.pack_configure(pady=(0, 6))
+            self.recovery_card.config(highlightbackground=COLOR_DANGER)
+        else:
+            for widget in self.discharge_detail_widgets:
+                widget.pack_forget()
+            self.discharge_compact_lbl.pack(fill="x", padx=10, pady=3)
+            self.recovery_card.config(highlightbackground=COLOR_CARD_BORDER)
 
     def build_phase_cycle_ui(self):
         card = tk.Frame(
@@ -804,21 +1026,6 @@ class TelemetryDashboard:
             bg=COLOR_BG,
             fg=COLOR_SUCCESS,
         )
-        self.trends_export_status_lbl.pack(side="right", padx=(8, 8))
-        self.trends_export_btn = tk.Button(
-            controls,
-            text="EXPORT TO EXCEL",
-            command=self.export_session_trends,
-            font=(FONT_FAMILY, 8, "bold"),
-            bg=COLOR_ACCENT,
-            fg=COLOR_TEXT_PRIMARY,
-            activebackground=COLOR_CARD_BORDER,
-            activeforeground=COLOR_TEXT_PRIMARY,
-            relief="flat",
-            padx=10,
-            pady=4,
-        )
-        self.trends_export_btn.pack(side="right")
 
         charts = tk.Frame(self.trends_content, bg=COLOR_BG)
         charts.pack(fill="both", expand=True, padx=20, pady=(0, 12))
@@ -866,21 +1073,6 @@ class TelemetryDashboard:
             bg=COLOR_BG,
             fg=COLOR_SUCCESS,
         )
-        self.llm_export_status_lbl.pack(side="right", padx=(8, 8))
-        self.llm_export_btn = tk.Button(
-            controls,
-            text="EXPORT TO EXCEL",
-            command=self.export_llm_performance,
-            font=(FONT_FAMILY, 8, "bold"),
-            bg=COLOR_ACCENT,
-            fg=COLOR_TEXT_PRIMARY,
-            activebackground=COLOR_CARD_BORDER,
-            activeforeground=COLOR_TEXT_PRIMARY,
-            relief="flat",
-            padx=10,
-            pady=4,
-        )
-        self.llm_export_btn.pack(side="right")
 
         self.llm_vars = {}
         self.llm_metric_cards = []
@@ -1807,14 +1999,41 @@ class TelemetryDashboard:
             self._write_telemetry_rows(telemetry_sheet, telemetry_rows)
             self._write_llm_performance_rows(performance_sheet, samples)
             self._write_llm_summary_rows(summary_sheet, samples)
+
+            # Record the operator inputs that produced this session, so the
+            # workbook is self-describing without the control panel.
+            inputs_sheet = workbook.create_sheet("Control Panel Inputs")
+            try:
+                import main
+
+                main.write_control_panel_inputs_sheet(inputs_sheet)
+            except Exception:
+                inputs_sheet.append(["section", "parameter", "value"])
+
+            # Fold in the content the removed per-tab buttons used to produce,
+            # so EXPORT ALL is genuinely the only export needed. Session
+            # Trends in particular exists only in this process's memory.
             self._style_excel_sheets(
                 (
                     decisions_sheet,
                     telemetry_sheet,
                     performance_sheet,
                     summary_sheet,
+                    inputs_sheet,
                 )
             )
+            try:
+                self.export_summary_snapshot(
+                    workbook=workbook, prefix="Snapshot "
+                )
+            except Exception:
+                pass
+            try:
+                self.export_session_trends(
+                    workbook=workbook, prefix="Trends "
+                )
+            except Exception:
+                pass
 
             workbook.save(destination)
             workbook.close()
@@ -1892,8 +2111,92 @@ class TelemetryDashboard:
                     max(10, width + 2), 42
                 )
 
-    def export_summary_snapshot(self, destination=None):
-        """Export the latest authoritative telemetry snapshot."""
+    @staticmethod
+    def _add_session_trend_charts(workbook, trends_sheet, sample_count):
+        """Add editable Excel charts backed by the exported trend table."""
+        from openpyxl.chart import LineChart, Reference
+        from openpyxl.chart.series import SeriesLabel
+
+        charts_sheet = workbook.create_sheet("Session Charts")
+        charts_sheet.sheet_view.showGridLines = False
+
+        categories = Reference(
+            trends_sheet,
+            min_col=1,
+            min_row=2,
+            max_row=sample_count + 1,
+        )
+        chart_specs = (
+            {
+                "title": "Network Occupancy Over Time",
+                "y_title": "Vehicles in network",
+                "columns": (2, 3),
+                "series": (
+                    ("Vehicles", "2D8CFF"),
+                    ("Buses", "F59E0B"),
+                ),
+                "anchor": "A1",
+                "number_format": "0",
+            },
+            {
+                "title": "Queue Pressure Over Time",
+                "y_title": "Vehicles and pending arrivals",
+                "columns": (4, 5),
+                "series": (
+                    ("Road queue", "EF4444"),
+                    ("Pending demand", "F59E0B"),
+                ),
+                "anchor": "A16",
+                "number_format": "0",
+            },
+            {
+                "title": "Network Congestion Over Time",
+                "y_title": "Congestion (%)",
+                "columns": (6, 6),
+                "series": (("Congestion", "2ECC71"),),
+                "anchor": "A31",
+                "number_format": "0.0",
+            },
+        )
+
+        for spec in chart_specs:
+            chart = LineChart()
+            chart.title = spec["title"]
+            chart.x_axis.title = "Simulation time (seconds)"
+            chart.y_axis.title = spec["y_title"]
+            chart.y_axis.numFmt = spec["number_format"]
+            chart.legend.position = "t"
+            chart.height = 7.2
+            chart.width = 14.5
+            chart.style = 13
+
+            data = Reference(
+                trends_sheet,
+                min_col=spec["columns"][0],
+                max_col=spec["columns"][1],
+                min_row=1,
+                max_row=sample_count + 1,
+            )
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(categories)
+            for series, (label, color) in zip(chart.series, spec["series"]):
+                series.tx = SeriesLabel(v=label)
+                series.graphicalProperties.line.solidFill = color
+                series.graphicalProperties.line.width = 24000
+
+            charts_sheet.add_chart(chart, spec["anchor"])
+
+        return charts_sheet
+
+    def export_summary_snapshot(
+        self, destination=None, workbook=None, prefix=""
+    ):
+        """Export the latest authoritative telemetry snapshot.
+
+        With `workbook` supplied the sheets are appended to it and returned
+        instead of being saved, so EXPORT ALL can fold this content in
+        without duplicating the row building.
+        """
         data = self.latest_telemetry
         if not isinstance(data, dict):
             self.summary_export_status_lbl.config(
@@ -1913,9 +2216,13 @@ class TelemetryDashboard:
                 destination = Path(destination)
                 destination.parent.mkdir(parents=True, exist_ok=True)
 
-            workbook = Workbook()
-            overview = workbook.active
-            overview.title = "Overview"
+            shared = workbook is not None
+            if shared:
+                overview = workbook.create_sheet(f"{prefix}Overview")
+            else:
+                workbook = Workbook()
+                overview = workbook.active
+                overview.title = "Overview"
             overview.append(["metric", "value"])
             overview_rows = [
                 ("telemetry_status", self.classify_status(data)),
@@ -1952,7 +2259,7 @@ class TelemetryDashboard:
                 passenger_queues = {}
             if not isinstance(demand, dict):
                 demand = {}
-            queue_sheet = workbook.create_sheet("Queues & Demand")
+            queue_sheet = workbook.create_sheet(f"{prefix}Queues & Demand")
             queue_headers = [
                 "approach",
                 "queued_vehicles",
@@ -1984,7 +2291,7 @@ class TelemetryDashboard:
                     ]
                 )
 
-            routes_sheet = workbook.create_sheet("Routes")
+            routes_sheet = workbook.create_sheet(f"{prefix}Routes")
             route_headers = [
                 "route_id",
                 "route_name",
@@ -2009,7 +2316,7 @@ class TelemetryDashboard:
                     [route_id] + [route.get(header) for header in route_headers[1:]]
                 )
 
-            nodes_sheet = workbook.create_sheet("Signal Nodes")
+            nodes_sheet = workbook.create_sheet(f"{prefix}Signal Nodes")
             node_headers = [
                 "node",
                 "node_x",
@@ -2061,9 +2368,10 @@ class TelemetryDashboard:
                     ]
                 )
 
-            self._style_excel_sheets(
-                (overview, queue_sheet, routes_sheet, nodes_sheet)
-            )
+            sheets = (overview, queue_sheet, routes_sheet, nodes_sheet)
+            self._style_excel_sheets(sheets)
+            if shared:
+                return sheets
             workbook.save(destination)
             workbook.close()
             self.summary_export_status_lbl.config(
@@ -2078,8 +2386,12 @@ class TelemetryDashboard:
             )
             return None
 
-    def export_session_trends(self, destination=None):
-        """Export only the bounded, in-memory Session Trends samples."""
+    def export_session_trends(self, destination=None, workbook=None, prefix=""):
+        """Export only the bounded, in-memory Session Trends samples.
+
+        With `workbook` supplied the sheets are appended to it and returned
+        rather than saved, so EXPORT ALL keeps this dashboard-only history.
+        """
         sample_count = len(self.history.get("time", ()))
         if sample_count == 0:
             self.trends_export_status_lbl.config(
@@ -2116,14 +2428,25 @@ class TelemetryDashboard:
                 "congestion",
             ]
             rows = list(zip(*(list(self.history[key]) for key in keys)))
-            workbook = Workbook()
-            trends_sheet = workbook.active
-            trends_sheet.title = "Session Trends"
+            shared = workbook is not None
+            if shared:
+                # Already unique in a combined workbook, so no prefix needed.
+                trends_sheet = workbook.create_sheet("Session Trends")
+            else:
+                workbook = Workbook()
+                trends_sheet = workbook.active
+                trends_sheet.title = "Session Trends"
             trends_sheet.append(headers)
             for row in rows:
                 trends_sheet.append(row)
 
-            summary_sheet = workbook.create_sheet("Summary")
+            charts_sheet = self._add_session_trend_charts(
+                workbook,
+                trends_sheet,
+                len(rows),
+            )
+
+            summary_sheet = workbook.create_sheet(f"{prefix}Summary")
             summary_sheet.append(["metric", "value"])
             times = list(self.history["time"])
             summary_rows = [
@@ -2150,6 +2473,8 @@ class TelemetryDashboard:
                 summary_sheet.append(row)
 
             self._style_excel_sheets((trends_sheet, summary_sheet))
+            if shared:
+                return (trends_sheet, charts_sheet, summary_sheet)
             workbook.save(destination)
             workbook.close()
             self.trends_export_status_lbl.config(
@@ -2427,6 +2752,17 @@ class TelemetryDashboard:
             self.discharge_recommendation_lbl.config(
                 text=display["recommendation"]
             )
+            runtime = data.get("network_discharge", {}) or {}
+            raw_status = str(runtime.get("status", "IDLE")).upper()
+            quiet = (
+                not runtime.get("active", False)
+                and raw_status in self.DISCHARGE_QUIET_STATES
+            )
+            self.set_discharge_expanded(not quiet)
+            if quiet:
+                self.discharge_compact_lbl.config(
+                    text=f"STATUS: NORMAL CONTROL  |  {display['selected']}"
+                )
 
         self.latest_telemetry = data
         self.root.update_idletasks()

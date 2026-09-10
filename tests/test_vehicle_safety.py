@@ -3,7 +3,12 @@ import pytest
 import control_panel
 from canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
 from signal_controller import SignalController
-from vehicle import Bus, DBL_LANE_INDEX, Vehicle
+from vehicle import (
+    Bus,
+    DBL_LANE_INDEX,
+    ROUTE_MERGE_AREA_PX,
+    Vehicle,
+)
 from tests.helpers import make_bus_for_leg, rectangles_overlap
 
 
@@ -298,6 +303,191 @@ def test_lane_blocked_bus_holds_upstream_of_stop_bar():
     assert bus.lane_index == 1
     assert bus.is_front_bumper_upstream(700, H_Y, ROAD_W, STOP)
     assert bus.speed == 0
+
+
+def test_multileg_bus_reserves_next_lane_before_crossing_first_node():
+    """R4 must not enter Node B if its post-node lane-2 merge has no storage."""
+    control_panel.bus_routes_config["R4_WB_A_SB"]["dbl_enabled"] = False
+    bus = make_bus_for_leg("R4_WB_A_SB", 700, "R4_ENTRY_GATE")
+    controller = SignalController({"green_time": 999})
+    merge_x = bus.route_merge_point_x(700, ROAD_W)
+    blocker = Vehicle(
+        merge_x,
+        H_Y + 2.5 * LANE,
+        "WB",
+        max_speed=0.0,
+        lane_index=2,
+    )
+    blocker.passed_nodes.add(700)
+    vehicles = [bus, blocker]
+    starting_x = bus.x
+
+    bus.update(
+        signals_for("WB", "GREEN"),
+        INT_X,
+        H_Y,
+        ROAD_W,
+        STOP,
+        LANE,
+        vehicles,
+        controller,
+    )
+
+    assert bus.route_exit_merge_blocked is True
+    assert bus.x == starting_x
+    assert bus.speed == 0.0
+    assert 700 not in bus.passed_nodes
+
+
+def test_r4_moves_to_next_legs_lane_immediately_after_node_b():
+    """The lane plan is route-driven and works with both DBL and TSP disabled."""
+    control_panel.bus_routes_config["R4_WB_A_SB"]["dbl_enabled"] = False
+    control_panel.bus_routes_config["R4_WB_A_SB"]["tsp_enabled"] = False
+    bus = make_bus_for_leg("R4_WB_A_SB", 300, "R4_EARLY_ROUTE_MERGE")
+    bus.x = 610.0
+    bus.y = H_Y + 1.5 * LANE
+    bus.lane_index = 1
+    controller = SignalController({"green_time": 999})
+    starting_y = bus.y
+
+    bus.update(
+        signals_for("WB", "GREEN"),
+        INT_X,
+        H_Y,
+        ROAD_W,
+        STOP,
+        LANE,
+        [bus],
+        controller,
+    )
+
+    assert bus.route_merge_active is True
+    assert bus.route_merge_desired_y == H_Y + 2.5 * LANE
+    assert bus.y > starting_y
+
+
+def test_route_merge_target_lane_vehicle_behind_yields():
+    bus = make_bus_for_leg("R4_WB_A_SB", 300, "R4_COOPERATIVE_MERGE")
+    bus.x = 570.0
+    bus.y = H_Y + 1.5 * LANE
+    bus.lane_index = 1
+    follower = Vehicle(
+        620.0,
+        H_Y + 2.5 * LANE,
+        "WB",
+        max_speed=1.0,
+        lane_index=2,
+    )
+    follower.passed_nodes.add(700)
+    controller = SignalController({"green_time": 999})
+    vehicles = [bus, follower]
+
+    # The bus publishes the deterministic merge request; the vehicle behind
+    # then yields on its update while traffic ahead remains free to discharge.
+    bus.update(
+        signals_for("WB", "GREEN"),
+        INT_X,
+        H_Y,
+        ROAD_W,
+        STOP,
+        LANE,
+        vehicles,
+        controller,
+    )
+    follower.update(
+        signals_for("WB", "GREEN"),
+        INT_X,
+        H_Y,
+        ROAD_W,
+        STOP,
+        LANE,
+        vehicles,
+        controller,
+    )
+
+    assert bus.route_merge_active is True
+    assert follower.speed == 0.0
+
+
+def test_unresolved_route_merge_holds_near_previous_node_not_node_a():
+    bus = make_bus_for_leg("R4_WB_A_SB", 300, "R4_LINK_HOLD")
+    merge_x = bus.route_merge_point_x(700, ROAD_W)
+    assert merge_x == pytest.approx(
+        700 - ROAD_W / 2.0 - bus.length / 2.0 - ROUTE_MERGE_AREA_PX
+    )
+    bus.x = merge_x
+    bus.y = H_Y + 1.5 * LANE
+    bus.lane_index = 1
+    blocker = Vehicle(
+        merge_x - 25.0,
+        H_Y + 2.5 * LANE,
+        "WB",
+        max_speed=0.0,
+        lane_index=2,
+    )
+    blocker.passed_nodes.add(700)
+    controller = SignalController({"green_time": 999})
+    vehicles = [bus, blocker]
+    starting_x = bus.x
+
+    bus.update(
+        signals_for("WB", "GREEN"),
+        INT_X,
+        H_Y,
+        ROAD_W,
+        STOP,
+        LANE,
+        vehicles,
+        controller,
+    )
+
+    assert bus.route_merge_hold_active is True
+    assert bus.speed == 0.0
+    assert bus.x == starting_x
+    assert bus.distance_to_node_stop_bar(300, H_Y, ROAD_W, STOP) > 35.0
+
+
+def test_r4_completes_with_dbl_and_tsp_off_when_unobstructed():
+    """The deterministic route-lane plan is part of the base simulation."""
+    config = control_panel.bus_routes_config["R4_WB_A_SB"]
+    config["dbl_enabled"] = False
+    config["tsp_enabled"] = False
+    route_info = {
+        "route_id": "R4_WB_A_SB",
+        "origin": config["origin"],
+        "destination": config["destination"],
+        "waypoints": dict(config["waypoints"]),
+        "lanes": dict(config["lanes"]),
+    }
+    bus = Bus(
+        1040,
+        H_Y + 1.5 * LANE,
+        "WB",
+        route_info,
+        "R4_BASE_SIM",
+    )
+    controller = SignalController(
+        {"green_time": 30}, yellow_time=3, red_clearance_time=3
+    )
+
+    for _ in range(3000):
+        controller.update([bus])
+        bus.update(
+            controller.get_all_signals(INT_X),
+            INT_X,
+            H_Y,
+            ROAD_W,
+            STOP,
+            LANE,
+            [bus],
+            controller,
+        )
+        if bus.y > 660:
+            break
+
+    assert bus.passed_nodes == {700, 300}
+    assert bus.direction == "SB"
+    assert bus.y > 660
 
 
 @pytest.mark.parametrize(

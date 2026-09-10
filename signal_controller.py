@@ -175,6 +175,15 @@ class SignalController:
 
     def reset_all_state(self):
         """Restore construction-time runtime state while preserving configuration."""
+        try:
+            eligibility_px = float(
+                self.global_config.get("priority_eligibility_px", 500)
+            )
+        except (TypeError, ValueError, OverflowError):
+            eligibility_px = 500.0
+        # This episode snapshot changes only on construction or full reset, so
+        # moving the UI slider cannot alter an already-running benchmark.
+        self.priority_eligibility_px = max(250.0, min(800.0, eligibility_px))
         self.frame_number = 0
         self.nodes = {node_x: NodeState() for node_x in INT_X}
         self._request_sequence = 0
@@ -1045,7 +1054,20 @@ class SignalController:
                 result[approach] = GREEN
         return result
 
-    def get_green_time(self):
+    def get_green_time(self, node_x=None, phase=0):
+        """Green duration in frames for one node's current phase.
+
+        Webster splits are per node and per phase, so EW and NS no longer
+        share a single slider value. Falls back to the legacy green_time
+        when no calibration has run yet.
+        """
+        splits = self.global_config.get("webster_splits") or {}
+        node_split = splits.get(node_x) or splits.get(str(node_x))
+        if node_split:
+            key = "NS_green_frames" if phase == 3 else "EW_green_frames"
+            frames = node_split.get(key)
+            if isinstance(frames, (int, float)) and frames > 0:
+                return max(1, int(frames))
         return max(1, int(self.global_config.get("green_time", 240)))
 
     @staticmethod
@@ -1315,6 +1337,10 @@ class SignalController:
             node_x, h_y=H_Y, road_w=ROAD_W, stop_offset=STOP
         )
 
+    def get_priority_eligibility_px(self):
+        """Eligibility distance frozen for the current simulation episode."""
+        return self.priority_eligibility_px
+
     @staticmethod
     def _live_route_config(bus):
         live_cfg = control_panel.bus_routes_config.get(bus.route_id)
@@ -1330,7 +1356,7 @@ class SignalController:
         if not leg or leg["node_x"] != target_node:
             return False
         dist = self.distance_to_node_stop_bar(bus, target_node)
-        return 0 <= dist <= 250
+        return 0 <= dist <= self.get_priority_eligibility_px()
 
     def is_dbl_enabled_for_bus_leg(self, bus, target_node):
         """Return the same live DBL intent used by priority eligibility."""
@@ -1349,7 +1375,7 @@ class SignalController:
         if bus.lane_index != DBL_LANE_INDEX:
             return False
         dist = self.distance_to_node_stop_bar(bus, target_node)
-        return 0 <= dist <= 250
+        return 0 <= dist <= self.get_priority_eligibility_px()
 
     @staticmethod
     def _request_key(request):
@@ -1466,7 +1492,7 @@ class SignalController:
     def _normal_phase_update(self, node, vehicles, node_x):
         node.timer += 1
         if node.phase in (0, 3):
-            maximum = self.get_green_time()
+            maximum = self.get_green_time(node_x, node.phase)
         elif node.phase in (1, 4):
             maximum = self.yellow_time
         else:

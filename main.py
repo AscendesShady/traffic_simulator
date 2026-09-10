@@ -12,6 +12,7 @@ from pathlib import Path
 import canvas_gemini as canvas
 import control_panel
 import guard
+import webster
 from vehicle import Vehicle, Bus
 from signal_controller import SignalController
 from telemetry_exporter import TelemetryExporter
@@ -94,6 +95,28 @@ def apply_configured_random_seed():
     return None
 
 
+def apply_configured_vehicle_speed_scale():
+    """Snapshot the pending speed scale for the next traffic episode."""
+    try:
+        scale = float(control_panel.global_config.get("vehicle_speed_scale", 0.5))
+    except (TypeError, ValueError, OverflowError):
+        scale = 0.5
+    scale = max(0.25, min(1.0, scale))
+    control_panel.global_config["vehicle_speed_scale"] = scale
+    control_panel.global_config["_active_vehicle_speed_scale"] = scale
+    return scale
+
+
+def get_active_vehicle_speed_scale():
+    """Return the speed scale frozen at the most recent START/reset."""
+    try:
+        return float(
+            control_panel.global_config.get("_active_vehicle_speed_scale", 0.5)
+        )
+    except (TypeError, ValueError, OverflowError):
+        return 0.5
+
+
 def calculate_startup_window_layout(screen_width, screen_height):
     """Return screen-aware positions for control, canvas, and telemetry windows."""
     try:
@@ -124,7 +147,7 @@ def calculate_startup_window_layout(screen_width, screen_height):
                 f"{control_width}x{control_height}+{margin}+{margin}"
             ),
             "telemetry_geometry": (
-                f"{telemetry_width}x{min(780, telemetry_height)}+"
+                f"{telemetry_width}x{min(430, telemetry_height)}+"
                 f"{right_x}+{telemetry_y}"
             ),
         }
@@ -132,7 +155,7 @@ def calculate_startup_window_layout(screen_width, screen_height):
     # Small desktops cannot contain all three full interfaces without overlap.
     # Keep every window wholly on-screen and use a predictable cascade instead.
     telemetry_width = min(900, screen_width - 2 * margin)
-    telemetry_height = min(780, usable_height)
+    telemetry_height = min(430, usable_height)
     canvas_x = max(margin, (screen_width - canvas.WIDTH) // 2)
     control_x = max(margin, screen_width - control_width - margin)
     telemetry_x = max(margin, (screen_width - telemetry_width) // 2)
@@ -245,6 +268,220 @@ def _read_jsonl_rows(path):
     return rows
 
 
+DECISION_HEADER_BASE = [
+    "turn",
+    "timestamp",
+    "model",
+    "status",
+    "reason",
+    "pax_per_min_at_turn",
+]
+
+TELEMETRY_HEADER = [
+    "frame",
+    "sim_time_s",
+    "passengers_served_total",
+    "passengers_served_bus",
+    "passengers_served_car",
+    "buses_served",
+    "cars_served",
+    "pax_per_min_cumulative",
+    "pax_per_min_recent",
+    "vehicles_in_network",
+    "ai_armed",
+    "ai_last_status",
+    "queues_vehicles",
+    "queues_passengers_est",
+]
+
+# Mirrors the dashboard's sheet layout so a timed-test workbook and a manual
+# EXPORT ALL workbook can be compared column for column.
+LLM_PERFORMANCE_HEADERS = [
+    "turn",
+    "timestamp",
+    "model",
+    "status",
+    "latency_ms",
+    "input_tokens",
+    "output_tokens",
+    "tokens_per_sec",
+    "tsp_on_count",
+    "dbl_on_count",
+    "reason",
+    "pax_per_min_recent",
+]
+
+LLM_SUMMARY_HEADERS = [
+    "model",
+    "turns",
+    "guard_ok_pct",
+    "held_pct",
+    "avg_latency_ms",
+    "avg_tokens_per_sec",
+    "total_output_tokens",
+]
+
+
+def _write_decisions_sheet(sheet, decisions):
+    header = list(DECISION_HEADER_BASE)
+    for route_id in SESSION_ROUTE_IDS:
+        header.extend((f"{route_id}_tsp", f"{route_id}_dbl"))
+    header.extend(("locked_routes", "minimap", "raw_output"))
+    sheet.append(header)
+    for decision in decisions:
+        flags = decision.get("flags", {})
+        if not isinstance(flags, dict):
+            flags = {}
+        row = [
+            decision.get("turn"),
+            decision.get("timestamp"),
+            decision.get("model"),
+            decision.get("status"),
+            decision.get("reason", ""),
+            decision.get("pax_per_min_recent"),
+        ]
+        for route_id in SESSION_ROUTE_IDS:
+            route_flags = flags.get(route_id, {})
+            if not isinstance(route_flags, dict):
+                route_flags = {}
+            row.extend(
+                (
+                    bool(route_flags.get("tsp", False)),
+                    bool(route_flags.get("dbl", False)),
+                )
+            )
+        locked_routes = decision.get("locked_routes", [])
+        if not isinstance(locked_routes, (list, tuple, set, frozenset)):
+            locked_routes = []
+        row.extend(
+            (
+                ",".join(str(route_id) for route_id in locked_routes),
+                str(decision.get("minimap", ""))[:32767],
+                str(decision.get("raw_output", ""))[:32767],
+            )
+        )
+        sheet.append(row)
+
+
+def _write_telemetry_sheet(sheet, telemetry_rows):
+    sheet.append(list(TELEMETRY_HEADER))
+    for telemetry in telemetry_rows:
+        sheet.append(
+            [
+                telemetry.get("frame"),
+                telemetry.get("sim_time_s"),
+                telemetry.get("passengers_served_total"),
+                telemetry.get("passengers_served_bus"),
+                telemetry.get("passengers_served_car"),
+                telemetry.get("buses_served"),
+                telemetry.get("cars_served"),
+                telemetry.get("pax_per_min_cumulative"),
+                telemetry.get("pax_per_min_recent"),
+                telemetry.get("vehicles_in_network"),
+                telemetry.get("ai_armed"),
+                telemetry.get("ai_last_status"),
+                json.dumps(telemetry.get("queues_vehicles")),
+                json.dumps(telemetry.get("queues_passengers_est")),
+            ]
+        )
+
+
+def _flag_on_counts(decision):
+    flags = decision.get("flags", {})
+    if not isinstance(flags, dict):
+        return 0, 0
+    tsp_on = 0
+    dbl_on = 0
+    for route_flags in flags.values():
+        if not isinstance(route_flags, dict):
+            continue
+        tsp_on += route_flags.get("tsp") is True
+        dbl_on += route_flags.get("dbl") is True
+    return tsp_on, dbl_on
+
+
+def _numeric_or_none(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _write_llm_performance_sheet(sheet, decisions):
+    """Per-turn model metrics taken straight from the agent turn log."""
+    sheet.append(list(LLM_PERFORMANCE_HEADERS))
+    for decision in decisions:
+        tsp_on, dbl_on = _flag_on_counts(decision)
+        sheet.append(
+            [
+                decision.get("turn"),
+                decision.get("timestamp"),
+                str(decision.get("model", "None")),
+                str(decision.get("status", "UNKNOWN")),
+                decision.get("latency_ms"),
+                decision.get("input_tokens"),
+                decision.get("output_tokens"),
+                decision.get("tokens_per_sec"),
+                tsp_on,
+                dbl_on,
+                str(decision.get("reason", "") or "")[:32767],
+                decision.get("pax_per_min_recent"),
+            ]
+        )
+
+
+def _average_of(values):
+    numbers = [
+        number
+        for number in (_numeric_or_none(value) for value in values)
+        if number is not None
+    ]
+    return round(sum(numbers) / len(numbers), 2) if numbers else None
+
+
+def summarize_turn_log(decisions):
+    """Aggregate guard outcomes and model throughput across logged turns."""
+    rows = [row for row in decisions if isinstance(row, dict)]
+    turns = len(rows)
+    ok_turns = sum(row.get("status") == "OK" for row in rows)
+    held_turns = sum(row.get("status") == "HELD_ALL_OFF" for row in rows)
+    output_tokens = [
+        number
+        for number in (
+            _numeric_or_none(row.get("output_tokens")) for row in rows
+        )
+        if number is not None
+    ]
+    models = [str(row.get("model", "None")) for row in rows]
+    return {
+        "model": max(set(models), key=models.count) if models else "None",
+        "turns": turns,
+        "guard_ok_pct": round(ok_turns / turns * 100.0, 2) if turns else 0.0,
+        "held_pct": round(held_turns / turns * 100.0, 2) if turns else 0.0,
+        "avg_latency_ms": _average_of(row.get("latency_ms") for row in rows),
+        "avg_tokens_per_sec": _average_of(
+            row.get("tokens_per_sec") for row in rows
+        ),
+        "total_output_tokens": sum(output_tokens) if output_tokens else 0.0,
+    }
+
+
+def _write_llm_summary_sheet(sheet, decisions):
+    sheet.append(list(LLM_SUMMARY_HEADERS))
+    rollup = summarize_turn_log(decisions)
+    if rollup["turns"]:
+        sheet.append(
+            [
+                rollup["model"],
+                rollup["turns"],
+                rollup["guard_ok_pct"],
+                rollup["held_pct"],
+                rollup["avg_latency_ms"],
+                rollup["avg_tokens_per_sec"],
+                rollup["total_output_tokens"],
+            ]
+        )
+
+
 def export_session_excel(output_path=None):
     """Build a two-sheet workbook from the crash-safe session JSONL logs."""
     try:
@@ -262,91 +499,10 @@ def export_session_excel(output_path=None):
         workbook = Workbook()
         decisions_sheet = workbook.active
         decisions_sheet.title = "Decisions"
-        decision_header = [
-            "turn",
-            "timestamp",
-            "model",
-            "status",
-            "reason",
-            "pax_per_min_at_turn",
-        ]
-        for route_id in SESSION_ROUTE_IDS:
-            decision_header.extend(
-                (f"{route_id}_tsp", f"{route_id}_dbl")
-            )
-        decision_header.extend(("locked_routes", "minimap", "raw_output"))
-        decisions_sheet.append(decision_header)
-        for decision in decisions:
-            flags = decision.get("flags", {})
-            if not isinstance(flags, dict):
-                flags = {}
-            row = [
-                decision.get("turn"),
-                decision.get("timestamp"),
-                decision.get("model"),
-                decision.get("status"),
-                decision.get("reason", ""),
-                decision.get("pax_per_min_recent"),
-            ]
-            for route_id in SESSION_ROUTE_IDS:
-                route_flags = flags.get(route_id, {})
-                if not isinstance(route_flags, dict):
-                    route_flags = {}
-                row.extend(
-                    (
-                        bool(route_flags.get("tsp", False)),
-                        bool(route_flags.get("dbl", False)),
-                    )
-                )
-            locked_routes = decision.get("locked_routes", [])
-            if not isinstance(locked_routes, (list, tuple, set, frozenset)):
-                locked_routes = []
-            row.extend(
-                (
-                    ",".join(str(route_id) for route_id in locked_routes),
-                    str(decision.get("minimap", ""))[:32767],
-                    str(decision.get("raw_output", ""))[:32767],
-                )
-            )
-            decisions_sheet.append(row)
-
-        telemetry_sheet = workbook.create_sheet("Telemetry")
-        telemetry_header = [
-            "frame",
-            "sim_time_s",
-            "passengers_served_total",
-            "passengers_served_bus",
-            "passengers_served_car",
-            "buses_served",
-            "cars_served",
-            "pax_per_min_cumulative",
-            "pax_per_min_recent",
-            "vehicles_in_network",
-            "ai_armed",
-            "ai_last_status",
-            "queues_vehicles",
-            "queues_passengers_est",
-        ]
-        telemetry_sheet.append(telemetry_header)
-        for telemetry in telemetry_rows:
-            telemetry_sheet.append(
-                [
-                    telemetry.get("frame"),
-                    telemetry.get("sim_time_s"),
-                    telemetry.get("passengers_served_total"),
-                    telemetry.get("passengers_served_bus"),
-                    telemetry.get("passengers_served_car"),
-                    telemetry.get("buses_served"),
-                    telemetry.get("cars_served"),
-                    telemetry.get("pax_per_min_cumulative"),
-                    telemetry.get("pax_per_min_recent"),
-                    telemetry.get("vehicles_in_network"),
-                    telemetry.get("ai_armed"),
-                    telemetry.get("ai_last_status"),
-                    json.dumps(telemetry.get("queues_vehicles")),
-                    json.dumps(telemetry.get("queues_passengers_est")),
-                ]
-            )
+        _write_decisions_sheet(decisions_sheet, decisions)
+        _write_telemetry_sheet(
+            workbook.create_sheet("Telemetry"), telemetry_rows
+        )
 
         destination = (
             Path(output_path)
@@ -364,6 +520,184 @@ def export_session_excel(output_path=None):
         return None
 
 
+CONTROL_INPUT_HEADERS = ["section", "parameter", "value"]
+
+
+def control_panel_input_rows():
+    """Flatten every operator-set input into section/parameter/value rows.
+
+    Kept as a flat table so a new config key never breaks the sheet, and so a
+    workbook records exactly which inputs produced it.
+    """
+    config = control_panel.global_config
+    ai_runtime = config.get("ai_runtime", {}) or {}
+    rows = [
+        ("Global", "random_seed", config.get("random_seed")),
+        ("Global", "sim_speed", config.get("sim_speed")),
+        ("Global", "test_duration_sim_seconds",
+         config.get("test_duration_sim_seconds")),
+        ("Global", "discharge_selection", config.get("discharge_selection")),
+        ("Global", "llm_model", ai_runtime.get("model", "None")),
+        ("Global", "llm_tick_seconds", ai_runtime.get("tick_seconds")),
+        ("Global", "llm_armed", bool(ai_runtime.get("armed", False))),
+        # Signal timing is derived output rather than an operator input. It is
+        # recorded here so the exported run remains fully reproducible.
+        ("Signal timing", "measured_saturation_flow_veh_per_hr",
+         config.get("measured_saturation_flow")),
+    ]
+    for node_x, split in (config.get("webster_splits") or {}).items():
+        section = f"Signal timing: node {node_x}"
+        rows.extend(
+            (
+                (section, "EW_green_sec", split.get("EW_green_sec")),
+                (section, "NS_green_sec", split.get("NS_green_sec")),
+                (section, "EW_green_frames", split.get("EW_green_frames")),
+                (section, "NS_green_frames", split.get("NS_green_frames")),
+                (section, "cycle_time_sec", split.get("cycle_time_sec")),
+                (section, "cycle_time_frames", split.get("cycle_time_frames")),
+                (section, "lost_time_sec", split.get("lost_time_sec")),
+                (section, "cycle_source", split.get("cycle_source")),
+                (section, "y_ew", split.get("y_ew")),
+                (section, "y_ns", split.get("y_ns")),
+                (section, "Y", split.get("Y")),
+                (section, "oversaturated", split.get("oversaturated")),
+                (section, "webster_optimal_cycle_sec",
+                 split.get("webster_optimal_cycle_sec")),
+            )
+        )
+    for key, name in control_panel.APPROACH_NAMES.items():
+        approach = control_panel.approach_configs.get(key, {})
+        section = f"Approach: {name}"
+        rows.extend(
+            (
+                (section, "active", bool(approach.get("active", False))),
+                (section, "generation_model", approach.get("model")),
+                (section, "inflow_rate_veh_per_min", approach.get("rate")),
+                (section, "turn_split", approach.get("turn_split")),
+                (section, "heavy_ratio", approach.get("heavy_ratio")),
+            )
+        )
+    for route_id, route in control_panel.bus_routes_config.items():
+        section = f"Route: {route_id}"
+        rows.extend(
+            (
+                (section, "name", route.get("name")),
+                (section, "active", bool(route.get("active", False))),
+                (section, "headway_sec", route.get("headway_sec")),
+                (section, "tsp_enabled", bool(route.get("tsp_enabled", False))),
+                (section, "dbl_enabled", bool(route.get("dbl_enabled", False))),
+                (section, "manual_dispatch",
+                 bool(route.get("manual_dispatch", False))),
+            )
+        )
+    return rows
+
+
+def write_control_panel_inputs_sheet(sheet):
+    """Write the operator-input table onto an open worksheet."""
+    sheet.append(list(CONTROL_INPUT_HEADERS))
+    for row in control_panel_input_rows():
+        sheet.append(list(row))
+    return sheet
+
+
+def build_test_export_filename(
+    model, duration_sim_seconds, seed, timestamp=None
+):
+    """Self-documenting workbook name: model, sim-duration, seed, wall clock."""
+    model_name = str(model or "None")
+    model_tag = (
+        model_name.replace(":", "-").replace("/", "-")
+        if model_name != "None"
+        else "baseline"
+    )
+    duration_tag = f"{int((duration_sim_seconds or 0) // 60)}min"
+    seed_tag = f"seed{seed}" if seed is not None else "seedNone"
+    stamp = timestamp or time.strftime("%Y%m%d_%H%M%S")
+    return f"test_{model_tag}_{duration_tag}_{seed_tag}_{stamp}.xlsx"
+
+
+def export_test_workbook(
+    model, duration_sim_seconds, seed, destination=None
+):
+    """Write the four-sheet benchmark workbook for one completed timed test.
+
+    Runs entirely inside the simulator process: every sheet is built from the
+    crash-safe JSONL logs on disk, so no dashboard handshake is required.
+    """
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print("openpyxl not installed; skipping test export")
+        return None
+
+    decisions = _read_jsonl_rows(AGENT_TURN_LOG_PATH)
+    telemetry_rows = _read_jsonl_rows(TELEMETRY_LOG_PATH)
+
+    try:
+        workbook = Workbook()
+        decisions_sheet = workbook.active
+        decisions_sheet.title = "Decisions"
+        _write_decisions_sheet(decisions_sheet, decisions)
+        _write_telemetry_sheet(
+            workbook.create_sheet("Telemetry"), telemetry_rows
+        )
+        _write_llm_performance_sheet(
+            workbook.create_sheet("LLM Performance"), decisions
+        )
+        _write_llm_summary_sheet(
+            workbook.create_sheet("LLM Summary"), decisions
+        )
+        write_control_panel_inputs_sheet(
+            workbook.create_sheet("Control Panel Inputs")
+        )
+
+        if destination is None:
+            destination = EXCEL_EXPORT_DIR / build_test_export_filename(
+                model, duration_sim_seconds, seed
+            )
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        workbook.save(destination)
+        workbook.close()
+        print(f"Timed test exported: {destination}")
+        return destination
+    except Exception as exc:
+        print(f"Timed test export warning: {exc}")
+        return None
+
+
+def timed_test_is_complete(master_frame_count):
+    """True once a running timed test has reached its sim-time duration.
+
+    The comparison is on simulation_time_seconds (frames / 60), which is the
+    same clock telemetry reports, so render speed cannot change run length.
+    """
+    config = control_panel.global_config
+    if not config.get("test_running", False):
+        return False
+    duration = config.get("test_duration_sim_seconds")
+    if not duration:
+        return False
+    simulation_time_seconds = master_frame_count / 60.0
+    return simulation_time_seconds >= float(duration)
+
+
+def finish_timed_test(master_frame_count):
+    """Stop the run at its configured sim-time and export the workbook."""
+    config = control_panel.global_config
+    config["is_running"] = False
+    config["test_running"] = False
+    destination = export_test_workbook(
+        config.get("test_model", "None"),
+        config.get("test_duration_sim_seconds"),
+        config.get("test_seed"),
+    )
+    config["test_last_export"] = destination.name if destination else ""
+    control_panel.write_ai_control()
+    return destination
+
+
 def _set_ai_flags(flags):
     for route_id, route_flags in flags.items():
         route_config = control_panel.bus_routes_config[route_id]
@@ -374,6 +708,14 @@ def _set_ai_flags(flags):
 def merge_ai_decision(path=None):
     """Validate and merge one file-based AI decision into live route config."""
     runtime = control_panel.global_config.setdefault("ai_runtime", {})
+    # Only an explicitly recorded "None" selection means a baseline run. An
+    # absent key leaves the generic merge path alone, so callers that drive
+    # decisions without a model selector keep working.
+    if "model" in runtime and str(runtime["model"]) == "None":
+        # There is no decision to wait for, and a decision file left over from
+        # an earlier model must not leak into the unaided run.
+        runtime["last_status"] = control_panel.BASELINE_NO_MODEL
+        return False
     decision_path = DECISION_PATH if path is None else Path(path)
     try:
         with decision_path.open("r", encoding="utf-8") as decision_file:
@@ -439,18 +781,213 @@ def reset_all_spawner_states():
 def reset_traffic_generation():
     """Reset every traffic source and restart its configured RNG sequence."""
     reset_all_spawner_states()
+    # Freeze motion tuning for the episode. Slider changes made during a run
+    # therefore cannot change the speed of only later arrivals.
+    apply_configured_vehicle_speed_scale()
     return apply_configured_random_seed()
+
+
+# --- Webster saturation-flow calibration ------------------------------------
+# Capacity here depends on the configured speed scale and vehicle mix, so the
+# saturation flow S that Webster needs is measured fresh at every run start
+# rather than hardcoded. The method is the HCM queue discharge: build a
+# standing queue behind red, release it with no new arrivals, discard the
+# startup vehicles and take the mean headway of the rest.
+CALIBRATION_APPROACH = "EB"
+CALIBRATION_SPAWN_X = -900          # Upstream of the canvas: real queue storage
+CALIBRATION_TARGET_QUEUE = 30       # Measured: 12 gives sd +/-920 veh/hr
+                                    # (+/-27%), 30 lands within ~3% of a
+                                    # careful 5-seed reference for ~1-2s
+CALIBRATION_BUILD_LIMIT_SEC = 180.0
+CALIBRATION_DISCHARGE_LIMIT_SEC = 120.0
+CALIBRATION_STARTUP_VEHICLES = 4    # Startup lost time, excluded per HCM
+CALIBRATION_BUILD_VEH_PER_MIN = 120
+CALIBRATION_SEED_FALLBACK = 20260909
+DEFAULT_SATURATION_FLOW = 1366.0    # Only used if a calibration run yields none
+
+
+def _calibration_signals(green):
+    """Force the measured approach red or green, with node B always green."""
+    measured = "GREEN" if green else "RED"
+    return {
+        canvas.INT_X[0]: {
+            "EB": measured, "WB": "RED", "NB": "RED", "SB": "RED",
+        },
+        canvas.INT_X[1]: {
+            "EB": "GREEN", "WB": "RED", "NB": "RED", "SB": "RED",
+        },
+    }
+
+
+def calibrate_saturation_flow(
+    speed_scale, heavy_ratio, seed=None, target_queue=CALIBRATION_TARGET_QUEUE
+):
+    """Measure saturation flow (veh/hr/lane) by discharging a standing queue.
+
+    Deterministic for a given seed. Runs headless and leaves no vehicles
+    behind; the caller re-seeds traffic generation afterwards so the measured
+    run itself starts from a clean RNG.
+    """
+    from signal_controller import SignalController
+
+    approach_cfg = dict(control_panel.approach_configs[CALIBRATION_APPROACH])
+    approach_cfg.update(
+        {
+            "active": True,
+            "model": "Poisson",
+            "rate": CALIBRATION_BUILD_VEH_PER_MIN,
+            "turn_split": 1.0,          # all straight: a single-lane measure
+            "heavy_ratio": heavy_ratio,
+        }
+    )
+    lane_y = canvas.H_Y - 1.5 * canvas.LANE
+    lane_coords = [lane_y, lane_y, lane_y]
+
+    previous_scale = control_panel.global_config.get(
+        "_active_vehicle_speed_scale", speed_scale
+    )
+    control_panel.global_config["_active_vehicle_speed_scale"] = speed_scale
+    random.seed(CALIBRATION_SEED_FALLBACK if seed is None else seed)
+    reset_all_spawner_states()
+
+    controller = SignalController(
+        {"green_time": 240, "is_running": True},
+        yellow_time=60,
+        red_clearance_time=60,
+    )
+    vehicles = []
+    upstream = {}
+
+    def queued():
+        return [
+            vehicle
+            for vehicle in vehicles
+            if vehicle.is_front_bumper_upstream(
+                canvas.INT_X[0], canvas.H_Y, canvas.ROAD_W, canvas.STOP
+            )
+        ]
+
+    def step(signals, spawning):
+        if spawning:
+            try_spawn_vehicle(
+                vehicles, CALIBRATION_APPROACH, CALIBRATION_APPROACH,
+                CALIBRATION_SPAWN_X, lane_coords, approach_cfg, min_gap=40,
+            )
+        crossings = 0
+        for vehicle in list(vehicles):
+            key = id(vehicle)
+            if key not in upstream:
+                upstream[key] = vehicle.is_front_bumper_upstream(
+                    canvas.INT_X[0], canvas.H_Y, canvas.ROAD_W, canvas.STOP
+                )
+            vehicle.update(
+                signals, canvas.INT_X, canvas.H_Y,
+                road_w=canvas.ROAD_W, stop_offset=canvas.STOP,
+                lane_w=canvas.LANE, all_vehicles=vehicles,
+                signal_controller=controller,
+            )
+            after = vehicle.is_front_bumper_upstream(
+                canvas.INT_X[0], canvas.H_Y, canvas.ROAD_W, canvas.STOP
+            )
+            if upstream[key] and not after:
+                crossings += 1
+            upstream[key] = after
+        controller.update(vehicles)
+        vehicles[:] = [v for v in vehicles if v.x <= canvas.WIDTH + 150]
+        return crossings
+
+    red = _calibration_signals(False)
+    for _ in range(int(CALIBRATION_BUILD_LIMIT_SEC * 60)):
+        step(red, spawning=True)
+        if len(queued()) >= target_queue:
+            break
+
+    green = _calibration_signals(True)
+    crossing_frames = []
+    for frame in range(int(CALIBRATION_DISCHARGE_LIMIT_SEC * 60)):
+        for _ in range(step(green, spawning=False)):
+            crossing_frames.append(frame)
+        if not queued():
+            break
+
+    control_panel.global_config["_active_vehicle_speed_scale"] = previous_scale
+
+    headways = [
+        (later - earlier) / 60.0
+        for earlier, later in zip(crossing_frames, crossing_frames[1:])
+    ][CALIBRATION_STARTUP_VEHICLES:]
+    if not headways:
+        return DEFAULT_SATURATION_FLOW
+    mean_headway = sum(headways) / len(headways)
+    if mean_headway <= 0:
+        return DEFAULT_SATURATION_FLOW
+    return 3600.0 / mean_headway
+
+
+def representative_heavy_ratio():
+    """Mean heavy-vehicle share across the configured approaches."""
+    ratios = [
+        float(cfg.get("heavy_ratio", 0.1))
+        for cfg in control_panel.approach_configs.values()
+    ]
+    return sum(ratios) / len(ratios) if ratios else 0.1
+
+
+def calibrate_and_apply_webster(signals):
+    """Measure S and publish Webster splits before the run clock starts."""
+    config = control_panel.global_config
+    config["calibrating"] = True
+    try:
+        saturation = calibrate_saturation_flow(
+            config.get("vehicle_speed_scale", 0.5),
+            representative_heavy_ratio(),
+            config.get("random_seed"),
+        )
+        config["measured_saturation_flow"] = round(saturation, 0)
+        # Tolerate controllers that do not expose the interlock timings,
+        # falling back to the production defaults rather than failing a reset.
+        lost_time = webster.lost_time_seconds(
+            getattr(signals, "yellow_time", 60),
+            getattr(signals, "red_clearance_time", 60),
+        )
+        splits = webster.compute_all_nodes(
+            control_panel.approach_configs,
+            saturation,
+            lost_time_sec=lost_time,
+        )
+        config["webster_splits"] = splits
+        config["cycle_time_sec"] = {
+            node_x: split["cycle_time_sec"] for node_x, split in splits.items()
+        }
+        cycle_summary = ", ".join(
+            f"node {node_x}={split['cycle_time_sec']:.1f}s"
+            for node_x, split in splits.items()
+        )
+        print(
+            f"[WEBSTER] S={saturation:.0f} veh/hr  "
+            f"cycles=({cycle_summary})  "
+            f"lost={lost_time:.1f}s  splits={splits}"
+        )
+        return saturation, splits
+    finally:
+        config["calibrating"] = False
 
 
 def perform_full_reset(vehicles, signals, telemetry=None):
     """Restore all per-run simulation state and return the frame-zero value."""
     vehicles.clear()
-    reset_traffic_generation()
     signals.reset_all_state()
     if telemetry is not None:
         telemetry.reset_session()
     reset_session_logs()
     network_throughput.update({key: 0 for key in network_throughput})
+    # Calibration consumes its own seeded RNG, so traffic generation is
+    # reset afterwards and the measured run still starts from the
+    # configured seed.
+    calibrate_and_apply_webster(signals)
+    reset_traffic_generation()
+    # Frame zero is returned only after S is locked: calibration is
+    # setup, not part of the measured run.
     return 0
 
 
@@ -647,7 +1184,12 @@ def try_spawn_vehicle(vehicles, approach_key, direction, spawn_coord, lane_coord
     heavy_ratio = approach_cfg.get("heavy_ratio", 0.10)
     is_heavy = random.random() < heavy_ratio
 
-    speed = random.uniform(0.8, 1.1) if is_heavy else random.uniform(1.0, 1.4)
+    base_speed = (
+        random.uniform(0.8, 1.1)
+        if is_heavy
+        else random.uniform(1.0, 1.4)
+    )
+    speed = base_speed * get_active_vehicle_speed_scale()
     colors = [(50, 150, 250), (250, 100, 50), (250, 200, 50), (150, 50, 250), (50, 200, 150)]
     color = (120, 120, 140) if is_heavy else random.choice(colors)
 
@@ -739,7 +1281,8 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
 
             vehicles.append(Bus(
                 x=spawn_coord, y=target_lane_coord, direction=direction,
-                route_info=route_info, bus_id=unique_bus_id
+                route_info=route_info, bus_id=unique_bus_id,
+                max_speed=1.0 * get_active_vehicle_speed_scale(),
             ))
 
 
@@ -850,6 +1393,7 @@ def main():
             control_panel.global_config["reset_triggered"] = False
             control_panel.global_config["is_running"] = True
             control_panel.global_config["run_has_started"] = True
+            control_panel.global_config["test_last_export"] = ""
             control_panel.global_config["start_requested"] = False
             control_panel.write_ai_control()
             run_just_reset = True
@@ -938,6 +1482,26 @@ def main():
         else:
             # Paused wall time must never become a catch-up burst on resume.
             time_accumulator = 0.0
+
+        # Calibration is setup, not part of the measured run: while it is
+        # in progress the frame counter, the published sim clock and the
+        # timed-test countdown all stay frozen at zero.
+        if control_panel.global_config.get("calibrating", False):
+            root.after(16, simulation_step)
+            return
+
+        # Publish the simulation clock so the control panel can count a timed
+        # test down in sim-time, matching the clock the auto-stop uses.
+        control_panel.global_config["sim_time_seconds"] = round(
+            master_frame_count / 60.0, 1
+        )
+
+        # A timed benchmark ends on the SIMULATION clock, never the wall clock,
+        # so the same duration means the same amount of simulated traffic on
+        # any machine regardless of render speed.
+        if timed_test_is_complete(master_frame_count):
+            finish_timed_test(master_frame_count)
+            is_running = False
 
         active_signal_data = signals.get_all_signals(canvas.INT_X)
         active_dbl_data = signals.get_all_dbl_states(canvas.INT_X, vehicles)

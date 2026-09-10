@@ -677,13 +677,118 @@ def test_minimap_still_has_routes_and_nodes():
     assert "passengers_per_minute=80.0" in minimap
     assert "passengers_per_minute_recent=95.0" in minimap
     assert 'queues_passengers_est={"EB": 20, "WB": 12}' in minimap
-    assert "NODES:" in minimap
-    assert "node=300 phase=EW_GREEN" in minimap
-    assert "node=780 phase=NS_GREEN" in minimap
+    assert "NODE_SUMMARY:" in minimap
+    assert "NODE 300: phase=EW_GREEN" in minimap
+    assert "NODE 780: phase=NS_GREEN" in minimap
     assert "ROUTES:" in minimap
     for position, route_id in enumerate(guard.ROUTE_ORDER, start=1):
         assert f"{position}) {route_id}:" in minimap
     assert "approaching_buses=0 none approaching" in minimap
+
+
+def test_minimap_node_summary_has_approach_queues_and_actionable_bus():
+    telemetry = {
+        "simulation_time_seconds": 20.0,
+        "routes": {
+            route_id: {
+                "active": True,
+                "tsp_enabled": False,
+                "dbl_enabled": False,
+            }
+            for route_id in guard.ROUTE_ORDER
+        },
+        "network_summary": {"queues_passengers_est": {}},
+        "signal_state": {
+            "nodes": {
+                "300": {
+                    "phase": "NS_GREEN",
+                    "signals": {
+                        "EB": "RED", "WB": "RED", "NB": "GREEN", "SB": "GREEN"
+                    },
+                    "queues_passengers_est": {
+                        "EB": 48, "WB": 32, "NB": 12, "SB": 8
+                    },
+                },
+                "700": {
+                    "phase": "EW_GREEN",
+                    "signals": {
+                        "EB": "GREEN", "WB": "GREEN", "NB": "RED", "SB": "RED"
+                    },
+                    "queues_passengers_est": {
+                        "EB": 20, "WB": 60, "NB": 40, "SB": 16
+                    },
+                },
+            }
+        },
+        "active_buses": [
+            {
+                "bus_id": "STRATEGY_BUS",
+                "route_id": "R1_EB_A_NB",
+                "direction": "EB",
+                "route_leg": {
+                    "node_x": 300,
+                    "approach": "EB",
+                    "movement": "LEFT",
+                },
+                "leg_state": "APPROACHING",
+                "distance_to_stop_bar_px": 400.0,
+                "eta_to_stop_bar_sec_freeflow": 16.0,
+                "passengers": 45,
+                "priority_granted": False,
+            }
+        ],
+    }
+
+    minimap = agent.read_minimap(
+        agent_state(telemetry=telemetry, decision_lag_sec=8.0)
+    )["minimap"]
+    node_300 = next(
+        line for line in minimap.splitlines() if line.startswith("- NODE 300:")
+    )
+    node_700 = next(
+        line for line in minimap.splitlines() if line.startswith("- NODE 700:")
+    )
+
+    assert "waiting_pax: EB=48 WB=32 NB=12 SB=8 (total=100)" in node_300
+    assert "actionable_bus: EB(45pax/1bus)" in node_300
+    assert "exclusive GREEN and sets all others RED" in node_300
+    assert "waiting_pax: EB=20 WB=60 NB=40 SB=16 (total=136)" in node_700
+    assert "actionable_bus: none" in node_700
+
+
+def test_prompt_frames_congestion_as_failure_and_restraint_as_default():
+    prompt = " ".join(agent.SYSTEM_PROMPT.split())
+
+    assert "already running Webster-optimal timing" in prompt
+    assert "CONGESTION IS FAILURE" in prompt
+    assert "DEFAULT TO RESTRAINT" in prompt
+    assert "all flags false is a good, safe decision" in prompt
+    assert "Granting priority to every approaching bus is WRONG" in (
+        prompt
+    )
+    assert "clearly exceed the cross-traffic passengers" in prompt
+    assert "AT MOST one or two approaches per node per turn" in (
+        prompt
+    )
+    # The positional schema is untouched by the reframing: same keys, same
+    # array lengths, same types.
+    schema = json.loads(agent.OUTPUT_SCHEMA)
+    assert set(schema) == {"reason", "tsp", "dbl"}
+    assert schema["tsp"] == [False] * len(guard.ROUTE_ORDER)
+    assert schema["dbl"] == [False] * len(guard.ROUTE_ORDER)
+    assert isinstance(schema["reason"], str)
+
+    # Throughput-maximising language licenses the over-granting this prompt
+    # exists to stop, so it must not survive anywhere the model reads --
+    # including the schema placeholder, which is interpolated into the prompt.
+    assert "maximize" not in agent.SYSTEM_PROMPT
+    assert "maximize" not in agent.OUTPUT_SCHEMA
+    assert agent.OUTPUT_SCHEMA in agent.SYSTEM_PROMPT
+
+    # The latency, DBL-obstruction and per-node rules are unchanged.
+    assert "eta_at_decision_land_sec" in prompt
+    assert "dbl_lane_obstructed=true" in prompt
+    assert "DECISION_LAG_SEC" in prompt
 
 
 def test_granted_route_stays_locked_through_clearing():

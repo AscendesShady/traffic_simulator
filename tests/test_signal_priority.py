@@ -330,7 +330,7 @@ def test_queued_timeout_is_terminal_and_cannot_renew_in_place():
     assert controller._request_sequence == 2
 
     # Leaving the eligibility zone for one update allows an explicit new attempt.
-    queued.x = -100
+    queued.x = -controller.get_priority_eligibility_px()
     controller.update([first, queued])
     queued.x = 190
     controller.update([first, queued])

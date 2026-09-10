@@ -47,6 +47,14 @@ DEFAULT_CONTROL = {
     "simulation_running": False,
 }
 FRAME_RESET_MARGIN = 100
+# A decision does not land instantly: the model needs seconds to answer, and
+# traffic keeps moving meanwhile. The previous turn's measured latency is the
+# best available predictor of this turn's, since a given model is consistent
+# turn to turn.
+DEFAULT_DECISION_LAG_SEC = 8.0
+# Beyond this many seconds a bus is too far out for a flag decided now to be
+# the right call; it will be reconsidered on a later turn.
+ACTIONABLE_HORIZON_SEC = 45.0
 GEMINI_TIMEOUT_SECONDS = 30.0
 OLLAMA_TIMEOUT_SECONDS = 45.0
 _GEMINI_CLIENT = None
@@ -57,8 +65,8 @@ _OLLAMA_CALL_LOCK = threading.Lock()
 OUTPUT_SCHEMA = json.dumps(
     {
         "reason": (
-            "<one sentence: why these flags maximize passenger throughput "
-            "this turn>"
+            "<one sentence: why this turn's grants are worth the "
+            "cross-traffic delay they cause, or why none was justified>"
         ),
         "tsp": [False for _ in guard.ROUTE_ORDER],
         "dbl": [False for _ in guard.ROUTE_ORDER],
@@ -89,13 +97,41 @@ ROUTE_ORDER_TEXT = "\n".join(
     f"{position}) {route_id}"
     for position, route_id in enumerate(guard.ROUTE_ORDER, start=1)
 )
-SYSTEM_PROMPT = f"""You control TSP and DBL flags for one traffic network.
-Your objective is to maximize passengers_per_minute across the whole network.
+SYSTEM_PROMPT = f"""The signals are already running Webster-optimal timing,
+which handles normal traffic well. Your job is NOT to take over. Make
+occasional, surgical priority grants ONLY when a bus clearly carries enough
+passengers to justify the delay it imposes on cross-traffic. Most turns, the
+right answer is little or no priority. You are a light touch on top of a
+competent baseline, not the primary controller.
+
+CONGESTION IS FAILURE. The worst outcome is a network filling with stopped
+vehicles. Watch total waiting passengers and vehicles across the network. If
+you grant priority and the network gets MORE congested, you made it worse.
+Every priority grant to a bus takes green from cross-traffic and risks backing
+it up. A grant is only correct if the passengers it serves clearly outweigh
+the cross-traffic passengers it delays.
+
+DEFAULT TO RESTRAINT. When you are not confident a grant clearly improves
+passenger flow, grant nothing. A turn with all flags false is a good, safe
+decision whenever no bus decisively outweighs its cross-traffic cost. Granting
+priority to every approaching bus is WRONG: it starves cross-traffic and
+congests the network. Grant priority only to the single most valuable
+bus-approach when its benefit is clear, and often to none.
+
+Do not treat routes independently. Each node is a shared resource, and giving
+one route priority takes green from its cross-traffic. Compare directly: a bus
+carries about 45 passengers. Cross-traffic on the approach you would red
+carries queues_passengers_est passengers. Only grant priority if the bus's 45
+passengers clearly exceed the cross-traffic passengers you would delay. If the
+cross-traffic queue is already large, do NOT add priority: you would deepen a
+queue already costing more passenger-time than the bus saves.
+
+Prefer granting priority to AT MOST one or two approaches per node per turn.
+Blanket priority across many routes at once congests the whole network. This is
+the most common mistake. Fewer, well-justified grants beat many eager ones.
 
 TSP gives an approaching bus an early or extended green at its target node.
-DBL enables the dynamic bus lane for that route. A 45-passenger bus can justify
-priority, but unnecessary priority delays cross traffic. Use
-queues_passengers_est to account for that tradeoff.
+DBL enables the dynamic bus lane for that route.
 
 The route positions are fixed in this exact order:
 {ROUTE_ORDER_TEXT}
@@ -106,8 +142,8 @@ on. Never write route IDs as JSON keys. Use strict JSON booleans and do not add
 markdown, analysis, or extra keys:
 {OUTPUT_SCHEMA}
 
-"reason" must be one sentence under about 40 words stating the main throughput
-justification for this turn's flag choices. Keep it on one line, with no line
+"reason" must be one sentence under about 40 words weighing the passengers
+served against the cross-traffic delayed by this turn's flag choices. Keep it on one line, with no line
 breaks and no quotation marks inside it if avoidable. The "tsp" and "dbl"
 arrays matter most: each must contain exactly {len(guard.ROUTE_ORDER)} booleans.
 
@@ -120,6 +156,19 @@ minimap THIS turn:
   approaching bus gains nothing from priority and only delays cross traffic.
 - Only set tsp or dbl true for a route that has an approaching bus this turn
   AND where priority improves passenger throughput.
+
+Your decision does not take effect instantly. DECISION_LAG_SEC tells you how
+many seconds pass between this snapshot and when your flags apply. During that
+time buses keep moving. For each route, eta_at_decision_land_sec is where the
+bus will be when your decision actually takes effect:
+
+- If eta_at_decision_land_sec <= 0 the bus will already be at or past the node
+  before your flag applies, so enabling priority for it is WASTED: the green
+  fires for empty space. Set it false.
+- Prefer routes showing actionable=true: that bus arrives AFTER your decision
+  lands and soon enough to benefit from it.
+- You are aiming your decision at the near future, not the present. Think about
+  where traffic will BE, not where it IS.
 
 DBL only helps if the bus can actually enter the dynamic bus lane. If a route
 shows dbl_lane_obstructed=true, do NOT enable dbl for that route: the bus
@@ -146,6 +195,7 @@ class AgentState(TypedDict):
     recent_decisions: list
     turn: int
     model: str
+    decision_lag_sec: float
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -300,6 +350,33 @@ def _finite_nonnegative(value, default=None):
     return number
 
 
+def decision_lag_seconds(latency_ms) -> float:
+    """Seconds a decision is expected to take, from the last measured call.
+
+    Falls back to DEFAULT_DECISION_LAG_SEC on the first turn or whenever the
+    previous call reported no usable latency, so the loop always has a horizon.
+    """
+    seconds = _finite_nonnegative(latency_ms)
+    if seconds is None or seconds <= 0:
+        return DEFAULT_DECISION_LAG_SEC
+    return round(float(seconds) / 1000.0, 1)
+
+
+def eta_at_decision_land(eta_sec, decision_lag_sec):
+    """Where a bus will be, in seconds from the stop bar, when flags apply."""
+    eta = _finite_nonnegative(eta_sec)
+    if eta is None:
+        return None
+    return round(float(eta) - float(decision_lag_sec), 1)
+
+
+def is_actionable(landed_eta_sec) -> bool:
+    """True when the bus arrives after the decision lands and soon enough."""
+    if landed_eta_sec is None:
+        return False
+    return 0 < landed_eta_sec < ACTIONABLE_HORIZON_SEC
+
+
 def actionable_buses(telemetry: dict) -> dict[str, list[dict]]:
     """Return only buses still approaching a real unfinished route leg."""
     by_route = {route_id: [] for route_id in guard.VALID_ROUTES}
@@ -384,22 +461,79 @@ def read_minimap(state: AgentState) -> dict:
     nodes = telemetry.get("signal_state", {}).get("nodes", {})
     approaching = actionable_buses(telemetry)
 
+    decision_lag_sec = state.get("decision_lag_sec")
+    if _finite_nonnegative(decision_lag_sec) is None:
+        decision_lag_sec = DEFAULT_DECISION_LAG_SEC
+
+    actionable_by_node = {}
+    for route_buses in approaching.values():
+        for bus in route_buses:
+            leg = bus.get("route_leg", {})
+            landed_eta = eta_at_decision_land(
+                bus.get("eta_to_stop_bar_sec_freeflow"), decision_lag_sec
+            )
+            if not is_actionable(landed_eta):
+                continue
+            node_key = str(leg.get("node_x"))
+            approach = str(leg.get("approach") or bus.get("direction", "?"))
+            bucket = actionable_by_node.setdefault(node_key, {}).setdefault(
+                approach, {"buses": 0, "passengers": 0}
+            )
+            bucket["buses"] += 1
+            bucket["passengers"] += int(bus.get("passengers", 0))
+
     lines = [
         f"simulation_time_seconds={telemetry.get('simulation_time_seconds', 0)}",
+        f"DECISION_LAG_SEC={decision_lag_sec}   # your decision will take "
+        "effect ~this many seconds from this snapshot; buses will have moved "
+        "by then",
         "passengers_per_minute="
         f"{throughput.get('passengers_per_minute', 0)}",
         "passengers_per_minute_recent="
         f"{throughput.get('passengers_per_minute_recent', 0)}",
         "queues_passengers_est="
         f"{json.dumps(summary.get('queues_passengers_est', {}), sort_keys=True)}",
-        "NODES:",
+        "NODE_SUMMARY:",
     ]
-    for node_x, node in sorted(nodes.items(), key=lambda item: str(item[0])):
+    sorted_nodes = sorted(nodes.items(), key=lambda item: str(item[0]))
+    global_queue_pax = summary.get("queues_passengers_est", {})
+    for node_position, (node_x, node) in enumerate(sorted_nodes):
         if not isinstance(node, dict):
             continue
+        waiting = node.get("queues_passengers_est")
+        if not isinstance(waiting, dict):
+            # Compatibility for telemetry produced before per-node queues were
+            # added. Current telemetry always takes the precise branch above.
+            vertical_prefix = "A" if node_position == 0 else "B"
+            waiting = {
+                "EB": global_queue_pax.get("EB", 0),
+                "WB": global_queue_pax.get("WB", 0),
+                "NB": global_queue_pax.get(f"{vertical_prefix}_NB", 0),
+                "SB": global_queue_pax.get(f"{vertical_prefix}_SB", 0),
+            }
+        waiting = {
+            approach: int(_finite_nonnegative(waiting.get(approach), 0) or 0)
+            for approach in ("EB", "WB", "NB", "SB")
+        }
+        signals = node.get("signals", {})
+        signal_text = " ".join(
+            f"{approach}={signals.get(approach, 'UNKNOWN')}"
+            for approach in ("EB", "WB", "NB", "SB")
+        )
+        bus_groups = actionable_by_node.get(str(node_x), {})
+        actionable_text = " ".join(
+            f"{approach}({details['passengers']}pax/{details['buses']}bus)"
+            for approach, details in sorted(bus_groups.items())
+        ) or "none"
         lines.append(
-            f"- node={node_x} phase={node.get('phase', 'UNKNOWN')} "
-            f"signals={json.dumps(node.get('signals', {}), sort_keys=True)}"
+            f"- NODE {node_x}: phase={node.get('phase', 'UNKNOWN')} "
+            f"signals: {signal_text} "
+            f"waiting_pax: EB={waiting['EB']} WB={waiting['WB']} "
+            f"NB={waiting['NB']} SB={waiting['SB']} "
+            f"(total={sum(waiting.values())}) "
+            f"actionable_bus: {actionable_text} "
+            "conflicts: EW(EB/WB) blocks NS(NB/SB); priority for one "
+            "approach gives it exclusive GREEN and sets all others RED"
         )
 
     lines.append("ROUTES:")
@@ -410,6 +544,9 @@ def read_minimap(state: AgentState) -> dict:
         if nearest:
             route_leg = nearest.get("route_leg", {})
             granted = bool(nearest.get("priority_granted", False))
+            landed_eta = eta_at_decision_land(
+                nearest.get("eta_to_stop_bar_sec_freeflow"), decision_lag_sec
+            )
             lines.append(
                 f"{route_position}) {route_id}: "
                 f"active={bool(route.get('active', False))} "
@@ -421,6 +558,8 @@ def read_minimap(state: AgentState) -> dict:
                 f"{bool(route.get('nearest_bus_in_dbl_lane', False))} "
                 f"approaching_buses={len(candidates)} "
                 f"nearest_eta_sec={nearest.get('eta_to_stop_bar_sec_freeflow')} "
+                f"eta_at_decision_land_sec={landed_eta} "
+                f"actionable={is_actionable(landed_eta)} "
                 f"target_node={route_leg.get('node_x')} "
                 f"passengers={int(nearest.get('passengers', 0))} "
                 f"priority={'GRANTED - do not change' if granted else 'not granted'}"
@@ -791,6 +930,8 @@ def run_forever() -> None:
     turn = 0
     recent_decisions = []
     last_frame = None
+    # First turn has no measurement yet, so start from the conservative default.
+    decision_lag_sec = DEFAULT_DECISION_LAG_SEC
     while True:
         control = read_ai_control()
         telemetry = _read_telemetry()
@@ -829,9 +970,16 @@ def run_forever() -> None:
                         "recent_decisions": recent_decisions,
                         "turn": turn,
                         "model": model,
+                        "decision_lag_sec": decision_lag_sec,
                     }
                 )
                 recent_decisions = result.get("recent_decisions", recent_decisions)
+                # This turn's measured latency predicts the next turn's lag.
+                measured = result.get("call_metrics", {})
+                if isinstance(measured, dict):
+                    decision_lag_sec = decision_lag_seconds(
+                        measured.get("latency_ms")
+                    )
         except Exception as exc:
             decision = _dependency_hold(
                 turn,

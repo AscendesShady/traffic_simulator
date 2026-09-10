@@ -392,6 +392,42 @@ def test_telemetry_uses_authoritative_passengers_and_per_node_signals(tmp_path):
     assert payload["simulation_time_seconds"] == 1.0
 
 
+def test_telemetry_exposes_per_node_approach_passenger_queues(tmp_path):
+    controller = SignalController({"green_time": 20})
+    exporter = TelemetryExporter(tmp_path / "state.json", 1)
+    node_a_eb = Vehicle(200, H_Y - 0.5 * LANE, "EB", lane_index=0)
+    node_b_eb = Vehicle(600, H_Y - 0.5 * LANE, "EB", lane_index=0)
+    node_b_eb.passed_nodes.add(canvas.INT_X[0])
+    node_a_nb = Vehicle(
+        canvas.INT_X[0] - 0.5 * LANE,
+        H_Y + 100,
+        "NB",
+        lane_index=0,
+        assigned_node_x=canvas.INT_X[0],
+    )
+    for vehicle in (node_a_eb, node_b_eb, node_a_nb):
+        vehicle.speed = 0.0
+
+    payload = exporter.build_payload(
+        controller, [node_a_eb, node_b_eb, node_a_nb], 60
+    )
+    node_a = payload["signal_state"]["nodes"]["300"]
+    node_b = payload["signal_state"]["nodes"]["700"]
+
+    assert node_a["queues_passengers_est"] == {
+        "EB": 4, "WB": 0, "NB": 4, "SB": 0
+    }
+    assert node_a["total_waiting_passengers_est"] == 8
+    assert node_b["queues_passengers_est"] == {
+        "EB": 4, "WB": 0, "NB": 0, "SB": 0
+    }
+    assert node_b["total_waiting_passengers_est"] == 4
+    assert payload["network_summary"]["queues_passengers_est_by_node"] == {
+        "300": node_a["queues_passengers_est"],
+        "700": node_b["queues_passengers_est"],
+    }
+
+
 def test_telemetry_includes_congestion_demand_backlog(tmp_path):
     controller = SignalController({"green_time": 20})
     exporter = TelemetryExporter(tmp_path / "state.json", 1)
@@ -575,9 +611,11 @@ def test_dashboard_history_is_bounded_in_memory():
 
 
 def test_dashboard_initial_window_fits_smaller_screens_and_remains_useful():
-    assert TelemetryDashboard.initial_window_size(1920, 1080) == (900, 780)
-    assert TelemetryDashboard.initial_window_size(1366, 768) == (900, 628)
-    assert TelemetryDashboard.initial_window_size(640, 480) == (560, 500)
+    # The dense summary layout fits in 430px, so the dashboard no longer
+    # claims 780px of monitor height it does not need.
+    assert TelemetryDashboard.initial_window_size(1920, 1080) == (900, 430)
+    assert TelemetryDashboard.initial_window_size(1366, 768) == (900, 430)
+    assert TelemetryDashboard.initial_window_size(640, 480) == (560, 360)
 
 
 def test_startup_window_layout_tiles_large_and_standard_hd_desktops():
@@ -588,7 +626,7 @@ def test_startup_window_layout_tiles_large_and_standard_hd_desktops():
         "mode": "tiled",
         "canvas_position": (900, 30),
         "control_geometry": "880x1030+10+10",
-        "telemetry_geometry": "1000x760+900+640",
+        "telemetry_geometry": "1000x430+900+640",
     }
     assert hd == {
         "mode": "tiled",
@@ -604,7 +642,7 @@ def test_startup_window_layout_uses_on_screen_cascade_when_space_is_small():
     assert layout["mode"] == "cascade"
     assert layout["canvas_position"] == (183, 30)
     assert layout["control_geometry"] == "880x718+476+10"
-    assert layout["telemetry_geometry"] == "900x718+233+30"
+    assert layout["telemetry_geometry"] == "900x430+233+30"
 
 
 def test_dashboard_responsive_profile_shrinks_content_without_scrollbars():
@@ -1025,7 +1063,7 @@ def test_llm_excel_export_writes_samples_and_per_model_summary(tmp_path):
     assert dashboard.llm_export_status_lbl.values["text"] == "No samples yet"
 
 
-def test_export_all_creates_four_sheets(tmp_path, monkeypatch):
+def test_export_all_creates_core_sheets(tmp_path, monkeypatch):
     from openpyxl import load_workbook
 
     class FakeLabel:
@@ -1110,13 +1148,23 @@ def test_export_all_creates_four_sheets(tmp_path, monkeypatch):
 
     workbook = load_workbook(destination, data_only=True)
     try:
-        assert workbook.sheetnames == [
+        # EXPORT ALL is now the only export, so it always carries the four
+        # session sheets plus the operator inputs that produced them.
+        session_sheets = [
             "Decisions",
             "Telemetry",
             "LLM Performance",
             "LLM Summary",
         ]
-        assert all(workbook[name].max_row == 2 for name in workbook.sheetnames)
+        assert workbook.sheetnames == session_sheets + ["Control Panel Inputs"]
+        assert all(workbook[name].max_row == 2 for name in session_sheets)
+        inputs = workbook["Control Panel Inputs"]
+        assert [cell.value for cell in inputs[1]] == [
+            "section",
+            "parameter",
+            "value",
+        ]
+        assert inputs.max_row > 1
         decision_headers = [cell.value for cell in workbook["Decisions"][1]]
         assert workbook["Decisions"].cell(
             row=2,
@@ -1374,7 +1422,11 @@ def test_session_trends_export_uses_only_in_memory_history(tmp_path):
 
     workbook = load_workbook(destination, data_only=True)
     try:
-        assert workbook.sheetnames == ["Session Trends", "Summary"]
+        assert workbook.sheetnames == [
+            "Session Trends",
+            "Session Charts",
+            "Summary",
+        ]
         trends = workbook["Session Trends"]
         assert trends.max_row == 3
         assert [cell.value for cell in trends[1]] == [
@@ -1394,6 +1446,31 @@ def test_session_trends_export_uses_only_in_memory_history(tmp_path):
         assert summary["samples"] == 2
         assert summary["average_vehicles"] == 10.0
         assert summary["peak_road_queue"] == 6
+
+        charts = workbook["Session Charts"]._charts
+        assert len(charts) == 3
+        assert [len(chart.series) for chart in charts] == [2, 2, 1]
+        assert [chart.title.tx.rich.p[0].r[0].t for chart in charts] == [
+            "Network Occupancy Over Time",
+            "Queue Pressure Over Time",
+            "Network Congestion Over Time",
+        ]
+        assert [chart.x_axis.title.tx.rich.p[0].r[0].t for chart in charts] == [
+            "Simulation time (seconds)",
+            "Simulation time (seconds)",
+            "Simulation time (seconds)",
+        ]
+        assert [
+            series.tx.v
+            for chart in charts
+            for series in chart.series
+        ] == [
+            "Vehicles",
+            "Buses",
+            "Road queue",
+            "Pending demand",
+            "Congestion",
+        ]
     finally:
         workbook.close()
     assert dashboard.trends_export_status_lbl.values["fg"] == "#2ECC71"
@@ -1612,3 +1689,93 @@ def test_dbl_lamp_uses_distinct_pending_active_and_clearing_colors(monkeypatch):
     for state, expected in expected_colors.items():
         canvas.draw_dbl_signal(surface, x, y, "EASTBOUND", state, False)
         assert surface.get_at(lamp_center)[:3] == expected
+
+
+def test_export_all_folds_in_snapshot_and_trends_when_available(
+    tmp_path, monkeypatch
+):
+    """EXPORT ALL must carry the content the removed tab buttons produced.
+
+    Session Trends in particular lives only in dashboard memory, so if the
+    fold-in silently failed that data would be unrecoverable.
+    """
+    from openpyxl import load_workbook
+
+    class FakeLabel:
+        def config(self, **kwargs):
+            self.values = kwargs
+
+    monkeypatch.setattr(
+        telemetry_dashboard_module,
+        "AGENT_TURN_LOG_FILE",
+        tmp_path / "missing_turns.jsonl",
+    )
+    monkeypatch.setattr(
+        telemetry_dashboard_module,
+        "TELEMETRY_LOG_FILE",
+        tmp_path / "missing_telemetry.jsonl",
+    )
+
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.export_all_status_lbl = FakeLabel()
+    dashboard.summary_export_status_lbl = FakeLabel()
+    dashboard.trends_export_status_lbl = FakeLabel()
+    dashboard.llm_samples = [
+        {"turn": 1, "model": "model-a", "status": "OK", "latency_ms": 10.0}
+    ]
+
+    # Live snapshot, as the Summary tab would hold.
+    dashboard.latest_telemetry = {
+        "timestamp": time.time(),
+        "frame_number": 120,
+        "simulation_time_seconds": 2.0,
+        "simulation_paused": False,
+        "simulation_speed": 1.0,
+        "network_summary": {"passenger_volume": 49},
+        "network_throughput": {"passengers_per_minute": 100.0},
+        "routes": {},
+        "signal_state": {"nodes": {}},
+    }
+
+    # In-memory trend history, as the Session Trends tab would hold.
+    dashboard.initialize_history_state()
+    dashboard.draw_trend_charts = lambda: None
+    dashboard.record_history_sample(
+        dashboard_sample(60, 1.0, vehicles=8, buses=1, queued=2, pending=3)
+    )
+    dashboard.record_history_sample(
+        dashboard_sample(120, 2.0, vehicles=12, buses=2, queued=6, pending=1)
+    )
+
+    destination = tmp_path / "combined_full.xlsx"
+    assert dashboard.export_all(destination) == destination
+
+    workbook = load_workbook(destination, data_only=True)
+    try:
+        names = workbook.sheetnames
+        # The four session sheets plus the inputs that produced them.
+        for expected in (
+            "Decisions",
+            "Telemetry",
+            "LLM Performance",
+            "LLM Summary",
+            "Control Panel Inputs",
+        ):
+            assert expected in names, names
+        # Folded-in snapshot sheets.
+        for expected in (
+            "Snapshot Overview",
+            "Snapshot Queues & Demand",
+            "Snapshot Routes",
+            "Snapshot Signal Nodes",
+        ):
+            assert expected in names, names
+        # Folded-in trends sheets, which exist nowhere else.
+        assert "Session Trends" in names, names
+        assert "Session Charts" in names, names
+        assert "Trends Summary" in names, names
+        trends = workbook["Session Trends"]
+        assert trends.max_row == 3  # header plus the two recorded samples
+        assert len(workbook["Session Charts"]._charts) == 3
+    finally:
+        workbook.close()

@@ -31,25 +31,45 @@ class TelemetryExporter:
         self._throughput_samples.clear()
         self._last_total_served = 0
 
-    def compute_queue_counts(self, vehicles):
-        queues = {"EB": 0, "WB": 0, "A_NB": 0, "A_SB": 0, "B_NB": 0, "B_SB": 0}
+    def compute_queue_counts_by_node(self, vehicles):
+        """Count stopped upstream vehicles by node and physical approach."""
+        queues = {
+            str(node_x): {approach: 0 for approach in ("EB", "WB", "NB", "SB")}
+            for node_x in canvas.INT_X
+        }
         for vehicle in vehicles:
             if vehicle.speed >= 0.25:
                 continue
             target_node = vehicle.get_next_target_node(canvas.INT_X)
+            node_queues = queues.get(str(target_node))
+            if node_queues is None:
+                continue
             if not vehicle.is_front_bumper_upstream(
                 target_node, canvas.H_Y, canvas.ROAD_W, canvas.STOP
             ):
                 continue
-            if vehicle.direction == "EB":
-                queues["EB"] += 1
-            elif vehicle.direction == "WB":
-                queues["WB"] += 1
-            elif vehicle.direction == "NB":
-                queues["A_NB" if target_node == canvas.INT_X[0] else "B_NB"] += 1
-            elif vehicle.direction == "SB":
-                queues["A_SB" if target_node == canvas.INT_X[0] else "B_SB"] += 1
+            if vehicle.direction in node_queues:
+                node_queues[vehicle.direction] += 1
         return queues
+
+    @staticmethod
+    def _flatten_queue_counts(queues_by_node):
+        """Preserve the original public aggregate queue contract."""
+        node_a = queues_by_node.get(str(canvas.INT_X[0]), {})
+        node_b = queues_by_node.get(str(canvas.INT_X[1]), {})
+        return {
+            "EB": int(node_a.get("EB", 0)) + int(node_b.get("EB", 0)),
+            "WB": int(node_a.get("WB", 0)) + int(node_b.get("WB", 0)),
+            "A_NB": int(node_a.get("NB", 0)),
+            "A_SB": int(node_a.get("SB", 0)),
+            "B_NB": int(node_b.get("NB", 0)),
+            "B_SB": int(node_b.get("SB", 0)),
+        }
+
+    def compute_queue_counts(self, vehicles):
+        return self._flatten_queue_counts(
+            self.compute_queue_counts_by_node(vehicles)
+        )
 
     @staticmethod
     def _phase_label(node_status):
@@ -132,13 +152,21 @@ class TelemetryExporter:
         demand_state=None,
         throughput_state=None,
     ):
-        queues = self.compute_queue_counts(vehicles)
+        queues_by_node = self.compute_queue_counts_by_node(vehicles)
+        queues = self._flatten_queue_counts(queues_by_node)
         # Queue counts are aggregated by approach, so vehicle type is no longer
         # available here. This documented car-occupancy approximation slightly
         # overestimates queued passengers whenever trucks are present.
         queues_passengers = {
             approach: vehicle_count * CAR_OCCUPANCY
             for approach, vehicle_count in queues.items()
+        }
+        queues_passengers_by_node = {
+            node_x: {
+                approach: vehicle_count * CAR_OCCUPANCY
+                for approach, vehicle_count in node_queues.items()
+            }
+            for node_x, node_queues in queues_by_node.items()
         }
         demand_state = demand_state or {}
         throughput_state = throughput_state or {}
@@ -218,7 +246,17 @@ class TelemetryExporter:
             status = signal_controller.get_node_status(node_x)
             label = self._phase_label(status)
             phase_labels.append(label)
-            node_states[str(node_x)] = {**status, "phase": label}
+            node_key = str(node_x)
+            node_queue_passengers = queues_passengers_by_node[node_key]
+            node_states[node_key] = {
+                **status,
+                "phase": label,
+                "queues": queues_by_node[node_key],
+                "queues_passengers_est": node_queue_passengers,
+                "total_waiting_passengers_est": sum(
+                    node_queue_passengers.values()
+                ),
+            }
 
         current_phase = phase_labels[0] if len(set(phase_labels)) == 1 else "MIXED"
         green_frames = signal_controller.get_green_time()
@@ -258,6 +296,29 @@ class TelemetryExporter:
                 control_panel.global_config.get("is_running", False)
             ),
             "simulation_paused": bool(control_panel.global_config.get("is_paused", False)),
+            # Signal timing is a key experimental parameter, so the calibrated
+            # saturation flow and the resulting splits travel with every frame.
+            "signal_timing": {
+                "measured_saturation_flow_veh_per_hr": (
+                    control_panel.global_config.get("measured_saturation_flow")
+                ),
+                # Each independent node uses its own derived Webster cycle.
+                "cycle_time_sec": {
+                    str(node_x): cycle
+                    for node_x, cycle in (
+                        control_panel.global_config.get("cycle_time_sec") or {}
+                    ).items()
+                },
+                "calibrating": bool(
+                    control_panel.global_config.get("calibrating", False)
+                ),
+                "webster_splits": {
+                    str(node_x): split
+                    for node_x, split in (
+                        control_panel.global_config.get("webster_splits") or {}
+                    ).items()
+                },
+            },
             "simulation_speed": float(control_panel.global_config.get("sim_speed", 1.0)),
             "signal_state": {
                 "current_phase": current_phase,
@@ -280,6 +341,8 @@ class TelemetryExporter:
                 ),
                 "queues": queues,
                 "queues_passengers_est": queues_passengers,
+                "queues_by_node": queues_by_node,
+                "queues_passengers_est_by_node": queues_passengers_by_node,
                 "car_occupancy_assumed": CAR_OCCUPANCY,
                 "pending_demand": pending_demand,
             },

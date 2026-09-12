@@ -339,6 +339,10 @@ def test_throughput_counts_truck_as_one(monkeypatch):
         main.control_panel, "create_dashboard_window", lambda _pane: None
     )
     monkeypatch.setattr(main, "bind_pane_mousewheel", lambda *_a, **_k: None)
+    # The telemetry dashboard now mounts in-process too (no longer a
+    # subprocess), so main() constructs it directly; same reasoning as
+    # create_dashboard_window above.
+    monkeypatch.setattr(main, "TelemetryDashboard", lambda _pane: None)
     monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr(main.atexit, "register", lambda callback: callback)
     monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
@@ -1509,7 +1513,10 @@ def test_session_trends_export_uses_only_in_memory_history(tmp_path):
 
 def test_runtime_paths_are_source_relative():
     project = Path(main.__file__).resolve().parent
-    assert main.DASHBOARD_PATH == project / "telemetry_dashboard.py"
+    # DASHBOARD_PATH no longer exists: the telemetry dashboard mounts
+    # in-process (TelemetryDashboard imported directly) instead of being
+    # launched as a separate subprocess script.
+    assert not hasattr(main, "DASHBOARD_PATH")
     assert main.TELEMETRY_PATH == project / "traffic_state_telemetry.json"
     assert DEFAULT_TELEMETRY_PATH == project / "traffic_state_telemetry.json"
 

@@ -66,7 +66,6 @@ network_throughput = {
 }
 BASE_DIR = Path(__file__).resolve().parent
 TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
-DASHBOARD_PATH = BASE_DIR / "telemetry_dashboard.py"
 AGENT_PATH = BASE_DIR / "agent.py"
 DECISION_PATH = BASE_DIR / "decision.json"
 DECISION_STALE_MULTIPLIER = 3
@@ -1464,17 +1463,12 @@ def main():
     control_panel.create_dashboard_window(control_pane)
     bind_pane_mousewheel(control_pane, control_pane.scroll_canvas)
 
-    # 2. Start Decoupled Telemetry Dashboard as a Subprocess
-    print("Launching Telemetry Dashboard...")
-    dashboard_environment = os.environ.copy()
-    dashboard_environment["TRAFFIC_TELEMETRY_GEOMETRY"] = startup_layout[
-        "telemetry_geometry"
-    ]
-    dashboard_proc = subprocess.Popen(
-        [sys.executable, str(DASHBOARD_PATH)],
-        cwd=str(BASE_DIR),
-        env=dashboard_environment,
-    )
+    # 2. Mount the telemetry dashboard into the right pane, in-process. It
+    # keeps reading traffic_state_telemetry.json / agent_turn_log.jsonl /
+    # ai_control.json from disk exactly as it did as a separate subprocess;
+    # only where its widgets live has changed.
+    TelemetryDashboard(telemetry_pane)
+    bind_pane_mousewheel(telemetry_pane, telemetry_pane.scroll_canvas)
 
     print("Launching LLM Control Agent...")
     agent_proc = subprocess.Popen(
@@ -1484,10 +1478,6 @@ def main():
 
     # 3. Register cleanup, then build the workbook after agent writes stop.
     def cleanup():
-        try:
-            dashboard_proc.terminate()
-        except Exception:
-            pass
         try:
             agent_proc.terminate()
         except Exception:

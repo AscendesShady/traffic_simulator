@@ -342,20 +342,31 @@ class HoverTooltip:
 
 class TelemetryDashboard:
     def __init__(self, root):
+        """Build every dashboard widget into `root` and start its pollers.
+
+        `root` may be a real top-level window (standalone use, as today) or a
+        frame inside the unified MainWindow. Window chrome -- title,
+        geometry, minsize, resizable -- only makes sense for a real top-level
+        and is skipped when `root` is a frame, since only one thing may own
+        the process's actual window. Everything else (reading telemetry,
+        building tabs, polling) behaves identically either way.
+        """
         self.root = root
-        self.root.title("Live Network Telemetry")
-        window_width, window_height = self.initial_window_size(
-            self.root.winfo_screenwidth(),
-            self.root.winfo_screenheight(),
-        )
-        default_geometry = f"{window_width}x{window_height}"
-        requested_geometry = os.environ.get(WINDOW_GEOMETRY_ENV, "").strip()
-        try:
-            self.root.geometry(requested_geometry or default_geometry)
-        except tk.TclError:
-            self.root.geometry(default_geometry)
-        self.root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
-        self.root.resizable(True, True)
+        is_toplevel = isinstance(root, (tk.Tk, tk.Toplevel))
+        if is_toplevel:
+            self.root.title("Live Network Telemetry")
+            window_width, window_height = self.initial_window_size(
+                self.root.winfo_screenwidth(),
+                self.root.winfo_screenheight(),
+            )
+            default_geometry = f"{window_width}x{window_height}"
+            requested_geometry = os.environ.get(WINDOW_GEOMETRY_ENV, "").strip()
+            try:
+                self.root.geometry(requested_geometry or default_geometry)
+            except tk.TclError:
+                self.root.geometry(default_geometry)
+            self.root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+            self.root.resizable(True, True)
         self.root.configure(bg=COLOR_BG)
         self._resize_after_id = None
         self.initialize_history_state()

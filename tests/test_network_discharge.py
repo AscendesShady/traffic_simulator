@@ -610,16 +610,21 @@ def test_active_priority_green_transitions_to_yellow_before_discharge_all_red():
     controller, config = make_controller("Node A Southbound")
     control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] = True
     bus = make_bus_for_leg("R1_EB_A_NB", 300, "ACTIVE_PRIORITY_BUS")
+    # EW green about to end with the bus still upstream: TSP holds it.
+    controller.phase = 0
+    controller.timer = controller.get_green_time(300, 0) - 3
     for _ in range(20):
         controller.update([bus])
-        if controller.get_node_status(300)["priority_state"] == "PRIORITY_ACTIVE":
+        if controller.get_node_status(300)["priority_state"] == "TSP_EXTENDING":
             break
+    assert controller.get_node_status(300)["priority_state"] == "TSP_EXTENDING"
     assert controller.get_all_signals()[300]["EB"] == "GREEN"
+    assert controller.get_all_signals()[300]["WB"] == "GREEN"
 
     request_discharge(controller, config, [bus], "Node A Southbound")
 
     assert controller.get_all_signals()[300] == {
-        "EB": "YELLOW", "WB": "RED", "NB": "RED", "SB": "RED"
+        "EB": "YELLOW", "WB": "YELLOW", "NB": "RED", "SB": "RED"
     }
     advance_until(
         controller,

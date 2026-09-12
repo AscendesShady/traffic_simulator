@@ -8,7 +8,7 @@ from signal_controller import (
     DISCHARGE_PLAN_STAGES,
     DISCHARGE_RECOVERY_FAILED,
     NORMAL,
-    PRIORITY_ACTIVE,
+    TSP_EXTENDING,
     NodeState,
     SignalController,
 )
@@ -42,7 +42,7 @@ def test_full_reset_restores_construction_state():
     node = controller.nodes[300]
     node.phase = 4
     node.timer = 22
-    node.priority_state = PRIORITY_ACTIVE
+    node.priority_state = TSP_EXTENDING
     node.priority_timer = 8
     node.active_request = object()
     node.request_queue.append(object())
@@ -116,13 +116,16 @@ def test_reset_clears_active_priority():
     controller = SignalController(
         {"green_time": 100}, yellow_time=2, red_clearance_time=2
     )
+    # EW green about to end with the bus still upstream: TSP extends it.
+    controller.phase = 0
+    controller.timer = 97
 
     for _ in range(20):
         controller.update([bus])
-        if controller.nodes[300].priority_state == PRIORITY_ACTIVE:
+        if controller.nodes[300].priority_state == TSP_EXTENDING:
             break
 
-    assert controller.nodes[300].priority_state == PRIORITY_ACTIVE
+    assert controller.nodes[300].priority_state == TSP_EXTENDING
     assert controller.nodes[300].active_request is not None
 
     controller.reset_all_state()
@@ -171,8 +174,8 @@ def test_config_survives_reset():
         "yellow_time": controller.yellow_time,
         "red_clearance_time": controller.red_clearance_time,
         "priority_request_timeout": controller.priority_request_timeout,
-        "priority_active_stall_frames": controller.priority_active_stall_frames,
-        "priority_active_max_frames": controller.priority_active_max_frames,
+        "tsp_max_adjust_fraction": controller.tsp_max_adjust_fraction,
+        "min_green_frames": controller.min_green_frames,
         "discharge_min_green": controller.discharge_min_green,
         "discharge_max_green": controller.discharge_max_green,
         "discharge_stall_time": controller.discharge_stall_time,

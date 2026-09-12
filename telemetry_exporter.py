@@ -102,12 +102,13 @@ class TelemetryExporter:
         priority = signal_controller.get_priority_status_for_bus(bus, target_node)
         latest_terminal = signal_controller.get_latest_terminal_status_for_bus(bus)
         priority_state = priority.get("state") if priority else None
-        is_pending = priority_state in (
-            "REQUESTED",
-            "CONFLICT_YELLOW",
-            "ALL_RED_CLEARANCE",
-        )
-        is_active = priority_state in ("PRIORITY_ACTIVE", "PRIORITY_CLEARING")
+        # REQUESTED = queued behind another bus; ARMED = the node's live
+        # request (DBL lane reserved, TSP watching for its moment); the two
+        # TSP_* states = a bounded signal adjustment actually being applied.
+        is_pending = priority_state == "REQUESTED"
+        is_adjusting = priority_state in ("TSP_EXTENDING", "TSP_EARLY_TRUNCATE")
+        is_active = priority_state == "ARMED" or is_adjusting
+        is_clearing = is_active and bus.leg_state != "APPROACHING"
         tsp_requested = bool(priority and priority.get("tsp_requested"))
         dbl_requested = bool(priority and priority.get("dbl_requested"))
         return {
@@ -133,8 +134,12 @@ class TelemetryExporter:
             "dbl_enabled": bool(live_cfg.get("dbl_enabled", False)),
             "priority_requested": priority is not None,
             "priority_transitioning": is_pending,
-            "priority_granted": priority_state == "PRIORITY_ACTIVE",
-            "priority_clearing": priority_state == "PRIORITY_CLEARING",
+            "priority_granted": is_adjusting,
+            "priority_clearing": is_clearing,
+            "tsp_action": priority.get("tsp_action", "none") if priority else "none",
+            "tsp_adjust_frames": (
+                int(priority.get("tsp_adjust_frames", 0)) if priority else 0
+            ),
             "priority_terminal": latest_terminal if priority is None else None,
             "latest_priority_terminal_event": latest_terminal,
             "tsp_priority_pending": tsp_requested and is_pending,

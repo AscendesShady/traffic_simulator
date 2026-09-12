@@ -16,18 +16,22 @@ VALID_SIGNAL_STATES = {RED, YELLOW, GREEN}
 
 NORMAL = "NORMAL"
 REQUESTED = "REQUESTED"
-CONFLICT_YELLOW = "CONFLICT_YELLOW"
-ALL_RED_CLEARANCE = "ALL_RED_CLEARANCE"
-PRIORITY_ACTIVE = "PRIORITY_ACTIVE"
-PRIORITY_CLEARING = "PRIORITY_CLEARING"
-RECOVERY_ALL_RED = "RECOVERY_ALL_RED"
+ARMED = "ARMED"
+TSP_EXTENDING = "TSP_EXTENDING"
+TSP_EARLY_TRUNCATE = "TSP_EARLY_TRUNCATE"
 COMPLETED = "COMPLETED"
 DENIED = "DENIED"
 CANCELLED = "CANCELLED"
-INFEASIBLE_GRANT = "INFEASIBLE_GRANT"
-ACTIVE_STALL_TIMEOUT = "ACTIVE_STALL_TIMEOUT"
 
-PRIORITY_PROGRESS_EPSILON = 0.5
+TSP_ACTION_NONE = "none"
+TSP_ACTION_EXTENDING = "extending"
+TSP_ACTION_EARLY_GREEN = "early_green"
+
+# Conventional TSP bounds: one adjustment may move at most this fraction of
+# the affected phase's Webster green, and a truncated phase always keeps at
+# least MIN_GREEN_FRAMES of green (5 s at 60 fps).
+TSP_MAX_ADJUST_FRACTION = 0.20
+MIN_GREEN_FRAMES = 300
 
 DISCHARGE_INACTIVE = "INACTIVE"
 DISCHARGE_TRANSITION_YELLOW = "TRANSITION_YELLOW"
@@ -102,6 +106,8 @@ class PriorityRequest:
     tsp_requested: bool = False
     dbl_requested: bool = False
     attempt_number: int = 1
+    tsp_action: str = TSP_ACTION_NONE
+    tsp_adjust_frames: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -122,6 +128,8 @@ class PriorityRequest:
             "tsp_requested": self.tsp_requested,
             "dbl_requested": self.dbl_requested,
             "attempt_number": self.attempt_number,
+            "tsp_action": self.tsp_action,
+            "tsp_adjust_frames": self.tsp_adjust_frames,
         }
 
 
@@ -136,9 +144,14 @@ class NodeState:
     reservations: dict[int, dict[str, Any]] = field(default_factory=dict)
     terminal_history: list[dict[str, Any]] = field(default_factory=list)
     suppressed_keys: set[tuple[str, int, int]] = field(default_factory=set)
-    active_start_frame: int | None = None
-    last_progress_frame: int | None = None
-    last_stop_bar_distance: float | None = None
+    # Live TSP event: frames of adjustment applied so far (extension) or the
+    # frame count the truncated green must reach before it ends.
+    tsp_cap_frames: int = 0
+    tsp_target_end: int = 0
+    # Last completed TSP event, kept until the next one so a 10-frame
+    # telemetry sample cannot miss a short truncation.
+    last_tsp_action: str = TSP_ACTION_NONE
+    last_tsp_adjust_frames: int = 0
 
 
 class SignalController:
@@ -149,22 +162,20 @@ class SignalController:
         global_config,
         yellow_time=60,
         red_clearance_time=60,
-        priority_request_timeout=900,
+        priority_request_timeout=7200,
         discharge_min_green=180,
         discharge_max_green=600,
         discharge_stall_time=180,
         discharge_queue_target=0,
-        priority_active_stall_frames=300,
-        priority_active_max_frames=900,
+        tsp_max_adjust_fraction=TSP_MAX_ADJUST_FRACTION,
+        min_green_frames=MIN_GREEN_FRAMES,
     ):
         self.global_config = global_config
         self.yellow_time = max(1, int(yellow_time))
         self.red_clearance_time = max(1, int(red_clearance_time))
         self.priority_request_timeout = max(1, int(priority_request_timeout))
-        self.priority_active_stall_frames = max(
-            1, int(priority_active_stall_frames)
-        )
-        self.priority_active_max_frames = max(1, int(priority_active_max_frames))
+        self.tsp_max_adjust_fraction = max(0.0, min(1.0, float(tsp_max_adjust_fraction)))
+        self.min_green_frames = max(1, int(min_green_frames))
         self.discharge_min_green = max(1, int(discharge_min_green))
         self.discharge_max_green = max(
             self.discharge_min_green, int(discharge_max_green)
@@ -246,9 +257,8 @@ class SignalController:
 
     @property
     def tsp_extension_timer(self):
-        # TSP now uses explicit priority requests instead of direction-blind
-        # extension of whichever phase happens to be green.
-        return 0
+        node = self.nodes[INT_X[0]]
+        return node.priority_timer if node.priority_state == TSP_EXTENDING else 0
 
     @property
     def current_discharge_stage(self):
@@ -1283,11 +1293,6 @@ class SignalController:
                 or self._discharge_green_map.get(node_x) != approach
             ):
                 return False
-        active = node.active_request
-        if node.priority_state in (PRIORITY_ACTIVE, PRIORITY_CLEARING):
-            if active is None or approach != active.originating_approach:
-                return False
-
         for reservation in node.reservations.values():
             if self._vehicle_blocks_entry(
                 approach,
@@ -1501,29 +1506,23 @@ class SignalController:
             return
         if node.phase in (2, 5) and not self.is_intersection_clear(node_x, vehicles):
             return
+        self._advance_phase(node)
+
+    @staticmethod
+    def _advance_phase(node):
         node.timer = 0
         node.phase = (node.phase + 1) % 6
 
-    def _begin_next_request(self, node):
-        if not node.request_queue:
-            return False
-        request = node.request_queue.pop(0)
-        node.active_request = request
-        node.priority_timer = 0
-        normal_signals = self._normal_signals_for_phase(node.phase)
-        if any(value in (GREEN, YELLOW) for value in normal_signals.values()):
-            node.priority_state = CONFLICT_YELLOW
-            request.state = CONFLICT_YELLOW
-        else:
-            node.priority_state = ALL_RED_CLEARANCE
-            request.state = ALL_RED_CLEARANCE
-        return True
+    @staticmethod
+    def _phase_for_approach(approach):
+        return 0 if approach in ("EB", "WB") else 3
 
-    def _cancel_active_request(self, node):
-        if node.active_request:
-            node.active_request.state = RECOVERY_ALL_RED
-        node.priority_state = RECOVERY_ALL_RED
-        node.priority_timer = 0
+    @staticmethod
+    def _conflicting_phase(phase):
+        return 3 if phase == 0 else 0
+
+    def _tsp_cap_frames(self, node_x, phase):
+        return int(self.get_green_time(node_x, phase) * self.tsp_max_adjust_fraction)
 
     @staticmethod
     def _bus_can_use_grant(request, node_x, vehicles):
@@ -1539,148 +1538,169 @@ class SignalController:
             and not getattr(bus, "must_hold_for_lane", False)
         )
 
-    def _start_priority_watchdog(self, node, request, node_x):
-        node.active_start_frame = self.frame_number
-        node.last_progress_frame = self.frame_number
-        node.last_stop_bar_distance = self.distance_to_node_stop_bar(
-            request.bus, node_x
+    def _request_can_start_tsp(self, request, node_x, vehicles):
+        """Feasibility gate: one bounded action per request, only for a bus
+        that can actually use it and is still upstream of the stop bar."""
+        return (
+            request.tsp_requested
+            and request.tsp_action == TSP_ACTION_NONE
+            and self._bus_can_use_grant(request, node_x, vehicles)
+            and request.bus.is_front_bumper_upstream(node_x, H_Y, ROAD_W, STOP)
         )
 
-    @staticmethod
-    def _stop_priority_watchdog(node):
-        node.active_start_frame = None
-        node.last_progress_frame = None
-        node.last_stop_bar_distance = None
+    def _terminal_state_for(self, request):
+        if request.denial_or_cancel_reason == "REQUEST_TIMEOUT":
+            return DENIED
+        if request.denial_or_cancel_reason:
+            return CANCELLED
+        return COMPLETED
 
-    def _deny_active_grant(self, node, request, reason):
-        request.denial_or_cancel_reason = reason
-        request.state = RECOVERY_ALL_RED
-        node.priority_state = RECOVERY_ALL_RED
-        node.priority_timer = 0
-        self._stop_priority_watchdog(node)
-
-    def _priority_update(self, node_x, node, vehicles):
+    def _prune_queue(self, node, node_x, vehicles):
         live_queue = []
         for queued_request in node.request_queue:
+            if node_x in queued_request.bus.passed_nodes:
+                self._finalize_request(node, queued_request, COMPLETED)
+                continue
             if self._request_is_live(queued_request, vehicles):
                 live_queue.append(queued_request)
                 continue
-            terminal_state = (
-                DENIED
-                if queued_request.denial_or_cancel_reason == "REQUEST_TIMEOUT"
-                else CANCELLED
+            self._finalize_request(
+                node, queued_request, self._terminal_state_for(queued_request)
             )
-            self._finalize_request(node, queued_request, terminal_state)
         node.request_queue = live_queue
-        if node.priority_state == NORMAL:
-            if self._begin_next_request(node):
-                return
-            self._normal_phase_update(node, vehicles, node_x)
+
+    def _refresh_active_request(self, node, node_x, vehicles):
+        """Retire a finished or dead head request, then arm the next one.
+
+        Arming attaches the request immediately -- there is no signal
+        transition to wait for, since TSP only nudges the running cycle. An
+        armed DBL request reserves its lane from this moment.
+        """
+        request = node.active_request
+        if request is not None:
+            finished = node_x in request.bus.passed_nodes
+            dead = not finished and not self._request_is_live(request, vehicles)
+            if finished or dead:
+                self._finalize_request(
+                    node,
+                    request,
+                    COMPLETED if finished else self._terminal_state_for(request),
+                )
+                node.active_request = None
+                if node.priority_state == TSP_EXTENDING:
+                    # The bus is gone or done; the held green ends now,
+                    # through the normal yellow.
+                    self._end_extension(node)
+        if node.active_request is None and node.request_queue:
+            request = node.request_queue.pop(0)
+            request.state = ARMED
+            node.active_request = request
+
+    def _begin_extension(self, node, request, cap):
+        node.priority_state = TSP_EXTENDING
+        request.state = TSP_EXTENDING
+        request.tsp_action = TSP_ACTION_EXTENDING
+        node.tsp_cap_frames = cap
+        # This frame the green would have ended; holding it is the first
+        # extended frame.
+        node.priority_timer = 1
+        request.tsp_adjust_frames = 1
+        node.timer += 1
+
+    def _end_extension(self, node):
+        node.last_tsp_action = TSP_ACTION_EXTENDING
+        node.last_tsp_adjust_frames = node.priority_timer
+        node.priority_state = NORMAL
+        node.priority_timer = 0
+        node.tsp_cap_frames = 0
+        request = node.active_request
+        if request is not None and request.state == TSP_EXTENDING:
+            request.state = ARMED
+        self._advance_phase(node)
+
+    def _extension_update(self, node, node_x, vehicles):
+        request = node.active_request
+        if request is None or not request.bus.is_front_bumper_upstream(
+            node_x, H_Y, ROAD_W, STOP
+        ):
+            # Bus crossed the stop bar: the extension did its job.
+            self._end_extension(node)
+            return
+        if node.priority_timer >= node.tsp_cap_frames:
+            # Cap reached without the bus clearing: the green ends anyway and
+            # the bus waits for its normal green. No second action follows.
+            self._end_extension(node)
+            return
+        node.priority_timer += 1
+        node.timer += 1
+        request.tsp_adjust_frames = node.priority_timer
+
+    def _begin_early_green(self, node, request, node_x):
+        """Shorten the running conflicting green, bounded by the cap and the
+        MIN_GREEN floor. Returns False when there is nothing left to cut."""
+        conflicting = node.phase
+        green = self.get_green_time(node_x, conflicting)
+        cap = self._tsp_cap_frames(node_x, conflicting)
+        shortened = max(self.min_green_frames, green - cap)
+        target_end = max(node.timer + 1, shortened)
+        cut = green - target_end
+        if cut <= 0:
+            return False
+        node.priority_state = TSP_EARLY_TRUNCATE
+        node.tsp_target_end = target_end
+        node.priority_timer = cut
+        request.state = TSP_EARLY_TRUNCATE
+        request.tsp_action = TSP_ACTION_EARLY_GREEN
+        request.tsp_adjust_frames = cut
+        self._truncation_update(node, node_x)
+        return True
+
+    def _end_truncation(self, node):
+        node.last_tsp_action = TSP_ACTION_EARLY_GREEN
+        node.last_tsp_adjust_frames = node.priority_timer
+        node.priority_state = NORMAL
+        node.priority_timer = 0
+        node.tsp_target_end = 0
+        request = node.active_request
+        if request is not None and request.state == TSP_EARLY_TRUNCATE:
+            request.state = ARMED
+        self._advance_phase(node)
+
+    def _truncation_update(self, node, node_x):
+        # Runs on node fields alone, so a request that dies mid-truncation
+        # does not stretch the conflicting green back out again.
+        node.timer += 1
+        if node.timer >= node.tsp_target_end:
+            self._end_truncation(node)
+
+    def _priority_update(self, node_x, node, vehicles):
+        self._prune_queue(node, node_x, vehicles)
+        self._refresh_active_request(node, node_x, vehicles)
+
+        if node.priority_state == TSP_EXTENDING:
+            self._extension_update(node, node_x, vehicles)
+            return
+        if node.priority_state == TSP_EARLY_TRUNCATE:
+            self._truncation_update(node, node_x)
             return
 
         request = node.active_request
-        if request is None:
-            node.priority_state = RECOVERY_ALL_RED
-            node.priority_timer = 0
-            return
-        if node.priority_state in (PRIORITY_ACTIVE, PRIORITY_CLEARING):
-            if request.bus not in vehicles:
-                request.denial_or_cancel_reason = "BUS_REMOVED"
-                self._cancel_active_request(node)
-                return
-        elif (
-            node.priority_state != RECOVERY_ALL_RED
-            and not self._request_is_live(request, vehicles)
+        if request is not None and self._request_can_start_tsp(
+            request, node_x, vehicles
         ):
-            self._cancel_active_request(node)
-            return
-
-        node.priority_timer += 1
-        if node.priority_state == CONFLICT_YELLOW:
-            if node.priority_timer >= self.yellow_time:
-                node.priority_state = ALL_RED_CLEARANCE
-                request.state = ALL_RED_CLEARANCE
-                node.priority_timer = 0
-            return
-        if node.priority_state == ALL_RED_CLEARANCE:
-            if (
-                node.priority_timer >= self.red_clearance_time
-                and self.is_intersection_clear(node_x, vehicles)
-            ):
-                if self._bus_can_use_grant(request, node_x, vehicles):
-                    node.priority_state = PRIORITY_ACTIVE
-                    request.state = PRIORITY_ACTIVE
-                    node.priority_timer = 0
-                    self._start_priority_watchdog(node, request, node_x)
-                else:
-                    # Keep the denied request attached until RECOVERY_ALL_RED
-                    # completes, so the normal conflict-safe recovery path can
-                    # record it and resume ordinary signal service.
-                    self._deny_active_grant(
-                        node, request, INFEASIBLE_GRANT
-                    )
-            return
-        if node.priority_state == PRIORITY_ACTIVE:
-            if not request.bus.is_front_bumper_upstream(
-                node_x, H_Y, ROAD_W, STOP
-            ):
-                node.priority_state = PRIORITY_CLEARING
-                request.state = PRIORITY_CLEARING
-                self._stop_priority_watchdog(node)
-                return
-            distance = self.distance_to_node_stop_bar(request.bus, node_x)
-            if (
-                node.last_stop_bar_distance is None
-                or distance
-                < node.last_stop_bar_distance - PRIORITY_PROGRESS_EPSILON
-            ):
-                node.last_progress_frame = self.frame_number
-                node.last_stop_bar_distance = distance
-            if node.active_start_frame is None:
-                self._start_priority_watchdog(node, request, node_x)
-                return
-            stalled = (
-                self.frame_number - node.last_progress_frame
-                > self.priority_active_stall_frames
-            )
-            over_max = (
-                self.frame_number - node.active_start_frame
-                > self.priority_active_max_frames
-            )
-            if stalled or over_max:
-                self._deny_active_grant(
-                    node, request, ACTIVE_STALL_TIMEOUT
-                )
-            return
-        if node.priority_state == PRIORITY_CLEARING:
-            if node_x in request.bus.passed_nodes:
-                node.priority_state = RECOVERY_ALL_RED
-                request.state = RECOVERY_ALL_RED
-                node.priority_timer = 0
-            return
-        if node.priority_state == RECOVERY_ALL_RED:
-            if (
-                node.priority_timer >= self.red_clearance_time
-                and self.is_intersection_clear(node_x, vehicles)
-            ):
-                approach = request.originating_approach
-                node.phase = 0 if approach in ("EB", "WB") else 3
-                node.timer = 0
-                node.priority_state = NORMAL
-                node.priority_timer = 0
-                if request.denial_or_cancel_reason in (
-                    "REQUEST_TIMEOUT",
-                    INFEASIBLE_GRANT,
-                    ACTIVE_STALL_TIMEOUT,
-                ):
-                    terminal_state = DENIED
-                elif request.denial_or_cancel_reason:
-                    terminal_state = CANCELLED
-                else:
-                    terminal_state = COMPLETED
-                self._finalize_request(node, request, terminal_state)
-                node.active_request = None
-                self._stop_priority_watchdog(node)
+            bus_phase = self._phase_for_approach(request.originating_approach)
+            if node.phase == bus_phase:
+                # Green extension: only when this green would otherwise end
+                # now with the bus still upstream.
+                if node.timer + 1 >= self.get_green_time(node_x, bus_phase):
+                    cap = self._tsp_cap_frames(node_x, bus_phase)
+                    if cap > 0:
+                        self._begin_extension(node, request, cap)
+                        return
+            elif node.phase == self._conflicting_phase(bus_phase):
+                if self._begin_early_green(node, request, node_x):
+                    return
+        self._normal_phase_update(node, vehicles, node_x)
 
     def update(self, vehicles=None):
         vehicles = vehicles or []
@@ -1697,22 +1717,10 @@ class SignalController:
         self._publish_discharge_status()
 
     def _base_signals_for_node(self, node):
-        request = node.active_request
-        if node.priority_state == NORMAL:
-            return self._normal_signals_for_phase(node.phase)
-        if node.priority_state == CONFLICT_YELLOW:
-            normal = self._normal_signals_for_phase(node.phase)
-            return {
-                approach: YELLOW if state in (GREEN, YELLOW) else RED
-                for approach, state in normal.items()
-            }
-        if node.priority_state in (ALL_RED_CLEARANCE, RECOVERY_ALL_RED):
-            return {"EB": RED, "WB": RED, "NB": RED, "SB": RED}
-        if node.priority_state in (PRIORITY_ACTIVE, PRIORITY_CLEARING) and request:
-            result = {"EB": RED, "WB": RED, "NB": RED, "SB": RED}
-            result[request.originating_approach] = GREEN
-            return result
-        return {"EB": RED, "WB": RED, "NB": RED, "SB": RED}
+        # TSP never isolates one approach: an extension is simply the running
+        # phase held longer and a truncation is the running phase ending
+        # sooner, so every state shows the ordinary signals for node.phase.
+        return self._normal_signals_for_phase(node.phase)
 
     def _signals_for_node(self, node_x, node):
         if self.discharge_active:
@@ -1731,17 +1739,11 @@ class SignalController:
         if not node or not node.active_request:
             return False
         request = node.active_request
-        return (
-            request.dbl_requested
-            and request.originating_approach == direction
-            and node.priority_state in (PRIORITY_ACTIVE, PRIORITY_CLEARING)
-        )
+        return request.dbl_requested and request.originating_approach == direction
 
     def get_active_dbl_request(self, target_node_x, direction=None):
         node = self.nodes.get(target_node_x)
         if not node or not node.active_request or not node.active_request.dbl_requested:
-            return None
-        if node.priority_state in (NORMAL, RECOVERY_ALL_RED):
             return None
         request = node.active_request
         if direction is not None and request.originating_approach != direction:
@@ -1758,18 +1760,27 @@ class SignalController:
                 "SB": "INACTIVE",
             }
             node = self.nodes.get(node_x)
-            if node and node.active_request and node.active_request.dbl_requested:
-                if node.priority_state in (CONFLICT_YELLOW, ALL_RED_CLEARANCE):
-                    display_state = "TRANSITIONING"
-                elif node.priority_state == PRIORITY_ACTIVE:
-                    display_state = "ACTIVE"
-                elif node.priority_state == PRIORITY_CLEARING:
-                    display_state = "CLEARING"
-                else:
-                    display_state = "INACTIVE"
-                result[node.active_request.originating_approach] = display_state
+            if node:
+                for queued in node.request_queue:
+                    if queued.dbl_requested:
+                        result[queued.originating_approach] = "TRANSITIONING"
+                request = node.active_request
+                if request and request.dbl_requested:
+                    upstream = request.bus.is_front_bumper_upstream(
+                        node_x, H_Y, ROAD_W, STOP
+                    )
+                    result[request.originating_approach] = (
+                        "ACTIVE" if upstream else "CLEARING"
+                    )
             states[node_x] = result
         return states
+
+    def _tsp_action_for_node(self, node):
+        if node.priority_state == TSP_EXTENDING:
+            return TSP_ACTION_EXTENDING
+        if node.priority_state == TSP_EARLY_TRUNCATE:
+            return TSP_ACTION_EARLY_GREEN
+        return TSP_ACTION_NONE
 
     def get_node_status(self, node_x):
         node = self.nodes[node_x]
@@ -1779,6 +1790,12 @@ class SignalController:
             "phase_timer_frames": node.timer,
             "priority_state": node.priority_state,
             "priority_timer_frames": node.priority_timer,
+            "tsp_action": self._tsp_action_for_node(node),
+            "tsp_adjust_frames": (
+                node.priority_timer if node.priority_state != NORMAL else 0
+            ),
+            "tsp_last_action": node.last_tsp_action,
+            "tsp_last_adjust_frames": node.last_tsp_adjust_frames,
             "signals": self._signals_for_node(node_x, node),
             "discharge_active": bool(self.discharge_active),
             "discharge_state": self.discharge_state,

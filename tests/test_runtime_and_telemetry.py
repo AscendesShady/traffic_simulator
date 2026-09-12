@@ -1639,30 +1639,34 @@ def test_llm_callbacks_write_runtime_control_instead_of_remaining_placeholders()
 
 
 def test_priority_telemetry_distinguishes_pending_from_active():
+    """A DBL request is pending only while queued behind another bus; the
+    node's live (armed) request is active from the moment it arms, since a
+    lane reservation needs no signal transition."""
     control_panel.bus_routes_config["R1_EB_A_NB"]["dbl_enabled"] = True
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "TELEMETRY_BUS")
+    first = make_bus_for_leg("R1_EB_A_NB", 300, "TELEMETRY_BUS_A")
+    second = make_bus_for_leg("R1_EB_A_NB", 300, "TELEMETRY_BUS_B")
+    second.x -= 60
     controller = SignalController({"green_time": 100}, 2, 2)
     exporter = TelemetryExporter(export_interval_frames=1)
 
-    controller.update([bus])
-    pending = exporter.build_payload(controller, [bus], 1)["active_buses"][0]
+    controller.update([first, second])
+    payload = exporter.build_payload(controller, [first, second], 1)
+    by_id = {bus["bus_id"]: bus for bus in payload["active_buses"]}
+    pending = by_id["TELEMETRY_BUS_B"]
     assert pending["priority_transitioning"] is True
     assert pending["priority_requested"] is True
     assert pending["dbl_priority_pending"] is True
     assert pending["priority_granted"] is False
     assert pending["dbl_active_triggered"] is False
-    assert controller.get_all_dbl_states()[300]["EB"] == "TRANSITIONING"
 
-    for _ in range(10):
-        controller.update([bus])
-        if controller.get_node_status(300)["priority_state"] == "PRIORITY_ACTIVE":
-            break
-    active = exporter.build_payload(controller, [bus], 2)["active_buses"][0]
+    active = by_id["TELEMETRY_BUS_A"]
     assert active["priority_transitioning"] is False
     assert active["priority_requested"] is True
-    assert active["priority_granted"] is True
     assert active["dbl_priority_pending"] is False
     assert active["dbl_active_triggered"] is True
+    # DBL alone never adjusts the signals, so nothing is "granted".
+    assert active["priority_granted"] is False
+    assert active["tsp_action"] == "none"
     assert controller.get_all_dbl_states()[300]["EB"] == "ACTIVE"
 
 

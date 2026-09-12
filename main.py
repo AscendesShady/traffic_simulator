@@ -8,6 +8,8 @@ import os
 import subprocess
 import atexit
 import time
+import tkinter as tk
+from tkinter import ttk
 from pathlib import Path
 import canvas_gemini as canvas
 import control_panel
@@ -15,6 +17,7 @@ import guard
 import webster
 from vehicle import Vehicle, Bus
 from signal_controller import SignalController
+from telemetry_dashboard import TelemetryDashboard
 from telemetry_exporter import TelemetryExporter
 
 # ==========================================================
@@ -1286,6 +1289,141 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
             ))
 
 
+# --- Unified single-window shell --------------------------------------------
+# One process now owns exactly one tk.Tk(): the control panel and telemetry
+# dashboard, previously each a standalone window (the latter in its own OS
+# process), mount into panes of this same root instead of creating their own.
+MAIN_WINDOW_TITLE = "Traffic Simulator"
+# Narrow enough that a 2560px-wide screen shows the simulation pane at its
+# full native canvas.WIDTH without deficit-driven squeezing (see
+# build_main_window); still wide enough for control_panel's own natural
+# ~813px content to render with only the scrollbar's width trimmed off.
+# Exact pixel tuning across every possible screen size is a styling concern,
+# not this checkpoint's -- on a narrower screen the simulation pane absorbs
+# any remaining deficit (by design, see the weight=1 comment below), and the
+# PanedWindow's sashes stay draggable afterward either way.
+SIDE_PANE_WIDTH = 760
+
+
+def build_scrollable_pane(parent, width):
+    """A fixed-width, vertically scrollable container for one side pane.
+
+    Mirrors the Canvas + Scrollbar + inner-frame pattern
+    TelemetryDashboard.create_scrollable_tab already uses for its own tabs,
+    generalized here to host an entire mounted component (the control panel
+    or the telemetry dashboard) instead of one dashboard tab.
+
+    Returns (outer_frame, content_frame, scroll_canvas). Pack widgets into
+    `content_frame`; `outer_frame` is what the caller adds to the
+    PanedWindow.
+    """
+    outer = tk.Frame(parent, width=width)
+    outer.pack_propagate(False)
+
+    scroll_canvas = tk.Canvas(
+        outer, width=width, highlightthickness=0, bg=control_panel.COLOR_BG,
+    )
+    scrollbar = ttk.Scrollbar(
+        outer, orient="vertical", command=scroll_canvas.yview
+    )
+    scroll_canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    scroll_canvas.pack(side="left", fill="both", expand=True)
+
+    content = tk.Frame(scroll_canvas, bg=control_panel.COLOR_BG)
+    content_window = scroll_canvas.create_window(
+        (0, 0), window=content, anchor="nw"
+    )
+
+    def refresh_scroll_region(_event=None):
+        scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
+
+    def fit_content_width(event):
+        scroll_canvas.itemconfigure(content_window, width=max(1, event.width))
+
+    content.bind("<Configure>", refresh_scroll_region, add="+")
+    scroll_canvas.bind("<Configure>", fit_content_width, add="+")
+
+    return outer, content, scroll_canvas
+
+
+def bind_pane_mousewheel(widget, canvas_widget):
+    """Recursively bind wheel scrolling to a pane and every widget inside it.
+
+    Tk delivers <MouseWheel> to whichever widget is directly under the
+    pointer, not to an ancestor, so binding only the outer scroll canvas
+    would silently miss every scroll gesture made over a button, label, or
+    slider sitting on top of it. This walks the already-built widget tree and
+    binds each one directly, the same recursive approach
+    TelemetryDashboard.bind_tab_mousewheel uses for its own tabs -- as
+    opposed to a global bind_all, which would make two independently
+    scrolling panes fight over one shared binding.
+    """
+    for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        widget.bind(
+            sequence,
+            lambda event, c=canvas_widget: TelemetryDashboard.scroll_tab_with_wheel(
+                event, c
+            ),
+            add="+",
+        )
+    for child in widget.winfo_children():
+        bind_pane_mousewheel(child, canvas_widget)
+
+
+def build_main_window():
+    """Construct the single Tk root and its three-pane layout.
+
+    Left = control panel, center = simulation canvas, right = telemetry.
+    The center pane claims any extra resize space (weight=1); the side panes
+    hold their configured width (weight=0) and scroll vertically for
+    whatever overflows it. This commit builds only the empty shell -- the
+    control panel and telemetry dashboard mount into their panes in later
+    checkpoints, and the simulation canvas gets its pygame-fed image later
+    still.
+    """
+    root = tk.Tk()
+    root.title(MAIN_WINDOW_TITLE)
+    root.configure(bg=control_panel.COLOR_BG)
+
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    preferred_width = SIDE_PANE_WIDTH * 2 + canvas.WIDTH + 60
+    preferred_height = max(canvas.HEIGHT + 80, 900)
+    window_width = max(900, min(screen_width - 60, preferred_width))
+    window_height = max(600, min(screen_height - 100, preferred_height))
+    root.geometry(f"{window_width}x{window_height}")
+
+    paned = ttk.PanedWindow(root, orient="horizontal")
+    paned.pack(fill="both", expand=True)
+
+    control_outer, control_pane, control_scroll = build_scrollable_pane(
+        paned, SIDE_PANE_WIDTH
+    )
+    simulation_pane = tk.Frame(paned, bg="black")
+    telemetry_outer, telemetry_pane, telemetry_scroll = build_scrollable_pane(
+        paned, SIDE_PANE_WIDTH
+    )
+    # Stashed on the pane itself rather than widening this function's return
+    # signature: whoever later mounts real content into control_pane or
+    # telemetry_pane needs this canvas to wire up bind_pane_mousewheel, but
+    # nothing in this checkpoint's empty-shell commit does yet.
+    control_pane.scroll_canvas = control_scroll
+    telemetry_pane.scroll_canvas = telemetry_scroll
+
+    # Each side pane's own requested width (frozen at SIDE_PANE_WIDTH by
+    # pack_propagate(False) above) is what the PanedWindow sizes it to
+    # automatically once mapped; weight=1 on the center pane then gives it
+    # everything left over. No explicit sashpos() call is needed -- and one
+    # actively breaks this if made before the window is first mapped, which
+    # collapses the side panes to near zero width instead.
+    paned.add(control_outer, weight=0)
+    paned.add(simulation_pane, weight=1)
+    paned.add(telemetry_outer, weight=0)
+
+    return root, control_pane, simulation_pane, telemetry_pane
+
+
 def main():
     # Seeding makes traffic generation reproducible, not LLM inference. The
     # valid benchmark is the same seed with one ARMED and one DISARMED run;
@@ -1317,10 +1455,11 @@ def main():
     }
 
     vehicles = []
-    
-    # 1. Start Control Panel
-    root = control_panel.create_dashboard_window()
-    root.geometry(startup_layout["control_geometry"])
+
+    # 1. Build the unified window shell. The control panel and telemetry
+    # dashboard mount into its panes in later checkpoints of this refactor;
+    # this step only builds the (empty) three-pane frame.
+    root, control_pane, simulation_pane, telemetry_pane = build_main_window()
 
     # 2. Start Decoupled Telemetry Dashboard as a Subprocess
     print("Launching Telemetry Dashboard...")

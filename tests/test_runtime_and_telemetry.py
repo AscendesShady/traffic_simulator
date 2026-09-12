@@ -264,6 +264,18 @@ def test_throughput_counts_truck_as_one(monkeypatch):
         def mainloop(self):
             self.callback()
 
+    class FakePane:
+        """Stand-in for a mounted pane frame: no real widget behind it."""
+
+        def __init__(self):
+            self.scroll_canvas = object()
+
+        def winfo_children(self):
+            return []
+
+        def bind(self, *_args, **_kwargs):
+            pass
+
     class FakeProcess:
         def terminate(self):
             pass
@@ -312,18 +324,21 @@ def test_throughput_counts_truck_as_one(monkeypatch):
     monkeypatch.setattr(main, "SignalController", FakeSignals)
     monkeypatch.setattr(main, "TelemetryExporter", FakeTelemetry)
     monkeypatch.setattr(main.control_panel, "approach_configs", approaches)
-    monkeypatch.setattr(main.control_panel, "create_dashboard_window", FakeRoot)
     # The unified window shell (PanedWindow, scrollable panes, pygame-blit
     # canvas) is real Tk widget construction and needs a real Tk() as its
     # parent, which FakeRoot deliberately is not -- it exists only to let
     # mainloop() return after exactly one simulation_step() instead of
     # blocking on a real event loop. This test is about vehicle/telemetry
     # accounting, not window layout, so the whole shell builder is replaced
-    # the same way create_dashboard_window always has been.
+    # the same way create_dashboard_window always has been mocked out.
     monkeypatch.setattr(
         main, "build_main_window",
-        lambda: (FakeRoot(), object(), object(), object()),
+        lambda: (FakeRoot(), FakePane(), FakePane(), FakePane()),
     )
+    monkeypatch.setattr(
+        main.control_panel, "create_dashboard_window", lambda _pane: None
+    )
+    monkeypatch.setattr(main, "bind_pane_mousewheel", lambda *_a, **_k: None)
     monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr(main.atexit, "register", lambda callback: callback)
     monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))

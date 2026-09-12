@@ -1456,10 +1456,13 @@ def main():
 
     vehicles = []
 
-    # 1. Build the unified window shell. The control panel and telemetry
-    # dashboard mount into its panes in later checkpoints of this refactor;
-    # this step only builds the (empty) three-pane frame.
+    # 1. Build the unified window shell, then mount the control panel into
+    # its left pane. write_ai_control() behavior is byte-identical to the
+    # standalone-window case; the agent subprocess depends on ai_control.json
+    # and nothing about what gets written to it changes here.
     root, control_pane, simulation_pane, telemetry_pane = build_main_window()
+    control_panel.create_dashboard_window(control_pane)
+    bind_pane_mousewheel(control_pane, control_pane.scroll_canvas)
 
     # 2. Start Decoupled Telemetry Dashboard as a Subprocess
     print("Launching Telemetry Dashboard...")

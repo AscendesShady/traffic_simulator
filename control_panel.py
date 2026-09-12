@@ -511,27 +511,48 @@ def set_active_ai_model(model, other_selector=None, persist=True):
         write_ai_control()
     return selected_model
 
-def create_dashboard_window():
+def create_dashboard_window(parent=None):
+    """Build every control-panel widget and return their container.
+
+    With no `parent`, this owns its own top-level window exactly as it always
+    has (a standalone `tk.Tk()`, title, geometry, close handling). Passed a
+    parent -- a frame inside the unified MainWindow -- it builds the same
+    widgets into that frame instead and leaves window chrome (title,
+    geometry, "-topmost", WM_DELETE_WINDOW) to whatever owns the real
+    top-level window, since only one thing may own that per process.
+    `global_config` and `write_ai_control()` behave identically either way;
+    the agent subprocess depends on `ai_control.json` and nothing here
+    changes what gets written to it.
+    """
     route_flag_buttons.clear()
-    root = tk.Tk()
-    root.title("Traffic & Transit Control Dashboard")
-    # Sized to the layout's natural width so no card is clipped. Kept at or
-    # below 890 px: main.calculate_startup_window_layout only tiles the canvas
-    # beside this window while the remaining desktop width stays >= 1000 px.
-    root.geometry("880x1030")
-    # Use normal desktop stacking. Forced topmost made the Pygame canvas slide
-    # underneath this window and also made focus/drag interaction feel sticky.
-    root.attributes("-topmost", False)
+    root = tk.Tk() if parent is None else parent
+    is_toplevel = isinstance(root, (tk.Tk, tk.Toplevel))
+    if is_toplevel:
+        root.title("Traffic & Transit Control Dashboard")
+        # Sized to the layout's natural width so no card is clipped.
+        root.geometry("880x1030")
+        # Use normal desktop stacking. Forced topmost made the Pygame canvas
+        # slide underneath this window and also made focus/drag interaction
+        # feel sticky.
+        root.attributes("-topmost", False)
     root.configure(bg=COLOR_BG)
     write_ai_control()
 
     panel_fit_after_id = None
 
     def fit_panel_to_visible_content():
-        """Resize only the height after a disclosure section changes state."""
+        """Resize only the height after a disclosure section changes state.
+
+        Only meaningful when this panel owns its own top-level window. Mounted
+        inside a MainWindow pane, the pane's own scrollable wrapper (a Canvas
+        bound to the frame's <Configure> event) already tracks this same
+        content-size change; this panel has no window to resize.
+        """
         nonlocal panel_fit_after_id
         panel_fit_after_id = None
         root.update_idletasks()
+        if not is_toplevel:
+            return
         width = root.winfo_width()
         if width <= 1:
             width = 880
@@ -556,7 +577,8 @@ def create_dashboard_window():
             pass
         sys.exit()
 
-    root.protocol("WM_DELETE_WINDOW", on_close)
+    if is_toplevel:
+        root.protocol("WM_DELETE_WINDOW", on_close)
 
     style = ttk.Style()
     style.theme_use('clam')

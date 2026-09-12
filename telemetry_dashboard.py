@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -195,6 +196,57 @@ def poll_gpu_stats():
         return _gpu_none()
 
 
+# poll_gpu_stats() shells out to nvidia-smi with a 2-second timeout. Called
+# synchronously from the Tk callback, a single slow or hung nvidia-smi call
+# freezes the entire event loop for up to 2 seconds -- and after the window
+# merge, that loop also drives the simulation and the pygame canvas, so the
+# freeze becomes visible everywhere, not just in one dashboard process. A
+# daemon thread refreshes a cached dict on its own clock; the Tk callback only
+# ever reads that cache, so it never blocks.
+GPU_POLL_INTERVAL_SECONDS = 2.0
+_gpu_stats_lock = threading.Lock()
+_gpu_stats_cache = _gpu_none()
+_gpu_poll_thread = None
+
+
+def _gpu_poll_worker(stop_event):
+    global _gpu_stats_cache
+    while not stop_event.is_set():
+        try:
+            stats = poll_gpu_stats()
+        except Exception:
+            # poll_gpu_stats() already degrades gracefully on its own errors;
+            # this guards a monkeypatched or otherwise misbehaving replacement
+            # from silently ending the background poll for the rest of the
+            # session.
+            stats = _gpu_none()
+        with _gpu_stats_lock:
+            _gpu_stats_cache = stats
+        stop_event.wait(GPU_POLL_INTERVAL_SECONDS)
+
+
+def start_gpu_poll_thread():
+    """Start the background GPU sampler once; safe to call more than once."""
+    global _gpu_poll_thread
+    if _gpu_poll_thread is not None and _gpu_poll_thread.is_alive():
+        return _gpu_poll_thread
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_gpu_poll_worker, args=(stop_event,), daemon=True,
+        name="gpu-poll",
+    )
+    thread.stop_event = stop_event
+    thread.start()
+    _gpu_poll_thread = thread
+    return thread
+
+
+def read_cached_gpu_stats():
+    """Return the most recently sampled GPU stats without blocking."""
+    with _gpu_stats_lock:
+        return dict(_gpu_stats_cache)
+
+
 class HoverTooltip:
     """Small delayed tooltip shared by one widget region and its children."""
 
@@ -313,6 +365,7 @@ class TelemetryDashboard:
         self.build_ui()
         self.root.bind("<Configure>", self.schedule_responsive_layout, add="+")
         self.root.after_idle(self.apply_responsive_layout)
+        start_gpu_poll_thread()
         self.poll_telemetry()
         self.poll_llm_performance()
 
@@ -1834,7 +1887,7 @@ class TelemetryDashboard:
     def poll_llm_performance(self):
         """Poll model logs and current GPU state on a separate one-second clock."""
         try:
-            self.latest_gpu = poll_gpu_stats()
+            self.latest_gpu = read_cached_gpu_stats()
             self.latest_ai_control = self.safe_read_ai_control()
             records, log_size = self.safe_read_agent_turns()
             if (

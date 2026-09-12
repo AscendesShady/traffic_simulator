@@ -62,8 +62,8 @@ def test_summary_fits_a_short_window():
     assert TelemetryDashboard.initial_window_size(640, 480) == (560, 360)
 
 
-def test_kpi_strip_carries_every_summary_metric():
-    """Every value update_metrics writes must have a cell in the strip."""
+def test_kpi_grid_carries_every_summary_metric():
+    """Every value update_metrics writes must have a card in the grid."""
     keys = {key for _label, key in telemetry_dashboard_module.SUMMARY_KPIS}
     assert keys == {
         "vehicles",
@@ -76,9 +76,11 @@ def test_kpi_strip_carries_every_summary_metric():
         "dbl",
         "timer",
     }
-    # Labels stay short so the strip fits on one row.
-    for label, _key in telemetry_dashboard_module.SUMMARY_KPIS:
-        assert len(label) <= 5, label
+    # Portrait layout: two cards per row, full titles rather than
+    # abbreviations since each card has its own line for the title.
+    assert telemetry_dashboard_module.SUMMARY_KPI_COLUMNS == 2
+    source = inspect.getsource(TelemetryDashboard.build_ui)
+    assert "divmod(index, SUMMARY_KPI_COLUMNS)" in source
 
 
 def test_every_summary_abbreviation_has_hover_help():

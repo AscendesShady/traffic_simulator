@@ -75,22 +75,22 @@ TELEMETRY_EXPORT_HEADERS = [
     "queues_passengers_est",
 ]
 
-# Summary KPI strip: label shown after the value, in display order.
+# Summary KPI cards, in display order, laid out two per row (portrait).
 SUMMARY_KPIS = (
-    ("VEH", "vehicles"),
-    ("BUS", "buses"),
-    ("PAX", "passengers"),
-    ("Q", "queued"),
-    ("AVGQ", "delay"),
-    ("CONG", "congestion"),
-    ("TSP", "tsp"),
-    ("DBL", "dbl"),
-    ("SIM", "timer"),
+    ("Active Vehicles", "vehicles"),
+    ("Active Buses", "buses"),
+    ("Passenger Vol", "passengers"),
+    ("Road/Demand Queue", "queued"),
+    ("Avg Queue (20s)", "delay"),
+    ("Congestion", "congestion"),
+    ("TSP Active/Pending", "tsp"),
+    ("DBL Active/Pending", "dbl"),
+    ("Sim Timer", "timer"),
 )
+SUMMARY_KPI_COLUMNS = 2
 
-# Hover text for the deliberately compact KPI strip. Keep this keyed by the
-# underlying metric rather than display order so every abbreviation has one
-# clear, testable definition.
+# Hover text for each KPI card. Keyed by the underlying metric rather than
+# display order so every card has one clear, testable definition.
 KPI_TOOLTIPS = {
     "vehicles": "Vehicles currently in the network",
     "buses": "Buses currently in the network",
@@ -515,43 +515,47 @@ class TelemetryDashboard:
         # export. The status label stays unpacked so export_summary_snapshot,
         # which EXPORT ALL reuses, still has somewhere to report.
 
-        # One dense KPI strip replaces the old 3x3 card grid: the same
-        # numbers in roughly a fifth of the vertical space.
-        self.metrics_frame = tk.Frame(
-            self.summary_content,
-            bg=COLOR_CARD,
-            highlightbackground=COLOR_CARD_BORDER,
-            highlightthickness=1,
-        )
+        # Portrait KPI grid: two cards per row, title over a large value, so
+        # the summary reads as a narrow column rather than one wide strip.
+        self.metrics_frame = tk.Frame(self.summary_content, bg=COLOR_BG)
         self.metrics_frame.pack(fill="x", padx=10, pady=(4, 3))
+        for column_index in range(SUMMARY_KPI_COLUMNS):
+            self.metrics_frame.grid_columnconfigure(
+                column_index, weight=1, uniform="summary_metric_columns"
+            )
         self.vars = {}
         self.metric_cards = []
         self.metric_title_labels = []
         self.metric_tooltips = []
         for index, (title, key) in enumerate(SUMMARY_KPIS):
-            if index:
-                separator = tk.Frame(
-                    self.metrics_frame, bg=COLOR_CARD_BORDER, width=1
-                )
-                separator.pack(side="left", fill="y", pady=4)
-            cell = tk.Frame(self.metrics_frame, bg=COLOR_CARD)
-            cell.pack(side="left", fill="both", expand=True, padx=5, pady=3)
-            value = tk.Label(
-                cell,
-                text="--",
-                font=(FONT_FAMILY, 13, "bold"),
+            row_index, column_index = divmod(index, SUMMARY_KPI_COLUMNS)
+            cell = tk.Frame(
+                self.metrics_frame,
                 bg=COLOR_CARD,
-                fg=COLOR_ACCENT,
+                highlightbackground=COLOR_CARD_BORDER,
+                highlightthickness=1,
             )
-            value.pack(side="left")
+            cell.grid(
+                row=row_index, column=column_index, sticky="nsew", padx=3, pady=3
+            )
             title_label = tk.Label(
                 cell,
                 text=title,
                 font=(FONT_FAMILY, 8, "bold"),
                 bg=COLOR_CARD,
                 fg=COLOR_TEXT_SECONDARY,
+                anchor="w",
             )
-            title_label.pack(side="left", padx=(3, 0))
+            title_label.pack(fill="x", padx=10, pady=(6, 0))
+            value = tk.Label(
+                cell,
+                text="--",
+                font=(FONT_FAMILY, 15, "bold"),
+                bg=COLOR_CARD,
+                fg=COLOR_ACCENT,
+                anchor="w",
+            )
+            value.pack(fill="x", padx=10, pady=(0, 6))
             self.metric_cards.append(cell)
             self.metric_title_labels.append(title_label)
             tooltip = HoverTooltip(cell, KPI_TOOLTIPS[key])
@@ -764,7 +768,10 @@ class TelemetryDashboard:
         """Return bounded dimensions and fonts for the current client area."""
         width = max(WINDOW_MIN_WIDTH, int(width))
         height = max(WINDOW_MIN_HEIGHT, int(height))
-        scale = max(0.60, min(1.0, min(width / 900.0, height / 430.0)))
+        # A portrait column (narrow but tall, e.g. MainWindow's side pane)
+        # has room for full-size type; only a genuinely short client area
+        # should shrink fonts. Width alone never drives the scale down.
+        scale = max(0.60, min(1.0, height / 700.0))
         compact = width < 700 or height < 700
         return {
             "compact": compact,
@@ -812,32 +819,34 @@ class TelemetryDashboard:
             pady=(0, 6 if compact else 12),
         )
 
-        metric_pad = 1 if compact else 3
+        metric_pad = 2 if compact else 4
         self.metrics_frame.pack_configure(
-            padx=8 if compact else 20,
+            padx=8 if compact else 16,
             pady=2 if compact else 5,
         )
-        for row_index in range(3):
+        row_count = -(-len(SUMMARY_KPIS) // SUMMARY_KPI_COLUMNS)
+        for row_index in range(row_count):
             self.metrics_frame.grid_rowconfigure(
                 row_index,
                 weight=1,
                 uniform="summary_metric_rows",
                 minsize=profile["metric_row_height"],
             )
-        # The KPI strip is packed, not gridded: each cell sits side by side.
         for card, title_label in zip(self.metric_cards, self.metric_title_labels):
-            card.pack_configure(padx=metric_pad, pady=max(2, metric_pad - 2))
+            card.grid_configure(padx=metric_pad, pady=metric_pad)
             title_label.config(
                 font=(FONT_FAMILY, profile["metric_title_font"], "bold")
             )
-            title_label.pack_configure(padx=(2 if compact else 3, 0), pady=0)
+            title_label.pack_configure(
+                padx=6 if compact else 10, pady=(4 if compact else 6, 0)
+            )
         for value_label in self.vars.values():
             value_label.config(
                 font=(FONT_FAMILY, profile["metric_value_font"], "bold")
             )
             value_label.pack_configure(
-                padx=5 if compact else 10,
-                pady=(0, 1 if compact else 4),
+                padx=6 if compact else 10,
+                pady=(0, 4 if compact else 6),
             )
 
         detail_font = (FONT_FAMILY, profile["detail_font"])
@@ -875,14 +884,17 @@ class TelemetryDashboard:
         self.phase_title_lbl.config(
             font=(FONT_FAMILY, max(8, profile["section_font"] - 1), "bold")
         )
-        self.phase_hint_lbl.config(
-            text=(
-                "Nominal cycle | live dots"
-                if compact
-                else "Nominal plan | marker repeats | dots show live state"
-            ),
-            font=(FONT_FAMILY, profile["detail_font"]),
-        )
+        # The legend hint has no room beside the title and status in a
+        # portrait column; it is decorative, so it simply goes away there.
+        if compact:
+            self.phase_hint_lbl.pack_forget()
+        else:
+            self.phase_hint_lbl.config(
+                text="Nominal plan | marker repeats | dots show live state",
+                font=(FONT_FAMILY, profile["detail_font"]),
+            )
+            if not self.phase_hint_lbl.winfo_manager():
+                self.phase_hint_lbl.pack(side="right", padx=(10, 12))
         self.phase_status_lbl.config(font=detail_bold_font, width=16 if compact else 18)
         self.phase_heading.pack_configure(
             padx=6 if compact else 10,

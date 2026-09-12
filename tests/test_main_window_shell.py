@@ -45,11 +45,18 @@ def test_center_pane_claims_dominant_share_on_resize():
     try:
         root.update_idletasks()
         root.update()
+        expected_side_width = max(
+            main.MIN_SIDE_PANE_WIDTH,
+            min(
+                main.MAX_SIDE_PANE_WIDTH,
+                round(root.winfo_width() * main.SIDE_PANE_WIDTH_FRACTION),
+            ),
+        )
         # The side panes hold close to their configured width; the center
         # pane is not artificially pinned to a small size.
-        assert control_pane.winfo_width() > main.SIDE_PANE_WIDTH * 0.8
-        assert telemetry_pane.winfo_width() > main.SIDE_PANE_WIDTH * 0.8
-        assert simulation_pane.winfo_width() > main.SIDE_PANE_WIDTH * 0.5
+        assert control_pane.winfo_width() > expected_side_width * 0.8
+        assert telemetry_pane.winfo_width() > expected_side_width * 0.8
+        assert simulation_pane.winfo_width() > expected_side_width * 0.5
     finally:
         root.destroy()
 

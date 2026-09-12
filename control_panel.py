@@ -46,6 +46,11 @@ SYM_DISCLOSURE_CLOSED = "\u25b6"  # ▶
 
 CONTROL_PANEL_MIN_HEIGHT = 360
 CONTROL_PANEL_BOTTOM_MARGIN = 40
+# Standalone-window width and the widest a wrapped status line may run.
+# Both sized for the portrait column this panel now lays itself out as,
+# whether it owns its own window or is mounted into MainWindow's left pane.
+CONTROL_PANEL_WIDTH = 520
+PORTRAIT_WRAP_LENGTH = 320
 BENCHMARK_COUNTDOWN_WIDTH = len("00:00 PAUSED")
 
 # Timed-benchmark durations, measured in SIMULATION seconds so a run is
@@ -529,8 +534,7 @@ def create_dashboard_window(parent=None):
     is_toplevel = isinstance(root, (tk.Tk, tk.Toplevel))
     if is_toplevel:
         root.title("Traffic & Transit Control Dashboard")
-        # Sized to the layout's natural width so no card is clipped.
-        root.geometry("880x1030")
+        root.geometry(f"{CONTROL_PANEL_WIDTH}x1030")
         # Use normal desktop stacking. Forced topmost made the Pygame canvas
         # slide underneath this window and also made focus/drag interaction
         # feel sticky.
@@ -555,7 +559,7 @@ def create_dashboard_window(parent=None):
             return
         width = root.winfo_width()
         if width <= 1:
-            width = 880
+            width = CONTROL_PANEL_WIDTH
         x_pos = max(0, root.winfo_x())
         y_pos = max(0, root.winfo_y())
         height = bounded_control_panel_height(
@@ -626,12 +630,15 @@ def create_dashboard_window(parent=None):
 
     title_label = tk.Label(
         header_frame, text="NETWORK CONTROL DASHBOARD",
-        font=(FONT_FAMILY, 15, "bold"), bg=COLOR_BG, fg=COLOR_TEXT_PRIMARY
+        font=(FONT_FAMILY, 14, "bold"), bg=COLOR_BG, fg=COLOR_TEXT_PRIMARY,
+        anchor="w",
     )
-    title_label.pack(side="left")
+    title_label.pack(fill="x")
 
+    # Status sits under the title: beside it, the title alone fills a
+    # portrait-width pane and the status text gets clipped.
     status_badge = tk.Frame(header_frame, bg=COLOR_BG)
-    status_badge.pack(side="right")
+    status_badge.pack(fill="x", pady=(2, 0))
 
     dot_lbl = tk.Label(status_badge, text=SYM_DOT, font=(FONT_FAMILY, 11), bg=COLOR_BG, fg=COLOR_TEXT_SECONDARY)
     dot_lbl.pack(side="left", padx=(0, 4))
@@ -642,8 +649,9 @@ def create_dashboard_window(parent=None):
     )
     status_text.pack(side="left")
 
-    # 2. TOP BAR: run controls on the left, the timed benchmark boxed beside
-    # them on the right. Both cards fill the bar so they share its height.
+    # 2. TOP BAR: run controls, then the timed benchmark card below them.
+    # Portrait layout: stacked full-width instead of side-by-side, since a
+    # narrow side pane has no room to share a row between two cards.
     top_bar = tk.Frame(root, bg=COLOR_BG)
     top_bar.pack(fill="x", padx=20, pady=2)
 
@@ -651,7 +659,7 @@ def create_dashboard_window(parent=None):
         top_bar, bg=COLOR_CARD, highlightbackground=COLOR_CARD_BORDER,
         highlightthickness=1, bd=0
     )
-    global_card.pack(side="left", fill="both", expand=True, ipady=3)
+    global_card.pack(fill="x", ipady=3)
 
     g_title = tk.Label(
         global_card, text="Global Simulation Controls",
@@ -659,8 +667,12 @@ def create_dashboard_window(parent=None):
     )
     g_title.pack(anchor="w", padx=16, pady=(7, 5))
 
+    # Portrait layout: START/PAUSE share a row, RESET gets its own full-width
+    # row below -- a narrow side pane has no room for all three abreast.
     controls_row = tk.Frame(global_card, bg=COLOR_CARD)
-    controls_row.pack(fill="x", padx=16, pady=(0, 8))
+    controls_row.pack(fill="x", padx=16, pady=(0, 4))
+    reset_row = tk.Frame(global_card, bg=COLOR_CARD)
+    reset_row.pack(fill="x", padx=16, pady=(0, 8))
 
     def toggle_start_stop():
         request_start_stop()
@@ -672,7 +684,7 @@ def create_dashboard_window(parent=None):
         activeforeground=COLOR_TEXT_PRIMARY, bd=0, padx=12, pady=4,
         cursor="hand2", relief="flat", command=toggle_start_stop
     )
-    start_stop_btn.pack(side="left", padx=(0, 8))
+    start_stop_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
     def toggle_pause():
         request_pause_resume()
@@ -684,26 +696,26 @@ def create_dashboard_window(parent=None):
         cursor="hand2", relief="flat"
     )
     pause_btn.config(command=toggle_pause)
-    pause_btn.pack(side="left", padx=(0, 8))
+    pause_btn.pack(side="left", fill="x", expand=True)
 
     def trigger_reset():
         global_config["reset_triggered"] = True
 
     reset_btn = tk.Button(
-        controls_row, text=f"{SYM_RESET} RESET VEHICLES", font=(FONT_FAMILY, 8, "bold"),
+        reset_row, text=f"{SYM_RESET} RESET VEHICLES", font=(FONT_FAMILY, 8, "bold"),
         bg=COLOR_DANGER, fg=COLOR_TEXT_PRIMARY, activebackground="#D32F2F",
         activeforeground=COLOR_TEXT_PRIMARY, bd=0, padx=12, pady=4,
         cursor="hand2", relief="flat"
     )
     reset_btn.config(command=trigger_reset)
-    reset_btn.pack(side="left")
+    reset_btn.pack(fill="x")
 
     # --- Timed benchmark: its own bordered box beside the run controls ---
     test_card = tk.Frame(
         top_bar, bg=COLOR_CARD, highlightbackground=COLOR_WARNING,
         highlightthickness=1, bd=0
     )
-    test_card.pack(side="left", fill="both", padx=(10, 0), ipady=3)
+    test_card.pack(fill="x", pady=(6, 0), ipady=3)
 
     test_header_row = tk.Frame(test_card, bg=COLOR_CARD)
     test_header_row.pack(fill="x", padx=14, pady=(6, 4))
@@ -852,14 +864,13 @@ def create_dashboard_window(parent=None):
 
     root.after(100, refresh_simulation_status)
 
-    # Run parameters sit on their own row. Sharing one row with the action
-    # buttons required 806 px inside a 748 px card, which clipped the seed
-    # control off the right edge.
+    # Run parameters: portrait layout stacks speed and seed on separate rows
+    # rather than sharing one, which needed ~400 px abreast.
     params_row = tk.Frame(global_card, bg=COLOR_CARD)
     params_row.pack(fill="x", padx=16, pady=0)
 
     speed_group = tk.Frame(params_row, bg=COLOR_CARD)
-    speed_group.pack(side="left", padx=(0, 18))
+    speed_group.pack(fill="x", pady=(0, 4))
 
     speed_title_lbl = tk.Label(
         speed_group, text="Speed:", font=(FONT_FAMILY, 8, "bold"),
@@ -886,7 +897,7 @@ def create_dashboard_window(parent=None):
     enable_scale_keyboard(speed_slider, step=0.1)
 
     seed_group = tk.Frame(params_row, bg=COLOR_CARD)
-    seed_group.pack(side="left")
+    seed_group.pack(fill="x", pady=(0, 4))
 
     tk.Label(
         seed_group, text="Seed:", font=(FONT_FAMILY, 8, "bold"),
@@ -949,9 +960,8 @@ def create_dashboard_window(parent=None):
     seed_entry.bind("<Return>", apply_seed_from_entry)
     seed_entry.bind("<FocusOut>", apply_seed_from_entry)
 
-    # Motion/priority tuning spans the full panel width below the top bar. It
-    # cannot share the narrower run-controls card because the benchmark card
-    # occupies the right side of that bar.
+    # Motion/priority tuning: portrait layout puts each slider on its own
+    # full-width row of this card.
     tuning_row = tk.Frame(
         root, bg=COLOR_CARD, highlightbackground=COLOR_CARD_BORDER,
         highlightthickness=1, bd=0,
@@ -959,7 +969,7 @@ def create_dashboard_window(parent=None):
     tuning_row.pack(fill="x", padx=20, pady=0)
 
     eligibility_group = tk.Frame(tuning_row, bg=COLOR_CARD)
-    eligibility_group.pack(side="left", padx=(0, 24))
+    eligibility_group.pack(fill="x", padx=16, pady=(6, 2))
     tk.Label(
         eligibility_group, text="Eligibility Zone:",
         font=(FONT_FAMILY, 8, "bold"), bg=COLOR_CARD,
@@ -982,11 +992,11 @@ def create_dashboard_window(parent=None):
         style="Global.Horizontal.TScale", command=update_priority_eligibility,
         length=150,
     )
-    eligibility_slider.pack(side="left", padx=2)
+    eligibility_slider.pack(side="left", fill="x", expand=True, padx=2)
     enable_scale_keyboard(eligibility_slider, step=10)
 
     vehicle_scale_group = tk.Frame(tuning_row, bg=COLOR_CARD)
-    vehicle_scale_group.pack(side="left", padx=(0, 14))
+    vehicle_scale_group.pack(fill="x", padx=16, pady=(2, 2))
     tk.Label(
         vehicle_scale_group, text="Vehicle Speed Scale:",
         font=(FONT_FAMILY, 8, "bold"), bg=COLOR_CARD,
@@ -1009,13 +1019,14 @@ def create_dashboard_window(parent=None):
         style="Global.Horizontal.TScale", command=update_vehicle_scale,
         length=130,
     )
-    vehicle_scale_slider.pack(side="left", padx=2)
+    vehicle_scale_slider.pack(side="left", fill="x", expand=True, padx=2)
     enable_scale_keyboard(vehicle_scale_slider, step=0.05)
 
     tk.Label(
         tuning_row, text="Applies on next START / RESET",
         font=(FONT_FAMILY, 8), bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY,
-    ).pack(side="left")
+        anchor="w",
+    ).pack(fill="x", padx=16, pady=(0, 6))
 
     webster_row = tk.Frame(global_card, bg=COLOR_CARD)
     webster_row.pack(fill="x", padx=16, pady=(0, 6))
@@ -1062,7 +1073,12 @@ def create_dashboard_window(parent=None):
         style="Modern.TCombobox",
     )
     discharge_mode_box.set(global_config["discharge_selection"])
-    discharge_mode_box.pack(side="left", padx=(0, 8))
+    discharge_mode_box.pack(side="left", fill="x", expand=True)
+
+    # Portrait layout: the two action buttons take their own row under the
+    # corridor selector instead of trailing it on the same line.
+    recovery_actions = tk.Frame(recovery_card, bg=COLOR_CARD)
+    recovery_actions.pack(fill="x", padx=16, pady=(0, 4))
 
     def on_discharge_mode_selected(event):
         global_config["discharge_selection"] = discharge_mode_box.get()
@@ -1090,26 +1106,26 @@ def create_dashboard_window(parent=None):
         )
 
     start_discharge_btn = tk.Button(
-        recovery_controls, text="START DISCHARGE",
+        recovery_actions, text="START DISCHARGE",
         font=(FONT_FAMILY, 8, "bold"), bg=COLOR_DANGER,
         fg=COLOR_TEXT_PRIMARY, activebackground="#D32F2F",
         activeforeground=COLOR_TEXT_PRIMARY, bd=0, padx=10, pady=4,
         cursor="hand2", relief="flat", command=start_discharge
     )
-    start_discharge_btn.pack(side="left", padx=(0, 8))
+    start_discharge_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
     def safe_stop_discharge():
         global_config["discharge_start_requested"] = False
         global_config["discharge_stop_requested"] = True
 
     stop_discharge_btn = tk.Button(
-        recovery_controls, text="SAFE STOP",
+        recovery_actions, text="SAFE STOP",
         font=(FONT_FAMILY, 8, "bold"), bg=COLOR_CARD_BORDER,
         fg=COLOR_TEXT_PRIMARY, activebackground="#475569",
         activeforeground=COLOR_TEXT_PRIMARY, bd=0, padx=10, pady=4,
         cursor="hand2", relief="flat", command=safe_stop_discharge
     )
-    stop_discharge_btn.pack(side="left")
+    stop_discharge_btn.pack(side="left", fill="x", expand=True)
 
     recovery_status = tk.Frame(recovery_card, bg=COLOR_CARD_ALT)
     recovery_status.pack(fill="x", padx=16, pady=(0, 3))
@@ -1122,14 +1138,14 @@ def create_dashboard_window(parent=None):
     discharge_reason_lbl = tk.Label(
         recovery_status, text="Reason: Normal signal control is active",
         font=(FONT_FAMILY, 8), bg=COLOR_CARD_ALT,
-        fg=COLOR_TEXT_PRIMARY, anchor="w", justify="left", wraplength=750
+        fg=COLOR_TEXT_PRIMARY, anchor="w", justify="left", wraplength=PORTRAIT_WRAP_LENGTH
     )
     discharge_reason_lbl.pack(fill="x", padx=8)
     discharge_recommendation_lbl = tk.Label(
         recovery_status,
         text="Recommended first action: Select Auto or a corridor, then start discharge",
         font=(FONT_FAMILY, 8), bg=COLOR_CARD_ALT,
-        fg=COLOR_WARNING, anchor="w", justify="left", wraplength=750
+        fg=COLOR_WARNING, anchor="w", justify="left", wraplength=PORTRAIT_WRAP_LENGTH
     )
     discharge_recommendation_lbl.pack(fill="x", padx=8, pady=(0, 5))
 
@@ -1180,11 +1196,16 @@ def create_dashboard_window(parent=None):
     )
     ai_title.pack(anchor="w", padx=16, pady=(7, 5))
 
-    # First row: Controls
+    # Model selectors: portrait layout gives Local and API their own rows.
     ai_row1 = tk.Frame(ai_card, bg=COLOR_CARD)
-    ai_row1.pack(fill="x", padx=16, pady=(0, 5))
+    ai_row1.pack(fill="x", padx=16, pady=(0, 4))
+    ai_row_api = tk.Frame(ai_card, bg=COLOR_CARD)
+    ai_row_api.pack(fill="x", padx=16, pady=(0, 5))
 
-    llm_lbl = tk.Label(ai_row1, text="Local", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
+    llm_lbl = tk.Label(
+        ai_row1, text="Local", font=(FONT_FAMILY, 9), bg=COLOR_CARD,
+        fg=COLOR_TEXT_PRIMARY, width=5, anchor="w",
+    )
     llm_lbl.pack(side="left", padx=(0, 8))
 
     available_models = get_ollama_models()
@@ -1208,7 +1229,7 @@ def create_dashboard_window(parent=None):
         width=22, state="readonly", style="Modern.TCombobox"
     )
     llm_engine_box.set(selected_local_model)
-    llm_engine_box.pack(side="left", padx=(0, 16))
+    llm_engine_box.pack(side="left", fill="x", expand=True)
 
     def on_llm_engine_selected(event):
         selected_model_name = set_active_ai_model(
@@ -1220,23 +1241,25 @@ def create_dashboard_window(parent=None):
     llm_engine_box.bind("<<ComboboxSelected>>", on_llm_engine_selected)
 
     api_lbl = tk.Label(
-        ai_row1,
+        ai_row_api,
         text="API",
         font=(FONT_FAMILY, 9),
         bg=COLOR_CARD,
         fg=COLOR_TEXT_PRIMARY,
+        width=5,
+        anchor="w",
     )
     api_lbl.pack(side="left", padx=(0, 8))
 
     api_engine_box = ttk.Combobox(
-        ai_row1,
+        ai_row_api,
         values=available_api_models,
         width=22,
         state="readonly",
         style="Modern.TCombobox",
     )
     api_engine_box.set(selected_api_model)
-    api_engine_box.pack(side="left", padx=(0, 16))
+    api_engine_box.pack(side="left", fill="x", expand=True)
 
     def on_api_engine_selected(event):
         selected_model_name = set_active_ai_model(
@@ -1262,43 +1285,74 @@ def create_dashboard_window(parent=None):
             runtime["last_turn"] = 0
         write_ai_control()
 
+    # Arm button and live status on their own row under the selectors.
+    ai_row_run = tk.Frame(ai_card, bg=COLOR_CARD)
+    ai_row_run.pack(fill="x", padx=16, pady=(0, 5))
+
     run_llm_btn = tk.Button(
-        ai_row1, text=f"{SYM_PLAY} RUN LLM", font=(FONT_FAMILY, 8, "bold"),
+        ai_row_run, text=f"{SYM_PLAY} RUN LLM", font=(FONT_FAMILY, 8, "bold"),
         bg=COLOR_WARNING, fg=COLOR_BG, activebackground="#D97706",
         activeforeground=COLOR_BG, bd=0, padx=12, pady=4,
         cursor="hand2", relief="flat", command=on_run_llm
     )
-    run_llm_btn.pack(side="left", padx=(0, 16))
+    run_llm_btn.pack(side="left", padx=(0, 12))
 
-    llm_status_box = tk.Frame(ai_row1, bg=COLOR_CARD)
-    llm_status_box.pack(side="right")
+    llm_status_box = tk.Frame(ai_row_run, bg=COLOR_CARD)
+    llm_status_box.pack(side="left", fill="x", expand=True)
 
     llm_dot = tk.Label(llm_status_box, text=SYM_DOT, font=(FONT_FAMILY, 11), bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY)
     llm_dot.pack(side="left", padx=(0, 4))
 
-    llm_status_text = tk.Label(llm_status_box, text="LLM INACTIVE", font=(FONT_FAMILY, 9, "bold"), bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY)
-    llm_status_text.pack(side="left")
+    llm_status_text = tk.Label(
+        llm_status_box, text="LLM INACTIVE", font=(FONT_FAMILY, 9, "bold"),
+        bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY, anchor="w",
+    )
+    llm_status_text.pack(side="left", fill="x", expand=True)
 
-    # Second row: Selected Model Label
+    # Selected model and control scope, one line each: at portrait width the
+    # two no longer fit side by side on the row they used to share.
     ai_row2 = tk.Frame(ai_card, bg=COLOR_CARD)
-    ai_row2.pack(fill="x", padx=16, pady=(0, 6))
+    ai_row2.pack(fill="x", padx=16, pady=(0, 2))
 
     sel_lbl = tk.Label(ai_row2, text="Selected: ", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
     sel_lbl.pack(side="left")
-    
+
     selected_val_lbl = tk.Label(ai_row2, text=selected_model, font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_ACCENT)
     selected_val_lbl.pack(side="left")
 
+    ai_row_scope = tk.Frame(ai_card, bg=COLOR_CARD)
+    ai_row_scope.pack(fill="x", padx=16, pady=(0, 4))
+
+    ctrl_lbl = tk.Label(ai_row_scope, text="Control: ", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
+    ctrl_lbl.pack(side="left")
+
+    ctrl_val_lbl = tk.Label(ai_row_scope, text="TSP + DBL", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_ACCENT)
+    ctrl_val_lbl.pack(side="left")
+
+    ctrl_rest_lbl = tk.Label(ai_row_scope, text=" for all bus routes", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
+    ctrl_rest_lbl.pack(side="left")
+
+    ai_row_tick = tk.Frame(ai_card, bg=COLOR_CARD)
+    ai_row_tick.pack(fill="x", padx=16, pady=(0, 6))
+
     tick_runtime = global_config["ai_runtime"]
+    tk.Label(
+        ai_row_tick,
+        text="Decision interval",
+        font=(FONT_FAMILY, 8),
+        bg=COLOR_CARD,
+        fg=COLOR_TEXT_PRIMARY,
+    ).pack(side="left", padx=(0, 6))
     tick_value_lbl = tk.Label(
-        ai_row2,
+        ai_row_tick,
         text=f"{int(tick_runtime.get('tick_seconds', 5))}s",
         font=(FONT_FAMILY, 8, "bold"),
         bg=COLOR_CARD,
         fg=COLOR_ACCENT,
         width=4,
+        anchor="w",
     )
-    tick_value_lbl.pack(side="right")
+    tick_value_lbl.pack(side="left")
 
     def on_tick_seconds_changed(value):
         tick_seconds = min(15, max(2, int(float(value))))
@@ -1307,7 +1361,7 @@ def create_dashboard_window(parent=None):
         write_ai_control()
 
     tick_slider = ttk.Scale(
-        ai_row2,
+        ai_row_tick,
         from_=2,
         to=15,
         value=tick_runtime.get("tick_seconds", 5),
@@ -1315,26 +1369,8 @@ def create_dashboard_window(parent=None):
         command=on_tick_seconds_changed,
         length=110,
     )
-    tick_slider.pack(side="right", padx=(6, 2))
+    tick_slider.pack(side="left", fill="x", expand=True, padx=(2, 0))
     enable_scale_keyboard(tick_slider, step=1)
-    tk.Label(
-        ai_row2,
-        text="Decision interval",
-        font=(FONT_FAMILY, 8),
-        bg=COLOR_CARD,
-        fg=COLOR_TEXT_PRIMARY,
-    ).pack(side="right")
-
-    # Control scope shares the "Selected" row. It is static text, and the row
-    # it used to own cost the vertical space the run-parameter row now needs.
-    ctrl_lbl = tk.Label(ai_row2, text="     Control: ", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
-    ctrl_lbl.pack(side="left")
-
-    ctrl_val_lbl = tk.Label(ai_row2, text="TSP + DBL", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_ACCENT)
-    ctrl_val_lbl.pack(side="left")
-
-    ctrl_rest_lbl = tk.Label(ai_row2, text=" for all bus routes", font=(FONT_FAMILY, 9), bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY)
-    ctrl_rest_lbl.pack(side="left")
 
     def refresh_llm_status():
         runtime = global_config.get("ai_runtime", {})
@@ -1421,14 +1457,14 @@ def create_dashboard_window(parent=None):
     dispatch_row.pack(fill="x", padx=16, pady=(0, 5))
 
     dispatch_box = tk.Frame(dispatch_row, bg=COLOR_CARD)
-    dispatch_box.pack(side="right")
+    dispatch_box.pack(fill="x")
 
     disp_route_box = ttk.Combobox(
         dispatch_box, values=[r["name"] for r in bus_routes_config.values()],
         width=22, state="readonly", style="Modern.TCombobox"
     )
     disp_route_box.set(bus_routes_config["R1_EB_A_NB"]["name"])
-    disp_route_box.pack(side="left", padx=(0, 8))
+    disp_route_box.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
     def trigger_manual_dispatch():
         selected_name = disp_route_box.get()
@@ -1447,45 +1483,25 @@ def create_dashboard_window(parent=None):
     manual_btn.config(command=trigger_manual_dispatch)
     manual_btn.pack(side="left")
 
-    TRANSIT_COL_WIDTHS = [200, 70, 190, 110, 110]
-
-    r_headers = tk.Frame(transit_body, bg=COLOR_CARD, height=22)
-    r_headers.pack_propagate(False)
-    r_headers.pack(fill="x", padx=16, pady=(2, 4))
-
-    r_titles = ["Route Name", "Status", "Headway Frequency", "TSP Signal", "DBL Lane"]
-    for i, (title, width) in enumerate(zip(r_titles, TRANSIT_COL_WIDTHS)):
-        h_box = tk.Frame(r_headers, bg=COLOR_CARD, width=width, height=22)
-        h_box.pack_propagate(False)
-        h_box.pack(side="left", padx=(0 if i == 0 else 10, 0))
-
-        lbl = tk.Label(
-            h_box, text=title, font=(FONT_FAMILY, 8, "bold"),
-            bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY, anchor="w"
-        )
-        lbl.pack(fill="both", expand=True)
-
+    # Portrait layout: one stacked card per route instead of a 720 px wide
+    # five-column table. Row 1 = name + ON/OFF, row 2 = headway slider,
+    # row 3 = the TSP and DBL toggles. Every widget, callback and
+    # bus_routes_config key is the same as before; only the arrangement moved.
     for r_id, r_cfg in bus_routes_config.items():
         row_frame = tk.Frame(
             transit_body, bg=COLOR_CARD_ALT, highlightbackground=COLOR_CARD_BORDER,
-            highlightthickness=1, bd=0, height=34
+            highlightthickness=1, bd=0,
         )
-        row_frame.pack_propagate(False)
-        row_frame.pack(fill="x", padx=16, pady=2)
+        row_frame.pack(fill="x", padx=16, pady=3)
 
-        c1 = tk.Frame(row_frame, bg=COLOR_CARD_ALT, width=TRANSIT_COL_WIDTHS[0], height=34)
-        c1.pack_propagate(False)
-        c1.pack(side="left", padx=(8, 0))
+        name_row = tk.Frame(row_frame, bg=COLOR_CARD_ALT)
+        name_row.pack(fill="x", padx=8, pady=(5, 2))
 
         lbl_name = tk.Label(
-            c1, text=r_cfg["name"], font=(FONT_FAMILY, 8, "bold"),
+            name_row, text=r_cfg["name"], font=(FONT_FAMILY, 8, "bold"),
             bg=COLOR_CARD_ALT, fg=COLOR_TEXT_PRIMARY, anchor="w"
         )
-        lbl_name.pack(fill="both", expand=True)
-
-        c2 = tk.Frame(row_frame, bg=COLOR_CARD_ALT, width=TRANSIT_COL_WIDTHS[1], height=34)
-        c2.pack_propagate(False)
-        c2.pack(side="left", padx=(10, 0))
+        lbl_name.pack(side="left", fill="x", expand=True)
 
         def make_route_toggle(key, btn):
             def toggle():
@@ -1497,19 +1513,23 @@ def create_dashboard_window(parent=None):
             return toggle
 
         t_btn = tk.Button(
-            c2, text="ON" if r_cfg["active"] else "OFF", font=(FONT_FAMILY, 8, "bold"),
+            name_row, text="ON" if r_cfg["active"] else "OFF", font=(FONT_FAMILY, 8, "bold"),
             bg=COLOR_CARD_ALT, fg=COLOR_SUCCESS if r_cfg["active"] else COLOR_TEXT_SECONDARY,
-            bd=0, cursor="hand2", relief="flat", anchor="w"
+            bd=0, cursor="hand2", relief="flat", anchor="e", width=4,
         )
         t_btn.config(command=make_route_toggle(r_id, t_btn))
-        t_btn.pack(fill="both", expand=True)
+        t_btn.pack(side="right")
 
-        c3 = tk.Frame(row_frame, bg=COLOR_CARD_ALT, width=TRANSIT_COL_WIDTHS[2], height=34)
-        c3.pack_propagate(False)
-        c3.pack(side="left", padx=(10, 0))
+        headway_row = tk.Frame(row_frame, bg=COLOR_CARD_ALT)
+        headway_row.pack(fill="x", padx=8, pady=(0, 2))
+
+        tk.Label(
+            headway_row, text="Headway", font=(FONT_FAMILY, 8),
+            bg=COLOR_CARD_ALT, fg=COLOR_TEXT_SECONDARY, anchor="w",
+        ).pack(side="left", padx=(0, 6))
 
         hw_val_lbl = tk.Label(
-            c3, text=f"{r_cfg['headway_sec']}s", font=(FONT_FAMILY, 8, "bold"),
+            headway_row, text=f"{r_cfg['headway_sec']}s", font=(FONT_FAMILY, 8, "bold"),
             bg=COLOR_CARD_ALT, fg=COLOR_ACCENT, width=4, anchor="w"
         )
         hw_val_lbl.pack(side="left")
@@ -1522,15 +1542,14 @@ def create_dashboard_window(parent=None):
             return update
 
         hw_slider = ttk.Scale(
-            c3, from_=0, to=90, value=r_cfg["headway_sec"],
+            headway_row, from_=0, to=90, value=r_cfg["headway_sec"],
             style="Modern.Horizontal.TScale", command=make_hw_slider(r_id, hw_val_lbl), length=130
         )
-        hw_slider.pack(side="left", padx=(4, 0))
+        hw_slider.pack(side="left", fill="x", expand=True, padx=(4, 0))
         enable_scale_keyboard(hw_slider, step=1)
 
-        c4 = tk.Frame(row_frame, bg=COLOR_CARD_ALT, width=TRANSIT_COL_WIDTHS[3], height=34)
-        c4.pack_propagate(False)
-        c4.pack(side="left", padx=(10, 0))
+        flags_row = tk.Frame(row_frame, bg=COLOR_CARD_ALT)
+        flags_row.pack(fill="x", padx=8, pady=(0, 5))
 
         def make_tsp_toggle(key, btn):
             def toggle():
@@ -1540,16 +1559,12 @@ def create_dashboard_window(parent=None):
             return toggle
 
         tsp_btn = tk.Button(
-            c4, text="TSP ACTIVE" if r_cfg["tsp_enabled"] else "TSP OFF", font=(FONT_FAMILY, 8, "bold"),
+            flags_row, text="TSP ACTIVE" if r_cfg["tsp_enabled"] else "TSP OFF", font=(FONT_FAMILY, 8, "bold"),
             bg=COLOR_CARD_ALT, fg=COLOR_SUCCESS if r_cfg["tsp_enabled"] else COLOR_DANGER,
             bd=0, cursor="hand2", relief="flat", anchor="w"
         )
         tsp_btn.config(command=make_tsp_toggle(r_id, tsp_btn))
-        tsp_btn.pack(fill="both", expand=True)
-
-        c5 = tk.Frame(row_frame, bg=COLOR_CARD_ALT, width=TRANSIT_COL_WIDTHS[4], height=34)
-        c5.pack_propagate(False)
-        c5.pack(side="left", padx=(10, 0))
+        tsp_btn.pack(side="left", fill="x", expand=True)
 
         def make_dbl_toggle(key, btn):
             def toggle():
@@ -1559,12 +1574,12 @@ def create_dashboard_window(parent=None):
             return toggle
 
         dbl_btn = tk.Button(
-            c5, text="DBL ACTIVE" if r_cfg["dbl_enabled"] else "DBL OFF", font=(FONT_FAMILY, 8, "bold"),
+            flags_row, text="DBL ACTIVE" if r_cfg["dbl_enabled"] else "DBL OFF", font=(FONT_FAMILY, 8, "bold"),
             bg=COLOR_CARD_ALT, fg=COLOR_ACCENT if r_cfg["dbl_enabled"] else COLOR_DANGER,
             bd=0, cursor="hand2", relief="flat", anchor="w"
         )
         dbl_btn.config(command=make_dbl_toggle(r_id, dbl_btn))
-        dbl_btn.pack(fill="both", expand=True)
+        dbl_btn.pack(side="left", fill="x", expand=True)
         route_flag_buttons[r_id] = {"tsp": tsp_btn, "dbl": dbl_btn}
 
     # 4. PER-APPROACH PARAMETERS SECTION
@@ -1613,48 +1628,39 @@ def create_dashboard_window(parent=None):
 
     sec_title.config(command=toggle_approaches_section)
 
-    GEN_COL_WIDTHS = [150, 150, 140, 140, 140]
-
-    headers_frame = tk.Frame(approaches_body, bg=COLOR_BG, height=22)
-    headers_frame.pack_propagate(False)
-    headers_frame.pack(fill="x", padx=16, pady=(0, 2))
-
-    h_titles = [
-        "Source / Status",
-        "Generation Model",
-        "Inflow Rate (v/m)",
-        "Straight %",
-        "Trucks %"
-    ]
-
-    for i, (title, width) in enumerate(zip(h_titles, GEN_COL_WIDTHS)):
-        h_box = tk.Frame(headers_frame, bg=COLOR_BG, width=width, height=22)
-        h_box.pack_propagate(False)
-        h_box.pack(side="left", padx=(0 if i == 0 else 10, 0))
-
-        lbl = tk.Label(
-            h_box, text=title, font=(FONT_FAMILY, 8, "bold"),
-            bg=COLOR_BG, fg=COLOR_TEXT_SECONDARY, anchor="w"
+    # Portrait layout: one stacked card per approach instead of a 760 px
+    # wide five-column table. Row 1 = name + ON/OFF, row 2 = generation
+    # model, then one labelled slider row each for inflow, straight % and
+    # trucks %. Same widgets, callbacks and approach_configs keys as before.
+    def add_slider_row(card, label_text, value_text, value_width):
+        row = tk.Frame(card, bg=COLOR_CARD)
+        row.pack(fill="x", padx=8, pady=(0, 2))
+        tk.Label(
+            row, text=label_text, font=(FONT_FAMILY, 8),
+            bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY, anchor="w", width=10,
+        ).pack(side="left")
+        value_lbl = tk.Label(
+            row, text=value_text, font=(FONT_FAMILY, 8, "bold"),
+            bg=COLOR_CARD, fg=COLOR_ACCENT, width=value_width, anchor="w",
         )
-        lbl.pack(fill="both", expand=True)
+        value_lbl.pack(side="left")
+        return row, value_lbl
 
     for key, name in APPROACH_NAMES.items():
         card = tk.Frame(
             approaches_body, bg=COLOR_CARD, highlightbackground=COLOR_CARD_BORDER,
-            highlightthickness=1, bd=0, height=36
+            highlightthickness=1, bd=0,
         )
-        card.pack_propagate(False)
-        card.pack(fill="x", padx=16, pady=2)
+        card.pack(fill="x", padx=16, pady=3)
 
-        col1 = tk.Frame(card, bg=COLOR_CARD, width=GEN_COL_WIDTHS[0], height=36)
-        col1.pack_propagate(False)
-        col1.pack(side="left", padx=(8, 0))
+        name_row = tk.Frame(card, bg=COLOR_CARD)
+        name_row.pack(fill="x", padx=8, pady=(5, 2))
 
         c_name = tk.Label(
-            col1, text=name, font=(FONT_FAMILY, 8, "bold"),
+            name_row, text=name, font=(FONT_FAMILY, 8, "bold"),
             bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY, anchor="w"
         )
-        c_name.pack(side="left")
+        c_name.pack(side="left", fill="x", expand=True)
 
         def make_toggle(k, btn, dot_label):
             def toggle():
@@ -1668,8 +1674,8 @@ def create_dashboard_window(parent=None):
                     dot_label.config(fg=COLOR_TEXT_SECONDARY)
             return toggle
 
-        status_box = tk.Frame(col1, bg=COLOR_CARD)
-        status_box.pack(side="right", padx=(0, 8))
+        status_box = tk.Frame(name_row, bg=COLOR_CARD)
+        status_box.pack(side="right")
 
         dot = tk.Label(status_box, text=SYM_DOT, font=(FONT_FAMILY, 8), bg=COLOR_CARD, fg=COLOR_SUCCESS)
         dot.pack(side="left")
@@ -1677,17 +1683,20 @@ def create_dashboard_window(parent=None):
         t_btn = tk.Button(
             status_box, text="ON", font=(FONT_FAMILY, 8, "bold"),
             bg=COLOR_CARD, fg=COLOR_SUCCESS, bd=0, activebackground=COLOR_CARD,
-            cursor="hand2", relief="flat"
+            cursor="hand2", relief="flat", width=4, anchor="e",
         )
         t_btn.config(command=make_toggle(key, t_btn, dot))
         t_btn.pack(side="left", padx=2)
 
-        col2 = tk.Frame(card, bg=COLOR_CARD, width=GEN_COL_WIDTHS[1], height=36)
-        col2.pack_propagate(False)
-        col2.pack(side="left", padx=(10, 0))
+        model_row = tk.Frame(card, bg=COLOR_CARD)
+        model_row.pack(fill="x", padx=8, pady=(0, 3))
+        tk.Label(
+            model_row, text="Model", font=(FONT_FAMILY, 8),
+            bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY, anchor="w", width=10,
+        ).pack(side="left")
 
         model_box = ttk.Combobox(
-            col2,
+            model_row,
             values=[
                 "Random",
                 "Poisson",
@@ -1700,7 +1709,7 @@ def create_dashboard_window(parent=None):
             style="Modern.TCombobox",
         )
         model_box.set(approach_configs[key]["model"])
-        model_box.pack(side="left", pady=4)
+        model_box.pack(side="left", fill="x", expand=True)
 
         def make_model_change(k, box):
             def change(event):
@@ -1708,15 +1717,9 @@ def create_dashboard_window(parent=None):
             return change
         model_box.bind("<<ComboboxSelected>>", make_model_change(key, model_box))
 
-        col3 = tk.Frame(card, bg=COLOR_CARD, width=GEN_COL_WIDTHS[2], height=36)
-        col3.pack_propagate(False)
-        col3.pack(side="left", padx=(10, 0))
-
-        rate_val = tk.Label(
-            col3, text=f"{approach_configs[key]['rate']} v/m",
-            font=(FONT_FAMILY, 8, "bold"), bg=COLOR_CARD, fg=COLOR_ACCENT, width=5, anchor="w"
+        rate_row, rate_val = add_slider_row(
+            card, "Inflow", f"{approach_configs[key]['rate']} v/m", 6
         )
-        rate_val.pack(side="left")
 
         def make_rate_slider(k, lbl):
             def update(val):
@@ -1726,21 +1729,15 @@ def create_dashboard_window(parent=None):
             return update
 
         rate_slider = ttk.Scale(
-            col3, from_=1, to=30, value=approach_configs[key]["rate"],
+            rate_row, from_=1, to=30, value=approach_configs[key]["rate"],
             style="Modern.Horizontal.TScale", command=make_rate_slider(key, rate_val), length=100
         )
-        rate_slider.pack(side="left", padx=(4, 0))
+        rate_slider.pack(side="left", fill="x", expand=True, padx=(4, 0))
         enable_scale_keyboard(rate_slider, step=1)
 
-        col4 = tk.Frame(card, bg=COLOR_CARD, width=GEN_COL_WIDTHS[3], height=36)
-        col4.pack_propagate(False)
-        col4.pack(side="left", padx=(10, 0))
-
-        split_val = tk.Label(
-            col4, text=f"{int(approach_configs[key]['turn_split']*100)}%",
-            font=(FONT_FAMILY, 8, "bold"), bg=COLOR_CARD, fg=COLOR_ACCENT, width=4, anchor="w"
+        split_row, split_val = add_slider_row(
+            card, "Straight", f"{int(approach_configs[key]['turn_split']*100)}%", 6
         )
-        split_val.pack(side="left")
 
         def make_split_slider(k, lbl):
             def update(val):
@@ -1750,21 +1747,15 @@ def create_dashboard_window(parent=None):
             return update
 
         split_slider = ttk.Scale(
-            col4, from_=0, to=100, value=int(approach_configs[key]["turn_split"]*100),
+            split_row, from_=0, to=100, value=int(approach_configs[key]["turn_split"]*100),
             style="Modern.Horizontal.TScale", command=make_split_slider(key, split_val), length=85
         )
-        split_slider.pack(side="left", padx=(4, 0))
+        split_slider.pack(side="left", fill="x", expand=True, padx=(4, 0))
         enable_scale_keyboard(split_slider, step=1)
 
-        col5 = tk.Frame(card, bg=COLOR_CARD, width=GEN_COL_WIDTHS[4], height=36)
-        col5.pack_propagate(False)
-        col5.pack(side="left", padx=(10, 0))
-
-        heavy_val = tk.Label(
-            col5, text=f"{int(approach_configs[key]['heavy_ratio']*100)}%",
-            font=(FONT_FAMILY, 8, "bold"), bg=COLOR_CARD, fg=COLOR_ACCENT, width=4, anchor="w"
+        heavy_row, heavy_val = add_slider_row(
+            card, "Trucks", f"{int(approach_configs[key]['heavy_ratio']*100)}%", 6
         )
-        heavy_val.pack(side="left")
 
         def make_heavy_slider(k, lbl):
             def update(val):
@@ -1774,11 +1765,13 @@ def create_dashboard_window(parent=None):
             return update
 
         heavy_slider = ttk.Scale(
-            col5, from_=0, to=50, value=int(approach_configs[key]["heavy_ratio"]*100),
+            heavy_row, from_=0, to=50, value=int(approach_configs[key]["heavy_ratio"]*100),
             style="Modern.Horizontal.TScale", command=make_heavy_slider(key, heavy_val), length=85
         )
-        heavy_slider.pack(side="left", padx=(4, 0))
+        heavy_slider.pack(side="left", fill="x", expand=True, padx=(4, 0))
         enable_scale_keyboard(heavy_slider, step=1)
+        # Bottom breathing room inside the card.
+        tk.Frame(card, bg=COLOR_CARD, height=3).pack(fill="x")
 
     # Both long sections intentionally launch collapsed. Their widgets remain
     # alive and retain every value/callback; only the body frames are unmapped.

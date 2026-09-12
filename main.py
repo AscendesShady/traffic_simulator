@@ -1292,15 +1292,16 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
 # dashboard, previously each a standalone window (the latter in its own OS
 # process), mount into panes of this same root instead of creating their own.
 MAIN_WINDOW_TITLE = "Traffic Simulator"
-# Narrow enough that a 2560px-wide screen shows the simulation pane at its
-# full native canvas.WIDTH without deficit-driven squeezing (see
-# build_main_window); still wide enough for control_panel's own natural
-# ~813px content to render with only the scrollbar's width trimmed off.
-# Exact pixel tuning across every possible screen size is a styling concern,
-# not this checkpoint's -- on a narrower screen the simulation pane absorbs
-# any remaining deficit (by design, see the weight=1 comment below), and the
-# PanedWindow's sashes stay draggable afterward either way.
-SIDE_PANE_WIDTH = 760
+# Portrait side panes: each holds roughly a fifth of the window, the
+# simulation pane the rest, so both control_panel and TelemetryDashboard read
+# as a narrow scrolling column (like their old standalone windows) rather
+# than a wide, sparsely-filled one. Computed from the actual window width in
+# build_main_window rather than fixed in pixels, since window_width itself
+# adapts to the screen; these two constants only bound that result so it
+# never gets crushed on a small screen or absurdly wide on a huge one.
+SIDE_PANE_WIDTH_FRACTION = 0.20
+MIN_SIDE_PANE_WIDTH = 360
+MAX_SIDE_PANE_WIDTH = 620
 
 
 def build_scrollable_pane(parent, width):
@@ -1386,21 +1387,28 @@ def build_main_window():
 
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
-    preferred_width = SIDE_PANE_WIDTH * 2 + canvas.WIDTH + 60
-    preferred_height = max(canvas.HEIGHT + 80, 900)
-    window_width = max(900, min(screen_width - 60, preferred_width))
-    window_height = max(600, min(screen_height - 100, preferred_height))
+    # Fill most of the screen's width -- unlike the old layout, the window no
+    # longer needs to be sized around canvas.WIDTH, since the simulation pane
+    # just centers its fixed-size image inside whatever width weight=1 gives
+    # it below.
+    window_width = max(900, min(screen_width - 60, 2200))
+    window_height = max(600, min(screen_height - 100, max(canvas.HEIGHT + 80, 900)))
     root.geometry(f"{window_width}x{window_height}")
+
+    side_pane_width = max(
+        MIN_SIDE_PANE_WIDTH,
+        min(MAX_SIDE_PANE_WIDTH, round(window_width * SIDE_PANE_WIDTH_FRACTION)),
+    )
 
     paned = ttk.PanedWindow(root, orient="horizontal")
     paned.pack(fill="both", expand=True)
 
     control_outer, control_pane, control_scroll = build_scrollable_pane(
-        paned, SIDE_PANE_WIDTH
+        paned, side_pane_width
     )
     simulation_pane = tk.Frame(paned, bg="black")
     telemetry_outer, telemetry_pane, telemetry_scroll = build_scrollable_pane(
-        paned, SIDE_PANE_WIDTH
+        paned, side_pane_width
     )
     # Stashed on the pane itself rather than widening this function's return
     # signature: whoever later mounts real content into control_pane or
@@ -1409,7 +1417,7 @@ def build_main_window():
     control_pane.scroll_canvas = control_scroll
     telemetry_pane.scroll_canvas = telemetry_scroll
 
-    # Each side pane's own requested width (frozen at SIDE_PANE_WIDTH by
+    # Each side pane's own requested width (frozen at side_pane_width by
     # pack_propagate(False) above) is what the PanedWindow sizes it to
     # automatically once mapped; weight=1 on the center pane then gives it
     # everything left over. No explicit sashpos() call is needed -- and one
@@ -1440,7 +1448,9 @@ def build_simulation_canvas(parent):
         parent, width=canvas.WIDTH, height=canvas.HEIGHT,
         bg="black", highlightthickness=0,
     )
-    simulation_canvas.pack()
+    # expand=True without fill: the fixed-size canvas floats centered in
+    # whatever width the 60% center pane has, rather than hugging its corner.
+    simulation_canvas.pack(expand=True)
     photo = tk.PhotoImage(width=canvas.WIDTH, height=canvas.HEIGHT)
     image_item = simulation_canvas.create_image(0, 0, anchor="nw", image=photo)
     ppm_header = f"P6 {canvas.WIDTH} {canvas.HEIGHT} 255 ".encode("ascii")

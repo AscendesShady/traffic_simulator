@@ -258,6 +258,9 @@ def test_throughput_counts_truck_as_one(monkeypatch):
         def geometry(self, _value):
             pass
 
+        def protocol(self, _name, _handler):
+            pass
+
         def after(self, _delay, callback):
             self.callback = callback
 
@@ -362,10 +365,9 @@ def test_throughput_counts_truck_as_one(monkeypatch):
     monkeypatch.setattr(main.pygame.font, "init", lambda: None)
     monkeypatch.setattr(main.pygame.font, "SysFont", lambda *args, **kwargs: None)
     # No pygame window exists any more (the simulation renders onto an
-    # offscreen Surface), so display.Info/set_mode/set_caption/flip are no
-    # longer called by main() at all. pygame.event.get() is still read (the
-    # QUIT-handling loop), so that mock stays.
-    monkeypatch.setattr(main.pygame.event, "get", lambda: [])
+    # offscreen Surface), so display.Info/set_mode/set_caption/flip and the
+    # old QUIT-handling event loop are no longer called by main() at all --
+    # closing is now MainWindow's single WM_DELETE_WINDOW handler instead.
     monkeypatch.setitem(main.control_panel.global_config, "is_running", True)
     monkeypatch.setitem(main.control_panel.global_config, "reset_triggered", False)
     monkeypatch.setitem(main.control_panel.global_config, "is_paused", False)

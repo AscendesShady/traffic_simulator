@@ -1529,6 +1529,22 @@ def main():
         export_session_excel()
     atexit.register(cleanup)
 
+    # One WM_DELETE_WINDOW handler for the one real window in this process
+    # (each of control_panel's and TelemetryDashboard's own close handling is
+    # skipped when mounted, per commits 3 and 4). sys.exit() runs the atexit-
+    # registered cleanup() above exactly once -- agent_proc termination and
+    # the combined-export workbook build -- the same way the old pygame QUIT
+    # handler already relied on it.
+    def on_main_window_close():
+        control_panel.global_config["is_running"] = False
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        sys.exit()
+
+    root.protocol("WM_DELETE_WINDOW", on_main_window_close)
+
     master_frame_count = 0
     dt_step = 1.0 / 60.0
     time_accumulator = 0.0
@@ -1556,14 +1572,6 @@ def main():
         elapsed = min(max(0.0, now - last_wall_time), max_catchup_seconds)
         last_wall_time = now
         run_just_reset = False
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                control_panel.global_config["is_running"] = False
-                pygame.quit()
-                try: root.destroy()
-                except Exception: pass
-                sys.exit()
 
         if control_panel.global_config.get("start_requested", False):
             master_frame_count = perform_full_reset(vehicles, signals, telemetry)

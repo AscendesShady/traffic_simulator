@@ -4,7 +4,6 @@ import sys
 import random
 import math
 import json
-import os
 import subprocess
 import atexit
 import time
@@ -1423,6 +1422,39 @@ def build_main_window():
     return root, control_pane, simulation_pane, telemetry_pane
 
 
+def build_simulation_canvas(parent):
+    """A fixed-size Tk Canvas fed by one PhotoImage, mutated every push.
+
+    The offscreen surface blit method (task-specified): one PhotoImage is
+    created once and itemconfig'd back onto the same canvas image item on
+    every push -- never recreated -- so Tk redraws in place without ever
+    losing the reference mid-frame. Held at the network's native
+    canvas.WIDTH x canvas.HEIGHT rather than rescaled to the pane's own
+    width: true rescaling needs a raster-resize dependency this project does
+    not otherwise use (Pillow), so it is left to a later styling pass.
+
+    Returns (canvas_widget, push_frame), where push_frame(surface) converts
+    one pygame Surface to PPM bytes and writes it into the same PhotoImage.
+    """
+    simulation_canvas = tk.Canvas(
+        parent, width=canvas.WIDTH, height=canvas.HEIGHT,
+        bg="black", highlightthickness=0,
+    )
+    simulation_canvas.pack()
+    photo = tk.PhotoImage(width=canvas.WIDTH, height=canvas.HEIGHT)
+    image_item = simulation_canvas.create_image(0, 0, anchor="nw", image=photo)
+    ppm_header = f"P6 {canvas.WIDTH} {canvas.HEIGHT} 255 ".encode("ascii")
+
+    def push_frame(surface):
+        photo.configure(
+            data=ppm_header + pygame.image.tostring(surface, "RGB"),
+            format="PPM",
+        )
+        simulation_canvas.itemconfig(image_item, image=photo)
+
+    return simulation_canvas, push_frame
+
+
 def main():
     # Seeding makes traffic generation reproducible, not LLM inference. The
     # valid benchmark is the same seed with one ARMED and one DISARMED run;
@@ -1431,15 +1463,13 @@ def main():
     pygame.font.init()
     font = pygame.font.SysFont("Consolas", 13, bold=True)
 
-    display_info = pygame.display.Info()
-    startup_layout = calculate_startup_window_layout(
-        display_info.current_w,
-        display_info.current_h,
-    )
-    canvas_x, canvas_y = startup_layout["canvas_position"]
-    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{canvas_x},{canvas_y}"
-    screen = pygame.display.set_mode((canvas.WIDTH, canvas.HEIGHT))
-    pygame.display.set_caption("Urban Network Simulation")
+    # No pygame window is created: the network renders onto an offscreen
+    # Surface (canvas_gemini.draw_network and Vehicle.draw are plain pygame
+    # drawing calls and work identically on one), which is pushed into a Tk
+    # Canvas living in the simulation pane instead of being flipped to a
+    # native display. Lane/intersection geometry (canvas_gemini.WIDTH/HEIGHT/
+    # LANE/INT_X/H_Y) is untouched -- only where the pixels end up changes.
+    screen = pygame.Surface((canvas.WIDTH, canvas.HEIGHT))
 
     signals = SignalController(global_config=control_panel.global_config, yellow_time=60, red_clearance_time=60)
     telemetry = TelemetryExporter(filename=TELEMETRY_PATH, export_interval_frames=10)
@@ -1470,6 +1500,16 @@ def main():
     TelemetryDashboard(telemetry_pane)
     bind_pane_mousewheel(telemetry_pane, telemetry_pane.scroll_canvas)
 
+    # 2b. The simulation canvas: a fixed-size Tk Canvas holding one PhotoImage
+    # that every render mutates in place (itemconfig'd once, never recreated
+    # or replaced) so Tk redraws it without ever losing the reference mid-
+    # frame. Kept at the network's native size rather than rescaled to the
+    # pane's own width -- true rescaling would need a new dependency (Pillow
+    # is not currently one) and is a styling concern, not this checkpoint's.
+    _simulation_canvas, push_simulation_frame = build_simulation_canvas(
+        simulation_pane
+    )
+
     print("Launching LLM Control Agent...")
     agent_proc = subprocess.Popen(
         [sys.executable, str(AGENT_PATH)],
@@ -1499,10 +1539,18 @@ def main():
     # headroom without allowing a long catch-up burst to monopolize the UI.
     max_steps_per_callback = 6
     discharge_was_active = False
+    # Pushing a rendered frame into the Tk PhotoImage costs several ms (a PPM
+    # round-trip over the full canvas), far more than the cheap pygame draw
+    # calls that fill the offscreen surface. Halving how often that push
+    # happens keeps the visual rate at 30 Hz while the fixed-timestep sim
+    # loop above keeps stepping at a full 60 Hz -- unaffected either way,
+    # since it measures real elapsed wall time and catches up independently
+    # of how often a frame is actually shown.
+    visual_frame_counter = 0
 
     def simulation_step():
         nonlocal master_frame_count, time_accumulator, last_wall_time
-        nonlocal discharge_was_active
+        nonlocal discharge_was_active, visual_frame_counter
 
         now = time.monotonic()
         elapsed = min(max(0.0, now - last_wall_time), max_catchup_seconds)
@@ -1666,7 +1714,13 @@ def main():
                 )
             except (OSError, json.JSONDecodeError, AttributeError, TypeError):
                 pass
-        pygame.display.flip()
+
+        # Every frame is drawn onto the offscreen surface above (cheap), but
+        # the far more expensive PPM push into the visible Tk canvas only
+        # happens every other tick: 30 Hz visual against the 60 Hz sim.
+        visual_frame_counter += 1
+        if visual_frame_counter % 2 == 0:
+            push_simulation_frame(screen)
 
         # Constant GUI polling rate (~60 FPS) decoupled from simulation speed
         root.after(16, simulation_step)

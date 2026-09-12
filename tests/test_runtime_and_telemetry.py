@@ -343,6 +343,14 @@ def test_throughput_counts_truck_as_one(monkeypatch):
     # subprocess), so main() constructs it directly; same reasoning as
     # create_dashboard_window above.
     monkeypatch.setattr(main, "TelemetryDashboard", lambda _pane: None)
+    # The simulation canvas is real Tk widget construction too (a tk.Canvas
+    # parented to simulation_pane), same reasoning as the other three mounted
+    # components above -- FakePane is not a real widget and cannot be a
+    # valid Tk master.
+    monkeypatch.setattr(
+        main, "build_simulation_canvas",
+        lambda _pane: (object(), lambda _surface: None),
+    )
     monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr(main.atexit, "register", lambda callback: callback)
     monkeypatch.setattr(main.time, "monotonic", lambda: next(monotonic_values))
@@ -353,14 +361,10 @@ def test_throughput_counts_truck_as_one(monkeypatch):
     monkeypatch.setattr(main.pygame, "init", lambda: None)
     monkeypatch.setattr(main.pygame.font, "init", lambda: None)
     monkeypatch.setattr(main.pygame.font, "SysFont", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        main.pygame.display,
-        "Info",
-        lambda: SimpleNamespace(current_w=1920, current_h=1080),
-    )
-    monkeypatch.setattr(main.pygame.display, "set_mode", lambda size: object())
-    monkeypatch.setattr(main.pygame.display, "set_caption", lambda title: None)
-    monkeypatch.setattr(main.pygame.display, "flip", lambda: None)
+    # No pygame window exists any more (the simulation renders onto an
+    # offscreen Surface), so display.Info/set_mode/set_caption/flip are no
+    # longer called by main() at all. pygame.event.get() is still read (the
+    # QUIT-handling loop), so that mock stays.
     monkeypatch.setattr(main.pygame.event, "get", lambda: [])
     monkeypatch.setitem(main.control_panel.global_config, "is_running", True)
     monkeypatch.setitem(main.control_panel.global_config, "reset_triggered", False)

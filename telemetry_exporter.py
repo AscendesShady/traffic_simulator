@@ -13,7 +13,6 @@ from vehicle import Bus, DBL_LANE_INDEX, dbl_lane_is_obstructed
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
-CAR_OCCUPANCY = 4
 
 
 class TelemetryExporter:
@@ -31,26 +30,55 @@ class TelemetryExporter:
         self._throughput_samples.clear()
         self._last_total_served = 0
 
-    def compute_queue_counts_by_node(self, vehicles):
-        """Count stopped upstream vehicles by node and physical approach."""
-        queues = {
+    @staticmethod
+    def _empty_queue_table():
+        return {
             str(node_x): {approach: 0 for approach in ("EB", "WB", "NB", "SB")}
             for node_x in canvas.INT_X
         }
+
+    @staticmethod
+    def _iter_queued_vehicles(vehicles):
+        """Yield (node_key, approach, vehicle) for every stopped upstream vehicle.
+
+        A vehicle is queued when it is effectively stationary and its front
+        bumper is still upstream of the stop bar of its next target node.
+        """
+        node_keys = {str(node_x) for node_x in canvas.INT_X}
         for vehicle in vehicles:
             if vehicle.speed >= 0.25:
                 continue
             target_node = vehicle.get_next_target_node(canvas.INT_X)
-            node_queues = queues.get(str(target_node))
-            if node_queues is None:
+            node_key = str(target_node)
+            if node_key not in node_keys:
                 continue
             if not vehicle.is_front_bumper_upstream(
                 target_node, canvas.H_Y, canvas.ROAD_W, canvas.STOP
             ):
                 continue
-            if vehicle.direction in node_queues:
-                node_queues[vehicle.direction] += 1
+            if vehicle.direction not in ("EB", "WB", "NB", "SB"):
+                continue
+            yield node_key, vehicle.direction, vehicle
+
+    def compute_queue_counts_by_node(self, vehicles):
+        """Count stopped upstream vehicles by node and physical approach."""
+        queues = self._empty_queue_table()
+        for node_key, approach, _vehicle in self._iter_queued_vehicles(vehicles):
+            queues[node_key][approach] += 1
         return queues
+
+    def compute_queue_passengers_by_node(self, vehicles):
+        """Sum ACTUAL passengers of stopped upstream vehicles, by node and approach.
+
+        Uses each vehicle's real passenger count (car=4, truck=1, bus=45)
+        rather than a flat per-vehicle weight, so a queued bus is worth 45 and
+        a queued truck is worth 1. This is the same weighting the throughput
+        counter applies to served vehicles.
+        """
+        passengers = self._empty_queue_table()
+        for node_key, approach, vehicle in self._iter_queued_vehicles(vehicles):
+            passengers[node_key][approach] += int(getattr(vehicle, "passengers", 0))
+        return passengers
 
     @staticmethod
     def _flatten_queue_counts(queues_by_node):
@@ -159,20 +187,8 @@ class TelemetryExporter:
     ):
         queues_by_node = self.compute_queue_counts_by_node(vehicles)
         queues = self._flatten_queue_counts(queues_by_node)
-        # Queue counts are aggregated by approach, so vehicle type is no longer
-        # available here. This documented car-occupancy approximation slightly
-        # overestimates queued passengers whenever trucks are present.
-        queues_passengers = {
-            approach: vehicle_count * CAR_OCCUPANCY
-            for approach, vehicle_count in queues.items()
-        }
-        queues_passengers_by_node = {
-            node_x: {
-                approach: vehicle_count * CAR_OCCUPANCY
-                for approach, vehicle_count in node_queues.items()
-            }
-            for node_x, node_queues in queues_by_node.items()
-        }
+        queues_passengers_by_node = self.compute_queue_passengers_by_node(vehicles)
+        queues_passengers = self._flatten_queue_counts(queues_passengers_by_node)
         demand_state = demand_state or {}
         throughput_state = throughput_state or {}
         pending_demand = sum(
@@ -180,6 +196,8 @@ class TelemetryExporter:
             for item in demand_state.values()
             if isinstance(item, dict)
         )
+        stopped_frames = int(throughput_state.get("stopped_vehicle_frames", 0) or 0)
+        vehicles_served = int(throughput_state.get("vehicles_served_total", 0) or 0)
         buses = [
             self._bus_state(vehicle, signal_controller)
             for vehicle in vehicles
@@ -348,8 +366,13 @@ class TelemetryExporter:
                 "queues_passengers_est": queues_passengers,
                 "queues_by_node": queues_by_node,
                 "queues_passengers_est_by_node": queues_passengers_by_node,
-                "car_occupancy_assumed": CAR_OCCUPANCY,
                 "pending_demand": pending_demand,
+                # Live network mean speed (px/frame); the Units tab converts
+                # it to km/h under the saturation-flow anchor.
+                "mean_speed_px_per_frame": round(
+                    sum(float(getattr(v, "speed", 0.0)) for v in vehicles)
+                    / len(vehicles), 3
+                ) if vehicles else None,
             },
             "network_throughput": {
                 "passengers_served_total": total_served,
@@ -369,6 +392,14 @@ class TelemetryExporter:
                 ),
                 "passengers_per_minute_recent": round(recent_rate, 1),
                 "trend_window_seconds": self._trend_window_seconds,
+                # Stopped delay: vehicle-seconds spent below the queue speed
+                # threshold, and its mean per served vehicle (HCM control
+                # delay proxy for the Units tab's level of service).
+                "stopped_vehicle_seconds": round(stopped_frames / 60.0, 1),
+                "mean_stopped_delay_sec_per_vehicle": (
+                    round(stopped_frames / 60.0 / vehicles_served, 2)
+                    if vehicles_served else None
+                ),
             },
             "demand_generation": demand_state,
             "routes": routes_block,

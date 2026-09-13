@@ -464,6 +464,130 @@ def test_telemetry_exposes_per_node_approach_passenger_queues(tmp_path):
     }
 
 
+def _queued_car(x, direction="EB", is_heavy=False):
+    vehicle = Vehicle(
+        x, H_Y - 0.5 * LANE, direction, is_heavy=is_heavy, lane_index=0
+    )
+    vehicle.speed = 0.0
+    return vehicle
+
+
+def _queued_nb(x_offset, node_x, is_heavy=False):
+    vehicle = Vehicle(
+        node_x - 0.5 * LANE,
+        H_Y + 100 + x_offset,
+        "NB",
+        is_heavy=is_heavy,
+        lane_index=0,
+        assigned_node_x=node_x,
+    )
+    vehicle.speed = 0.0
+    return vehicle
+
+
+def test_queue_passengers_uses_real_weights():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    controller = SignalController({"green_time": 20})
+    vehicles = [
+        _queued_car(200),
+        _queued_car(170),
+        _queued_car(140, is_heavy=True),
+    ]
+    assert [v.passengers for v in vehicles] == [4, 4, 1]
+
+    payload = exporter.build_payload(controller, vehicles, 60)
+    summary = payload["network_summary"]
+
+    assert summary["queues"]["EB"] == 3
+    assert summary["queues_passengers_est"]["EB"] == 2 * 4 + 1 * 1
+    assert summary["queues_passengers_est"]["EB"] != 3 * 4
+    assert summary["queues_passengers_est_by_node"]["300"]["EB"] == 9
+
+
+def test_queued_bus_counts_full_load():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    controller = SignalController({"green_time": 20})
+    bus = make_bus_for_leg("R1_EB_A_NB", 300, "QUEUED_BUS")
+    bus.speed = 0.0
+    assert bus.passengers == 45
+
+    by_node = exporter.compute_queue_passengers_by_node([bus])
+    assert by_node["300"]["EB"] == 45
+
+    payload = exporter.build_payload(controller, [bus], 60)
+    summary = payload["network_summary"]
+    assert summary["queues"]["EB"] == 1
+    assert summary["queues_passengers_est"]["EB"] == 45
+    node_a = payload["signal_state"]["nodes"]["300"]
+    assert node_a["queues_passengers_est"]["EB"] == 45
+    assert node_a["total_waiting_passengers_est"] == 45
+
+
+def test_queue_vehicle_count_unchanged():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    bus = make_bus_for_leg("R1_EB_A_NB", 300, "COUNT_BUS")
+    bus.speed = 0.0
+    vehicles = [bus, _queued_car(150), _queued_car(120, is_heavy=True)]
+
+    counts = exporter.compute_queue_counts_by_node(vehicles)
+    passengers = exporter.compute_queue_passengers_by_node(vehicles)
+
+    # Three vehicles regardless of type; passengers reflect 45 + 4 + 1.
+    assert counts["300"]["EB"] == 3
+    assert passengers["300"]["EB"] == 50
+    assert exporter.compute_queue_counts(vehicles)["EB"] == 3
+
+
+def test_queue_passengers_per_node():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    controller = SignalController({"green_time": 20})
+    node_a_x, node_b_x = canvas.INT_X
+    node_a_eb_truck = _queued_car(200, is_heavy=True)
+    node_b_eb_car = _queued_car(600)
+    node_b_eb_car.passed_nodes.add(node_a_x)
+    node_a_nb_car = _queued_nb(0, node_a_x)
+    node_b_nb_truck = _queued_nb(0, node_b_x, is_heavy=True)
+    vehicles = [node_a_eb_truck, node_b_eb_car, node_a_nb_car, node_b_nb_truck]
+
+    payload = exporter.build_payload(controller, vehicles, 60)
+    node_a = payload["signal_state"]["nodes"][str(node_a_x)]
+    node_b = payload["signal_state"]["nodes"][str(node_b_x)]
+
+    assert node_a["queues"] == {"EB": 1, "WB": 0, "NB": 1, "SB": 0}
+    assert node_a["queues_passengers_est"] == {"EB": 1, "WB": 0, "NB": 4, "SB": 0}
+    assert node_a["total_waiting_passengers_est"] == 5
+    assert node_b["queues"] == {"EB": 1, "WB": 0, "NB": 1, "SB": 0}
+    assert node_b["queues_passengers_est"] == {"EB": 4, "WB": 0, "NB": 1, "SB": 0}
+    assert node_b["total_waiting_passengers_est"] == 5
+
+    summary = payload["network_summary"]
+    assert summary["queues_passengers_est"] == {
+        "EB": 5, "WB": 0, "A_NB": 4, "A_SB": 0, "B_NB": 1, "B_SB": 0
+    }
+    assert summary["queues_passengers_est_by_node"] == {
+        str(node_a_x): node_a["queues_passengers_est"],
+        str(node_b_x): node_b["queues_passengers_est"],
+    }
+
+
+def test_empty_approach_zero():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    controller = SignalController({"green_time": 20})
+    moving_car = Vehicle(200, H_Y - 0.5 * LANE, "EB", lane_index=0)
+    moving_car.speed = 1.0
+
+    for vehicles in ([], [moving_car]):
+        payload = exporter.build_payload(controller, vehicles, 60)
+        summary = payload["network_summary"]
+        assert all(value == 0 for value in summary["queues"].values())
+        assert all(value == 0 for value in summary["queues_passengers_est"].values())
+        for node in payload["signal_state"]["nodes"].values():
+            assert node["queues_passengers_est"] == {
+                "EB": 0, "WB": 0, "NB": 0, "SB": 0
+            }
+            assert node["total_waiting_passengers_est"] == 0
+
+
 def test_telemetry_includes_congestion_demand_backlog(tmp_path):
     controller = SignalController({"green_time": 20})
     exporter = TelemetryExporter(tmp_path / "state.json", 1)
@@ -549,12 +673,11 @@ def test_schema_v3_exposes_bus_eta_routes_and_passenger_weighted_queues():
     assert route["nearest_bus_eta_sec"] == bus_state["eta_to_stop_bar_sec_freeflow"]
     assert bus_state["lane_index"] == bus.lane_index
     assert bus_state["in_dbl_lane"] is True
-    assert all(
-        payload["network_summary"]["queues_passengers_est"][approach]
-        == vehicle_count * 4
-        for approach, vehicle_count in payload["network_summary"]["queues"].items()
+    summary = payload["network_summary"]
+    assert summary["queues_passengers_est"] == exporter._flatten_queue_counts(
+        exporter.compute_queue_passengers_by_node([bus, car])
     )
-    assert payload["network_summary"]["car_occupancy_assumed"] == 4
+    assert "car_occupancy_assumed" not in summary
 
 
 def test_recent_throughput_uses_rolling_window_and_clears_on_reset():

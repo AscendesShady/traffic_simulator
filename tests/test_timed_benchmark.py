@@ -188,6 +188,8 @@ def test_test_autoexports_with_correct_filename(tmp_path, monkeypatch):
         "LLM Performance",
         "LLM Summary",
         "Control Panel Inputs",
+        "Bus Events",
+        "Unit Conversions",
     ]
     # The benchmark file records the exact configuration that produced it.
     inputs = workbook["Control Panel Inputs"]

@@ -18,6 +18,8 @@ from vehicle import Vehicle, Bus
 from signal_controller import SignalController
 from telemetry_dashboard import TelemetryDashboard
 from telemetry_exporter import TelemetryExporter
+from bus_event_log import BusEventTracker, write_bus_events_sheet
+import real_world_units
 
 # ==========================================================
 # STOCHASTIC SPAWNER ENGINE (COMPOUND POISSON / EXACT RATE)
@@ -62,6 +64,9 @@ network_throughput = {
     "vehicles_served_total": 0,
     "buses_served": 0,
     "cars_served": 0,
+    # Vehicle-frames spent stopped (speed below the queue threshold); the
+    # exporter turns this into mean stopped delay per served vehicle.
+    "stopped_vehicle_frames": 0,
 }
 BASE_DIR = Path(__file__).resolve().parent
 TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
@@ -71,6 +76,7 @@ DECISION_STALE_MULTIPLIER = 3
 DECISION_STALE_FLOOR_SEC = 12.0
 AGENT_TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
 TELEMETRY_LOG_PATH = BASE_DIR / "telemetry_log.jsonl"
+BUS_EVENTS_LOG_PATH = BASE_DIR / "bus_events.jsonl"
 EXCEL_EXPORT_DIR = BASE_DIR / "excel_exports"
 TELEMETRY_LOG_INTERVAL = 60
 SESSION_ROUTE_IDS = (
@@ -82,6 +88,9 @@ SESSION_ROUTE_IDS = (
     "R6_WB_ONLY",
 )
 _last_telemetry_log_frame = None
+# Per-bus lifecycle records (spawn, waits, TSP treatment, completion). The
+# path is resolved lazily so tests can re-point BUS_EVENTS_LOG_PATH.
+bus_event_tracker = BusEventTracker(lambda: BUS_EVENTS_LOG_PATH)
 
 
 def apply_configured_random_seed():
@@ -173,10 +182,11 @@ def calculate_startup_window_layout(screen_width, screen_height):
 
 
 def reset_session_logs():
-    """Start a clean pair of append-only logs for one simulator run."""
+    """Start a clean set of append-only logs for one simulator run."""
     global _last_telemetry_log_frame
     _last_telemetry_log_frame = None
-    for path in (TELEMETRY_LOG_PATH, AGENT_TURN_LOG_PATH):
+    bus_event_tracker.reset()
+    for path in (TELEMETRY_LOG_PATH, AGENT_TURN_LOG_PATH, BUS_EVENTS_LOG_PATH):
         try:
             path.unlink()
         except FileNotFoundError:
@@ -607,6 +617,27 @@ def write_control_panel_inputs_sheet(sheet):
     return sheet
 
 
+def write_unit_conversions_sheet(sheet, telemetry=None):
+    """Record how this run's pixel/frame data maps to real-world units.
+
+    The anchor constants and derived scales go in every workbook so each
+    figure can cite its conversion basis. Telemetry defaults to the last
+    exported snapshot on disk, so the live delay/speed rows are filled too.
+    """
+    if telemetry is None:
+        try:
+            telemetry = json.loads(TELEMETRY_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            telemetry = None
+    return real_world_units.write_unit_conversions_sheet(
+        sheet,
+        control_panel.global_config,
+        control_panel.approach_configs,
+        control_panel.APPROACH_NAMES,
+        telemetry,
+    )
+
+
 def build_test_export_filename(
     model, duration_sim_seconds, seed, timestamp=None
 ):
@@ -639,6 +670,7 @@ def export_test_workbook(
 
     decisions = _read_jsonl_rows(AGENT_TURN_LOG_PATH)
     telemetry_rows = _read_jsonl_rows(TELEMETRY_LOG_PATH)
+    bus_events = _read_jsonl_rows(BUS_EVENTS_LOG_PATH)
 
     try:
         workbook = Workbook()
@@ -657,6 +689,8 @@ def export_test_workbook(
         write_control_panel_inputs_sheet(
             workbook.create_sheet("Control Panel Inputs")
         )
+        write_bus_events_sheet(workbook.create_sheet("Bus Events"), bus_events)
+        write_unit_conversions_sheet(workbook.create_sheet("Unit Conversions"))
 
         if destination is None:
             destination = EXCEL_EXPORT_DIR / build_test_export_filename(
@@ -1670,10 +1704,17 @@ def main():
                             if isinstance(v, Bus):
                                 network_throughput["passengers_served_bus"] += passengers
                                 network_throughput["buses_served"] += 1
+                                bus_event_tracker.complete(v, master_frame_count, signals)
                             else:
                                 network_throughput["passengers_served_car"] += passengers
                                 network_throughput["cars_served"] += 1
                         vehicles.remove(v)
+                # Instrumentation only: samples post-update bus state and the
+                # controller's live priority requests for this frame.
+                bus_event_tracker.observe(vehicles, master_frame_count, signals)
+                network_throughput["stopped_vehicle_frames"] += sum(
+                    1 for v in vehicles if v.speed < 0.25
+                )
                 
                 time_accumulator -= dt_step
                 steps_this_callback += 1

@@ -20,7 +20,7 @@ def test_telemetry_dashboard_mounts_into_a_frame_without_owning_it():
         assert dashboard.root is pane
         assert len(pane.winfo_children()) > 0
         assert hasattr(dashboard, "notebook")
-        assert len(dashboard.notebook.tabs()) == 3
+        assert len(dashboard.notebook.tabs()) == 4
         assert host.title() != "Live Network Telemetry"
     finally:
         host.destroy()

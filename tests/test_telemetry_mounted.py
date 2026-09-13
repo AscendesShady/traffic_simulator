@@ -14,7 +14,7 @@ def test_main_mounts_telemetry_dashboard_into_the_right_pane():
 
         assert dashboard.root is telemetry_pane
         assert len(telemetry_pane.winfo_children()) > 0
-        assert len(dashboard.notebook.tabs()) == 3
+        assert len(dashboard.notebook.tabs()) == 4
         # The dashboard never touched the shared root's own title.
         assert root.title() == main.MAIN_WINDOW_TITLE
     finally:

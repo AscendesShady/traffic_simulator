@@ -149,9 +149,61 @@ def test_height_heavy_tabs_use_vertical_overflow_containers():
 
     assert "self.trends_scroll_canvas" in source
     assert "self.llm_scroll_canvas" in source
-    assert source.count("self.create_scrollable_tab()") == 2
+    assert source.count("self.create_overflow_tab()") == 3
     # The already-dense summary remains responsive without gaining a scrollbar.
     assert "self.summary_tab, self.summary_content = self.create_responsive_tab()" in source
+    overflow = inspect.getsource(TelemetryDashboard.create_overflow_tab)
+    assert "self.create_scrollable_tab()" in overflow
+    assert "self.embedded" in overflow
+
+
+def test_embedded_dashboard_never_nests_a_scrollbar():
+    """Mounted in a MainWindow pane the pane scrolls, so tabs must not add
+    a second scroll canvas inside it; standalone they still scroll."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    def scrollbars_under(widget):
+        found = [c for c in widget.winfo_children() if isinstance(c, ttk.Scrollbar)]
+        for child in widget.winfo_children():
+            found += scrollbars_under(child)
+        return found
+
+    host = tk.Tk()
+    try:
+        embedded = TelemetryDashboard(tk.Frame(host))
+        assert embedded.embedded is True
+        assert embedded.trends_scroll_canvas is None
+        assert embedded.llm_scroll_canvas is None
+        assert scrollbars_under(embedded.notebook) == []
+
+        # A Toplevel is a window of its own, so the dashboard owns it the
+        # same way it owns a standalone tk.Tk().
+        standalone = TelemetryDashboard(tk.Toplevel(host))
+        assert standalone.embedded is False
+        assert isinstance(standalone.trends_scroll_canvas, tk.Canvas)
+        assert len(scrollbars_under(standalone.notebook)) == 3
+    finally:
+        host.destroy()
+
+
+def test_llm_metric_grids_reflow_to_two_columns_in_a_portrait_column():
+    import tkinter as tk
+
+    host = tk.Tk()
+    try:
+        dashboard = TelemetryDashboard(tk.Frame(host))
+        dashboard.apply_responsive_layout(width=440, height=1200)
+        assert {s["active_columns"] for s in dashboard.llm_sections} == {2}
+        for section in dashboard.llm_sections:
+            for card in section["cards"]:
+                assert int(card.grid_info()["column"]) < 2
+        dashboard.apply_responsive_layout(width=1100, height=800)
+        assert [s["active_columns"] for s in dashboard.llm_sections] == [
+            s["columns"] for s in dashboard.llm_sections
+        ]
+    finally:
+        host.destroy()
 
 
 def test_scrollable_tab_tracks_width_and_vertical_overflow():

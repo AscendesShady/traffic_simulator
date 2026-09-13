@@ -350,22 +350,21 @@ def test_route_flag_button_repaint_reflects_external_decision(monkeypatch):
 
     control_panel.repaint_route_flag_buttons()
 
-    assert buttons["tsp"].options == {
-        "text": "TSP ACTIVE",
-        "fg": control_panel.COLOR_SUCCESS,
-    }
-    assert buttons["dbl"].options == {
-        "text": "DBL ACTIVE",
-        "fg": control_panel.COLOR_ACCENT,
-    }
+    # An enabled flag is a filled chip; the text carries the state too, so
+    # it never depends on colour alone.
+    assert buttons["tsp"].options["text"] == "TSP ON"
+    assert buttons["tsp"].options["bg"] == control_panel.COLOR_SUCCESS
+    assert buttons["dbl"].options["text"] == "DBL ON"
+    assert buttons["dbl"].options["bg"] == control_panel.COLOR_ACCENT
+    assert buttons["dbl"].options["fg"] == control_panel.COLOR_TEXT_PRIMARY
 
     monkeypatch.setitem(route, "tsp_enabled", False)
     monkeypatch.setitem(route, "dbl_enabled", False)
     control_panel.repaint_route_flag_buttons()
-    assert buttons["tsp"].options["text"] == "TSP OFF"
-    assert buttons["tsp"].options["fg"] == control_panel.COLOR_DANGER
-    assert buttons["dbl"].options["text"] == "DBL OFF"
-    assert buttons["dbl"].options["fg"] == control_panel.COLOR_DANGER
+    for key in ("tsp", "dbl"):
+        assert buttons[key].options["text"] == f"{key.upper()} OFF"
+        assert buttons[key].options["bg"] == control_panel.COLOR_CARD_BORDER
+        assert buttons[key].options["fg"] == control_panel.COLOR_TEXT_SECONDARY
 
 
 def test_main_merge_applies_valid_flags_and_rejects_invalid_flags(

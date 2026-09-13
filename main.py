@@ -1373,11 +1373,20 @@ def build_scrollable_pane(parent, width):
         (0, 0), window=content, anchor="nw"
     )
 
+    # A 1px-wide spacer whose height follows the viewport gives the content
+    # frame a natural height of at least the visible pane, so a mounted
+    # component that packs with expand=True (the telemetry notebook) fills
+    # the pane top to bottom. Natural sizing is untouched: taller content
+    # still fires <Configure> and scrolls.
+    min_height_spacer = tk.Frame(content, width=1, height=1, bg=control_panel.COLOR_BG)
+    min_height_spacer.pack(side="right", fill="y")
+
     def refresh_scroll_region(_event=None):
         scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
 
     def fit_content_width(event):
         scroll_canvas.itemconfigure(content_window, width=max(1, event.width))
+        min_height_spacer.configure(height=max(1, event.height))
 
     content.bind("<Configure>", refresh_scroll_region, add="+")
     scroll_canvas.bind("<Configure>", fit_content_width, add="+")
@@ -1445,7 +1454,7 @@ def build_main_window():
     control_outer, control_pane, control_scroll = build_scrollable_pane(
         paned, side_pane_width
     )
-    simulation_pane = tk.Frame(paned, bg="black")
+    simulation_pane = tk.Frame(paned, bg=control_panel.COLOR_BG)
     telemetry_outer, telemetry_pane, telemetry_scroll = build_scrollable_pane(
         paned, side_pane_width
     )
@@ -1483,13 +1492,21 @@ def build_simulation_canvas(parent):
     Returns (canvas_widget, push_frame), where push_frame(surface) converts
     one pygame Surface to PPM bytes and writes it into the same PhotoImage.
     """
-    simulation_canvas = tk.Canvas(
-        parent, width=canvas.WIDTH, height=canvas.HEIGHT,
-        bg="black", highlightthickness=0,
+    # The pane shares the side panes' background; the canvas sits in a
+    # hairline frame so the network reads as one framed view rather than a
+    # black rectangle floating on black.
+    frame = tk.Frame(
+        parent, bg=control_panel.COLOR_BG,
+        highlightthickness=1, highlightbackground=control_panel.COLOR_CARD_BORDER,
     )
     # expand=True without fill: the fixed-size canvas floats centered in
     # whatever width the 60% center pane has, rather than hugging its corner.
-    simulation_canvas.pack(expand=True)
+    frame.pack(expand=True)
+    simulation_canvas = tk.Canvas(
+        frame, width=canvas.WIDTH, height=canvas.HEIGHT,
+        bg="black", highlightthickness=0,
+    )
+    simulation_canvas.pack()
     photo = tk.PhotoImage(width=canvas.WIDTH, height=canvas.HEIGHT)
     image_item = simulation_canvas.create_image(0, 0, anchor="nw", image=photo)
     ppm_header = f"P6 {canvas.WIDTH} {canvas.HEIGHT} 255 ".encode("ascii")

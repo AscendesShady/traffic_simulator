@@ -1315,7 +1315,11 @@ def test_export_all_creates_core_sheets(tmp_path, monkeypatch):
             "LLM Performance",
             "LLM Summary",
         ]
-        assert workbook.sheetnames == session_sheets + ["Control Panel Inputs"]
+        assert workbook.sheetnames == session_sheets + [
+            "Control Panel Inputs",
+            "Bus Events",
+            "Unit Conversions",
+        ]
         assert all(workbook[name].max_row == 2 for name in session_sheets)
         inputs = workbook["Control Panel Inputs"]
         assert [cell.value for cell in inputs[1]] == [

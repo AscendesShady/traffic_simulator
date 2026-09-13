@@ -11,11 +11,14 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
+import control_panel
+import real_world_units
 from guard import ROUTE_ORDER
 
 
 COLOR_BG = "#1A1E29"
 COLOR_CARD = "#222834"
+COLOR_CARD_ALT = "#272E3D"
 COLOR_CARD_BORDER = "#333D50"
 COLOR_ACCENT = "#2D8CFF"
 COLOR_SUCCESS = "#2ECC71"
@@ -24,11 +27,22 @@ COLOR_DANGER = "#EF4444"
 COLOR_TEXT_PRIMARY = "#FFFFFF"
 COLOR_TEXT_SECONDARY = "#94A3B8"
 FONT_FAMILY = "Segoe UI"
+# Same three-step type scale as the control panel, plus one display size
+# reserved for KPI numbers.
+FONT_TITLE_SIZE = 13
+FONT_SECTION_SIZE = 10
+FONT_BODY_SIZE = 9
+FONT_DISPLAY_SIZE = 16
+SPACE_XS, SPACE_SM, SPACE_MD = 4, 8, 12
+# LLM metric grids drop to this many columns in a portrait column, where
+# a 4-wide grid clips its own titles.
+LLM_PORTRAIT_COLUMNS = 2
 
 BASE_DIR = Path(__file__).resolve().parent
 TELEMETRY_FILE = BASE_DIR / "traffic_state_telemetry.json"
 AGENT_TURN_LOG_FILE = BASE_DIR / "agent_turn_log.jsonl"
 TELEMETRY_LOG_FILE = BASE_DIR / "telemetry_log.jsonl"
+BUS_EVENTS_LOG_FILE = BASE_DIR / "bus_events.jsonl"
 AI_CONTROL_FILE = BASE_DIR / "ai_control.json"
 DASHBOARD_EXPORT_DIR = BASE_DIR / "excel_exports"
 STALE_AFTER_SECONDS = 2.0
@@ -353,6 +367,9 @@ class TelemetryDashboard:
         """
         self.root = root
         is_toplevel = isinstance(root, (tk.Tk, tk.Toplevel))
+        # Mounted in a MainWindow pane, the pane already scrolls; tabs
+        # must not add a second scrollbar inside it.
+        self.embedded = not is_toplevel
         if is_toplevel:
             self.root.title("Live Network Telemetry")
             window_width, window_height = self.initial_window_size(
@@ -428,73 +445,94 @@ class TelemetryDashboard:
         self._last_agent_log_size = None
 
     def build_ui(self):
+        # Header row 1: title + live status. Row 2: the one export action and
+        # its result line. Two rows because a portrait column cannot hold
+        # title, status, button and message abreast without clipping.
         header = tk.Frame(self.root, bg=COLOR_BG)
-        header.pack(fill="x", padx=14, pady=(8, 4))
+        header.pack(fill="x", padx=SPACE_MD, pady=(SPACE_MD, SPACE_SM))
         self.header_title_lbl = tk.Label(
             header,
-            text="LIVE NETWORK TELEMETRY",
-            font=(FONT_FAMILY, 13, "bold"),
+            text="Live Telemetry",
+            font=(FONT_FAMILY, FONT_TITLE_SIZE, "bold"),
             bg=COLOR_BG,
             fg=COLOR_TEXT_PRIMARY,
+            anchor="w",
         )
-        self.header_title_lbl.pack(side="left")
+        self.header_title_lbl.pack(side="left", fill="x", expand=True)
         self.status_lbl = tk.Label(
             header,
             text="WAITING FOR DATA",
-            font=(FONT_FAMILY, 10, "bold"),
+            font=(FONT_FAMILY, FONT_BODY_SIZE, "bold"),
             bg=COLOR_BG,
             fg=COLOR_WARNING,
+            anchor="e",
         )
         self.status_lbl.pack(side="right")
 
         style = ttk.Style(self.root)
-        style.configure("Telemetry.TNotebook", background=COLOR_BG, borderwidth=0)
+        # clam is the one built-in theme that honours colour options on
+        # notebook tabs; the native Windows theme would keep grey tabs and
+        # then paint the mapped white text onto them.
+        style.theme_use("clam")
+        # The ttk notebook keeps the page bookkeeping (tabs(), select(),
+        # <<NotebookTabChanged>>) but draws no tab strip of its own: clam
+        # resizes and re-bevels the selected tab, which reads as a jump on
+        # every switch. A fixed-size button strip below drives it instead.
         style.configure(
-            "Telemetry.TNotebook.Tab",
-            font=(FONT_FAMILY, 9, "bold"),
-            padding=(16, 7),
+            "Telemetry.TNotebook",
+            background=COLOR_BG,
+            borderwidth=0,
+            bordercolor=COLOR_BG,
+            lightcolor=COLOR_BG,
+            darkcolor=COLOR_BG,
+            tabmargins=0,
         )
-        self.export_all_btn = tk.Button(
-            header,
-            text="EXPORT ALL",
-            command=self.export_all,
-            font=(FONT_FAMILY, 8, "bold"),
-            bg=COLOR_ACCENT,
-            fg=COLOR_TEXT_PRIMARY,
-            activebackground=COLOR_CARD_BORDER,
-            activeforeground=COLOR_TEXT_PRIMARY,
-            relief="flat",
-            padx=10,
-            pady=3,
+        style.layout("Telemetry.TNotebook.Tab", [])
+        toolbar = tk.Frame(self.root, bg=COLOR_BG)
+        toolbar.pack(fill="x", padx=SPACE_MD, pady=(0, SPACE_SM))
+        self.header_toolbar = toolbar
+        self.export_all_btn = control_panel.make_button(
+            toolbar, "Export all", "primary", self.export_all
         )
-        self.export_all_btn.pack(side="right", padx=(10, 0))
+        self.export_all_btn.pack(side="left")
         self.export_all_status_lbl = tk.Label(
-            header,
+            toolbar,
             text="",
-            font=(FONT_FAMILY, 8),
+            font=(FONT_FAMILY, FONT_BODY_SIZE),
             bg=COLOR_BG,
             fg=COLOR_SUCCESS,
+            anchor="w",
+            justify="left",
         )
-        self.export_all_status_lbl.pack(side="right", padx=(8, 0))
+        self.export_all_status_lbl.pack(side="left", fill="x", expand=True, padx=(SPACE_SM, 0))
+        self.tab_strip = self.build_tab_strip(self.root)
+        self.tab_strip.pack(fill="x", padx=SPACE_MD)
         self.notebook = ttk.Notebook(
             self.root,
             style="Telemetry.TNotebook",
         )
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self.notebook.pack(fill="both", expand=True, padx=SPACE_MD, pady=(0, SPACE_SM))
+        self.notebook.bind("<<NotebookTabChanged>>", self.refresh_tab_strip, add="+")
         self.summary_tab, self.summary_content = self.create_responsive_tab()
         (
             self.trends_tab,
             self.trends_content,
             self.trends_scroll_canvas,
-        ) = self.create_scrollable_tab()
+        ) = self.create_overflow_tab()
         (
             self.llm_tab,
             self.llm_content,
             self.llm_scroll_canvas,
-        ) = self.create_scrollable_tab()
-        self.notebook.add(self.summary_tab, text="SUMMARY")
-        self.notebook.add(self.trends_tab, text="SESSION TRENDS")
-        self.notebook.add(self.llm_tab, text="LLM PERFORMANCE")
+        ) = self.create_overflow_tab()
+        (
+            self.units_tab,
+            self.units_content,
+            self.units_scroll_canvas,
+        ) = self.create_overflow_tab()
+        self.add_tab(self.summary_tab, "Summary")
+        self.add_tab(self.trends_tab, "Trends")
+        self.add_tab(self.llm_tab, "LLM")
+        self.add_tab(self.units_tab, "Units")
 
         summary_controls = tk.Frame(self.summary_content, bg=COLOR_BG)
         self.summary_export_hint_lbl = tk.Label(
@@ -651,7 +689,9 @@ class TelemetryDashboard:
         )
         self.intersection_title_lbl.pack(anchor="w", padx=20, pady=(10, 3))
         diagram_frame = tk.Frame(self.summary_content, bg=COLOR_BG)
-        diagram_frame.pack(fill="both", expand=True, padx=20, pady=5)
+        # fill="x" only: the node diagrams keep a bounded height instead of
+        # stretching to swallow whatever the pane has left below them.
+        diagram_frame.pack(fill="x", padx=20, pady=5)
         self.diagram_frame = diagram_frame
         self.diagram_frame.grid_rowconfigure(0, weight=1)
         self.diagram_frame.grid_columnconfigure(
@@ -677,8 +717,80 @@ class TelemetryDashboard:
         )
         self.build_trends_ui()
         self.build_llm_performance_ui()
-        self.bind_tab_mousewheel(self.trends_content, self.trends_scroll_canvas)
-        self.bind_tab_mousewheel(self.llm_content, self.llm_scroll_canvas)
+        self.build_units_ui()
+        if self.trends_scroll_canvas is not None:
+            self.bind_tab_mousewheel(self.trends_content, self.trends_scroll_canvas)
+        if self.llm_scroll_canvas is not None:
+            self.bind_tab_mousewheel(self.llm_content, self.llm_scroll_canvas)
+        if self.units_scroll_canvas is not None:
+            self.bind_tab_mousewheel(self.units_content, self.units_scroll_canvas)
+
+    TAB_SHADOW_STEPS = ("#12151D", "#151821", "#171B25", "#191D28")
+
+    def build_tab_strip(self, parent):
+        """Equal-width tab buttons with an accent underline under the active
+        one, over a soft shadow that separates the strip from the page.
+
+        Buttons never change size on selection -- only colour and the
+        underline move -- so switching tabs does not shift the layout.
+        """
+        strip = tk.Frame(parent, bg=COLOR_BG)
+        self.tab_buttons_row = tk.Frame(strip, bg=COLOR_BG)
+        self.tab_buttons_row.pack(fill="x")
+        self.tab_buttons = []
+        shadow = tk.Frame(strip, bg=COLOR_BG)
+        shadow.pack(fill="x")
+        for shade in self.TAB_SHADOW_STEPS:
+            tk.Frame(shadow, bg=shade, height=1).pack(fill="x")
+        return strip
+
+    def add_tab(self, page, title):
+        """Register a page with the notebook and give it a strip button."""
+        index = len(self.tab_buttons)
+        self.notebook.add(page, text=title)
+        self.tab_buttons_row.grid_columnconfigure(
+            index, weight=1, uniform="telemetry_tabs"
+        )
+        cell = tk.Frame(self.tab_buttons_row, bg=COLOR_BG)
+        cell.grid(row=0, column=index, sticky="nsew")
+        button = tk.Button(
+            cell,
+            text=title,
+            font=(FONT_FAMILY, FONT_BODY_SIZE, "bold"),
+            bg=COLOR_BG,
+            fg=COLOR_TEXT_SECONDARY,
+            activebackground=COLOR_CARD,
+            activeforeground=COLOR_TEXT_PRIMARY,
+            relief="flat",
+            bd=0,
+            padx=SPACE_SM,
+            pady=SPACE_SM,
+            cursor="hand2",
+            highlightthickness=1,
+            highlightbackground=COLOR_BG,
+            highlightcolor=COLOR_ACCENT,
+            command=lambda page=page: self.notebook.select(page),
+        )
+        button.pack(fill="x")
+        underline = tk.Frame(cell, bg=COLOR_BG, height=2)
+        underline.pack(fill="x")
+        control_panel.add_hover_state(button)
+        self.tab_buttons.append({"page": page, "button": button, "underline": underline})
+        self.refresh_tab_strip()
+
+    def refresh_tab_strip(self, _event=None):
+        """Paint the strip from the notebook's real selection."""
+        try:
+            selected = self.notebook.select()
+        except tk.TclError:
+            return
+        for entry in self.tab_buttons:
+            active = str(entry["page"]) == str(selected)
+            entry["button"].config(
+                bg=COLOR_CARD if active else COLOR_BG,
+                fg=COLOR_TEXT_PRIMARY if active else COLOR_TEXT_SECONDARY,
+            )
+            entry["underline"].config(bg=COLOR_ACCENT if active else COLOR_BG)
 
     def create_responsive_tab(self):
         """Return a tab whose content reflows with the available window size."""
@@ -686,6 +798,18 @@ class TelemetryDashboard:
         content = tk.Frame(tab, bg=COLOR_BG)
         content.pack(fill="both", expand=True)
         return tab, content
+
+    def create_overflow_tab(self):
+        """A tab for height-heavy content: (tab, content, scroll_canvas).
+
+        Standalone, the tab scrolls itself. Mounted in a MainWindow pane the
+        pane is already the scroll container, so the tab is a plain frame and
+        ``scroll_canvas`` is None -- one scrollbar, never one inside another.
+        """
+        if self.embedded:
+            tab, content = self.create_responsive_tab()
+            return tab, content, None
+        return self.create_scrollable_tab()
 
     def create_scrollable_tab(self):
         """Return a width-responsive tab with vertical overflow scrolling.
@@ -720,7 +844,14 @@ class TelemetryDashboard:
             canvas.configure(scrollregion=canvas.bbox("all"))
 
         def fit_content_width(event):
-            canvas.itemconfigure(content_window, width=max(1, event.width))
+            # Width always tracks the viewport; height only when the content
+            # is shorter than it, so charts fill the tab instead of leaving a
+            # dead band under them, and taller content still scrolls.
+            canvas.itemconfigure(
+                content_window,
+                width=max(1, event.width),
+                height=max(event.height, content.winfo_reqheight()),
+            )
             canvas.after_idle(refresh_scroll_region)
 
         content.bind("<Configure>", refresh_scroll_region, add="+")
@@ -775,15 +906,18 @@ class TelemetryDashboard:
         compact = width < 700 or height < 700
         return {
             "compact": compact,
-            "header_font": max(11, round(16 * scale)),
-            "status_font": max(8, round(10 * scale)),
-            "section_font": max(8, round(11 * scale)),
-            "metric_title_font": max(6, round(9 * scale)),
-            "metric_value_font": max(11, min(16, round(18 * scale))),
-            "detail_font": max(6, round(8 * scale)),
+            "portrait": width < 700,
+            "header_font": max(11, round(FONT_TITLE_SIZE * scale)),
+            "status_font": max(8, round(FONT_BODY_SIZE * scale)),
+            "section_font": max(8, round(FONT_SECTION_SIZE * scale)),
+            "metric_title_font": max(7, round(FONT_BODY_SIZE * scale)),
+            "metric_value_font": max(11, min(FONT_DISPLAY_SIZE, round(FONT_DISPLAY_SIZE * scale))),
+            "detail_font": max(7, round(FONT_BODY_SIZE * scale)),
             "metric_row_height": max(26, min(40, round(height * 0.07))),
             "phase_height": max(35, min(85, round(height * 0.11))),
-            "node_height": max(45, min(100, round(height * 0.13))),
+            # Wide enough to read as a crossing in a portrait column, but
+            # never taller than a short standalone window can spare.
+            "node_height": max(45, min(round(width * 0.36), round(height * 0.22))),
             "chart_height": max(72, min(150, round((height - 120) / 3))),
             "wraplength": max(310, width - 92),
         }
@@ -811,12 +945,19 @@ class TelemetryDashboard:
             font=(FONT_FAMILY, profile["status_font"], "bold")
         )
         self.header_title_lbl.master.pack_configure(
-            padx=10 if compact else 20,
-            pady=(6, 4) if compact else (15, 10),
+            padx=SPACE_MD if compact else 20,
+            pady=(SPACE_MD, SPACE_XS) if compact else (15, SPACE_SM),
+        )
+        self.header_toolbar.pack_configure(
+            padx=SPACE_MD if compact else 20,
+            pady=(0, SPACE_SM),
         )
         self.notebook.pack_configure(
-            padx=6 if compact else 14,
-            pady=(0, 6 if compact else 12),
+            padx=SPACE_MD if compact else 14,
+            pady=(0, SPACE_SM if compact else 12),
+        )
+        self._regrid_llm_sections(
+            LLM_PORTRAIT_COLUMNS if profile["portrait"] else None
         )
 
         metric_pad = 2 if compact else 4
@@ -1068,6 +1209,8 @@ class TelemetryDashboard:
         )
 
     def build_trends_ui(self):
+        # Caption on top, the single action under it: the caption wraps to
+        # the column width instead of fighting the button for one row.
         controls = tk.Frame(self.trends_content, bg=COLOR_BG)
         controls.pack(fill="x", padx=20, pady=(12, 6))
         self.trends_info_lbl = tk.Label(
@@ -1076,25 +1219,17 @@ class TelemetryDashboard:
                 "IN MEMORY ONLY  |  Up to 1 sample per simulated second  |  "
                 f"Latest {HISTORY_MAX_POINTS} samples  |  Clears on reset/close"
             ),
-            font=(FONT_FAMILY, 9),
+            font=(FONT_FAMILY, FONT_BODY_SIZE),
             bg=COLOR_BG,
             fg=COLOR_TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
         )
-        self.trends_info_lbl.pack(side="left")
-        self.clear_history_btn = tk.Button(
-            controls,
-            text="CLEAR HISTORY",
-            command=self.clear_history,
-            font=(FONT_FAMILY, 8, "bold"),
-            bg=COLOR_CARD,
-            fg=COLOR_TEXT_PRIMARY,
-            activebackground=COLOR_CARD_BORDER,
-            activeforeground=COLOR_TEXT_PRIMARY,
-            relief="flat",
-            padx=10,
-            pady=4,
+        self.trends_info_lbl.pack(fill="x")
+        self.clear_history_btn = control_panel.make_button(
+            controls, "Clear history", "neutral", self.clear_history
         )
-        self.clear_history_btn.pack(side="right")
+        self.clear_history_btn.pack(anchor="w", pady=(SPACE_SM, 0))
         self.trends_export_status_lbl = tk.Label(
             controls,
             text="",
@@ -1154,6 +1289,9 @@ class TelemetryDashboard:
         self.llm_metric_cards = []
         self.llm_metric_title_labels = []
         self.llm_section_labels = []
+        # (grid frame, cards, natural column count) per section, so the
+        # responsive pass can re-grid them for a portrait column.
+        self.llm_sections = []
         self._build_llm_card_grid(
             "LATEST TURN",
             (
@@ -1186,12 +1324,22 @@ class TelemetryDashboard:
             ),
             columns=4,
         )
+        ttk.Style(self.root).configure(
+            "Telemetry.Horizontal.TProgressbar",
+            troughcolor="#141822",
+            background=COLOR_ACCENT,
+            bordercolor=COLOR_CARD_BORDER,
+            lightcolor=COLOR_ACCENT,
+            darkcolor=COLOR_ACCENT,
+            thickness=8,
+        )
         self.llm_vram_bar = ttk.Progressbar(
             self.llm_vars["vram"].master,
             orient="horizontal",
             mode="determinate",
             maximum=100,
             value=0,
+            style="Telemetry.Horizontal.TProgressbar",
         )
         self.llm_vram_bar.pack(fill="x", padx=8, pady=(0, 5))
         self._build_llm_card_grid(
@@ -1209,6 +1357,142 @@ class TelemetryDashboard:
             columns=4,
         )
 
+    UNIT_TAG_COLORS = {
+        real_world_units.TAG_EXACT: COLOR_SUCCESS,
+        real_world_units.TAG_ANCHOR: COLOR_ACCENT,
+        real_world_units.TAG_DERIVED: COLOR_TEXT_SECONDARY,
+        real_world_units.TAG_APPROX: COLOR_WARNING,
+    }
+
+    def build_units_ui(self):
+        """Read-only sim -> real conversion table, anchored on saturation flow.
+
+        Rows are (quantity | sim | real | tag) with the tag spelled out, so
+        calibrated, derived and approximate numbers are never told apart by
+        colour alone. Rebuilt from live telemetry on every poll.
+        """
+        self.units_statement_lbl = tk.Label(
+            self.units_content,
+            text=real_world_units.anchor_statement(None),
+            font=(FONT_FAMILY, FONT_BODY_SIZE, "bold"),
+            bg=COLOR_BG,
+            fg=COLOR_TEXT_PRIMARY,
+            anchor="w",
+            justify="left",
+            wraplength=360,
+        )
+        self.units_statement_lbl.pack(fill="x", padx=20, pady=(SPACE_MD, SPACE_SM))
+        legend = tk.Frame(self.units_content, bg=COLOR_BG)
+        legend.pack(fill="x", padx=20, pady=(0, SPACE_SM))
+        for tag, meaning in (
+            (real_world_units.TAG_EXACT, "no assumption"),
+            (real_world_units.TAG_ANCHOR, "declared mapping"),
+            (real_world_units.TAG_DERIVED, "follows from anchor"),
+            (real_world_units.TAG_APPROX, "sim-equivalent only"),
+        ):
+            tk.Label(
+                legend, text=f"[{tag}] {meaning}",
+                font=(FONT_FAMILY, FONT_BODY_SIZE), bg=COLOR_BG,
+                fg=self.UNIT_TAG_COLORS[tag], anchor="w",
+            ).pack(anchor="w")
+        self.units_sections_frame = tk.Frame(self.units_content, bg=COLOR_BG)
+        self.units_sections_frame.pack(fill="x", padx=20, pady=(0, SPACE_MD))
+        self.units_row_widgets = {}
+        self.units_sections = None
+        self.update_units_display(None)
+
+    def units_table(self, telemetry):
+        return real_world_units.build_conversion_table(
+            control_panel.global_config,
+            control_panel.approach_configs,
+            control_panel.APPROACH_NAMES,
+            telemetry,
+        )
+
+    def update_units_display(self, telemetry):
+        sections = self.units_table(telemetry)
+        self.units_statement_lbl.config(
+            text=real_world_units.anchor_statement(
+                control_panel.global_config.get("measured_saturation_flow")
+            )
+        )
+        shape = [(s["title"], [r["quantity"] for r in s["rows"]]) for s in sections]
+        if shape != self.units_sections:
+            # Row set changed (first build, or approaches renamed): rebuild.
+            for child in self.units_sections_frame.winfo_children():
+                child.destroy()
+            self.units_row_widgets = {}
+            for section in sections:
+                card = tk.Frame(
+                    self.units_sections_frame, bg=COLOR_CARD,
+                    highlightbackground=COLOR_CARD_BORDER, highlightthickness=1,
+                )
+                card.pack(fill="x", pady=(0, SPACE_SM))
+                tk.Label(
+                    card, text=section["title"].upper(),
+                    font=(FONT_FAMILY, FONT_BODY_SIZE, "bold"),
+                    bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY, anchor="w",
+                ).pack(fill="x", padx=SPACE_MD, pady=(SPACE_SM, SPACE_XS))
+                rows_frame = tk.Frame(card, bg=COLOR_CARD)
+                rows_frame.pack(fill="x", padx=SPACE_MD, pady=(0, SPACE_SM))
+                for index, row in enumerate(section["rows"]):
+                    block = tk.Frame(rows_frame, bg=COLOR_CARD)
+                    block.pack(fill="x", pady=(0 if index == 0 else SPACE_SM, 0))
+                    head = tk.Frame(block, bg=COLOR_CARD)
+                    head.pack(fill="x")
+                    tk.Label(
+                        head, text=row["quantity"], font=(FONT_FAMILY, FONT_BODY_SIZE, "bold"),
+                        bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY, anchor="w",
+                    ).pack(side="left", fill="x", expand=True)
+                    tag = tk.Label(
+                        head, text=f"[{row['tag']}]", font=(FONT_FAMILY, FONT_BODY_SIZE, "bold"),
+                        bg=COLOR_CARD, fg=self.UNIT_TAG_COLORS.get(row["tag"], COLOR_TEXT_SECONDARY),
+                        anchor="e",
+                    )
+                    tag.pack(side="right")
+                    values = tk.Frame(block, bg=COLOR_CARD)
+                    values.pack(fill="x")
+                    sim = tk.Label(
+                        values, text=row["sim"], font=(FONT_FAMILY, FONT_BODY_SIZE),
+                        bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY, anchor="w",
+                    )
+                    sim.pack(side="left")
+                    tk.Label(
+                        values, text="→", font=(FONT_FAMILY, FONT_BODY_SIZE),
+                        bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY,
+                    ).pack(side="left", padx=SPACE_SM)
+                    real = tk.Label(
+                        values, text=row["real"], font=(FONT_FAMILY, FONT_BODY_SIZE, "bold"),
+                        bg=COLOR_CARD, fg=COLOR_ACCENT, anchor="w",
+                    )
+                    real.pack(side="left")
+                    note = tk.Label(
+                        block, text=row["note"], font=(FONT_FAMILY, FONT_BODY_SIZE),
+                        bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY, anchor="w",
+                        justify="left", wraplength=340,
+                    )
+                    if row["note"]:
+                        note.pack(fill="x")
+                    self.units_row_widgets[(section["title"], row["quantity"])] = {
+                        "sim": sim, "real": real, "tag": tag, "note": note,
+                    }
+            self.units_sections = shape
+            return
+        for section in sections:
+            for row in section["rows"]:
+                widgets = self.units_row_widgets[(section["title"], row["quantity"])]
+                widgets["sim"].config(text=row["sim"])
+                widgets["real"].config(text=row["real"])
+                widgets["tag"].config(
+                    text=f"[{row['tag']}]",
+                    fg=self.UNIT_TAG_COLORS.get(row["tag"], COLOR_TEXT_SECONDARY),
+                )
+                widgets["note"].config(text=row["note"])
+                if row["note"] and not widgets["note"].winfo_manager():
+                    widgets["note"].pack(fill="x")
+                elif not row["note"] and widgets["note"].winfo_manager():
+                    widgets["note"].pack_forget()
+
     def _build_llm_card_grid(self, title, metrics, columns):
         section = tk.Frame(self.llm_content, bg=COLOR_BG)
         section.pack(fill="x", padx=20, pady=(3, 2))
@@ -1224,27 +1508,15 @@ class TelemetryDashboard:
         self.llm_section_labels.append(section_title)
         grid = tk.Frame(section, bg=COLOR_BG)
         grid.pack(fill="x")
-        for column in range(columns):
-            grid.grid_columnconfigure(
-                column,
-                weight=1,
-                uniform=f"llm_{title}_columns",
-            )
-        for index, (metric_title, key) in enumerate(metrics):
-            row, column = divmod(index, columns)
+        cards = []
+        for metric_title, key in metrics:
             card = tk.Frame(
                 grid,
                 bg=COLOR_CARD,
                 highlightbackground=COLOR_CARD_BORDER,
                 highlightthickness=1,
             )
-            card.grid(
-                row=row,
-                column=column,
-                sticky="nsew",
-                padx=3,
-                pady=3,
-            )
+            cards.append(card)
             title_label = tk.Label(
                 card,
                 text=metric_title,
@@ -1266,6 +1538,34 @@ class TelemetryDashboard:
             self.llm_metric_cards.append(card)
             self.llm_metric_title_labels.append(title_label)
             self.llm_vars[key] = value_label
+        self.llm_sections.append(
+            {"grid": grid, "cards": cards, "columns": columns, "title": title}
+        )
+        self._grid_llm_cards(self.llm_sections[-1], columns)
+
+    @staticmethod
+    def _grid_llm_cards(section, columns):
+        grid = section["grid"]
+        columns = max(1, int(columns))
+        for column in range(max(columns, section["columns"])):
+            grid.grid_columnconfigure(
+                column,
+                weight=1 if column < columns else 0,
+                uniform=f"llm_{section['title']}_columns" if column < columns else "",
+            )
+        for index, card in enumerate(section["cards"]):
+            row, column = divmod(index, columns)
+            card.grid(row=row, column=column, sticky="nsew", padx=3, pady=3)
+        section["active_columns"] = columns
+
+    def _regrid_llm_sections(self, portrait_columns):
+        """Re-flow every LLM metric grid: natural width or a portrait count."""
+        for section in getattr(self, "llm_sections", []):
+            columns = section["columns"]
+            if portrait_columns is not None:
+                columns = min(columns, portrait_columns)
+            if section.get("active_columns") != columns:
+                self._grid_llm_cards(section, columns)
 
     def create_trend_chart(self, parent, title, series, fixed_max=None):
         card = tk.Frame(
@@ -2086,6 +2386,31 @@ class TelemetryDashboard:
             except Exception:
                 inputs_sheet.append(["section", "parameter", "value"])
 
+            # One row per completed bus, so treated (TSP-granted) and
+            # untreated bus delay can be compared from the same workbook.
+            bus_events_sheet = workbook.create_sheet("Bus Events")
+            try:
+                from bus_event_log import write_bus_events_sheet
+
+                write_bus_events_sheet(
+                    bus_events_sheet, read_jsonl(BUS_EVENTS_LOG_FILE)
+                )
+            except Exception:
+                pass
+            # The anchor constants and derived scales, so every figure in
+            # this workbook can cite its pixel -> real-unit basis.
+            units_sheet = workbook.create_sheet("Unit Conversions")
+            try:
+                real_world_units.write_unit_conversions_sheet(
+                    units_sheet,
+                    control_panel.global_config,
+                    control_panel.approach_configs,
+                    control_panel.APPROACH_NAMES,
+                    self.latest_telemetry,
+                )
+            except Exception:
+                pass
+
             # Fold in the content the removed per-tab buttons used to produce,
             # so EXPORT ALL is genuinely the only export needed. Session
             # Trends in particular exists only in this process's memory.
@@ -2096,6 +2421,7 @@ class TelemetryDashboard:
                     performance_sheet,
                     summary_sheet,
                     inputs_sheet,
+                    bus_events_sheet,
                 )
             )
             try:
@@ -2786,6 +3112,11 @@ class TelemetryDashboard:
                 canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill=color, outline="")
 
     def update_metrics(self, data):
+        try:
+            self.update_units_display(data)
+        except Exception:
+            # Display only; a conversion hiccup must never stall the poll.
+            pass
         frame = int(data.get("frame_number", 0))
         summary = data.get("network_summary", {})
         total_vehicles = int(summary.get("total_vehicles", 0))

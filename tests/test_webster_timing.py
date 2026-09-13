@@ -43,7 +43,10 @@ def test_webster_handles_zero_and_oversaturated_demand():
         {"EW": 0.0, "NS": 0.0}, s=1800.0, lost_time_sec=4.0
     )
     assert idle["EW_green_frames"] == idle["NS_green_frames"]
-    assert idle["cycle_time_sec"] == idle["webster_optimal_cycle_sec"] == 11.0
+    # Webster's optimum collapses to the lost time; the practical floor holds.
+    assert idle["webster_optimal_cycle_sec"] == 11.0
+    assert idle["cycle_time_sec"] == webster.MIN_CYCLE_SEC == 40.0
+    assert idle["cycle_source"] == "min_cycle_floor"
 
     jammed = webster.compute_node_green_splits(
         {"EW": 1500.0, "NS": 1500.0}, s=1800.0, cycle_sec=60.0,
@@ -55,8 +58,9 @@ def test_webster_handles_zero_and_oversaturated_demand():
 
 
 def test_splits_consistent_with_optimal_cycle():
+    # Y = 0.833: Webster's optimum (66 s) is above the floor, so it is used.
     split = webster.compute_node_green_splits(
-        {"EW": 720.0, "NS": 480.0}, s=1800.0, lost_time_sec=4.0
+        {"EW": 1000.0, "NS": 500.0}, s=1800.0, lost_time_sec=4.0
     )
 
     assert split["cycle_source"] == "webster_optimal"
@@ -84,13 +88,64 @@ def test_oversaturated_node_caps_cycle():
 def test_per_node_cycles_can_differ():
     flows = {key: dict(value) for key, value in control_panel.approach_configs.items()}
     flows["A_NB"]["rate"] = flows["A_SB"]["rate"] = 8
-    flows["B_NB"]["rate"] = flows["B_SB"]["rate"] = 16
+    flows["B_NB"]["rate"] = flows["B_SB"]["rate"] = 12
 
-    splits = webster.compute_all_nodes(flows, s=1800.0, lost_time_sec=4.0)
+    # S low enough that both nodes' optima clear the 40 s floor.
+    splits = webster.compute_all_nodes(flows, s=600.0, lost_time_sec=4.0)
 
     assert splits[300]["cycle_time_sec"] != splits[700]["cycle_time_sec"]
     assert splits[300]["cycle_source"] == "webster_optimal"
     assert splits[700]["cycle_source"] == "webster_optimal"
+
+
+def test_critical_lane_fraction_matches_spawn_lane_choice():
+    """try_spawn_vehicle sends straight vehicles to lanes 0/1 at random and
+    left-turners to lane 2, so the busiest lane carries
+    max(turn_split / 2, 1 - turn_split) of the approach flow. heavy_ratio
+    never touches lane choice, so it must not enter this fraction."""
+    assert webster.critical_lane_fraction(0.8) == 0.4
+    assert webster.critical_lane_fraction(0.5) == 0.5      # left lane busiest
+    assert webster.critical_lane_fraction(1.0) == 0.5
+    assert webster.critical_lane_fraction(0.0) == 1.0
+    cfg = {"rate": 12, "turn_split": 0.8, "heavy_ratio": 0.5}
+    assert webster.critical_lane_flow_veh_hr(cfg) == 720 * 0.4
+    assert webster.critical_lane_flow_veh_hr({**cfg, "heavy_ratio": 0.0}) == 720 * 0.4
+
+
+def test_webster_uses_per_lane_flows_against_per_lane_s():
+    """Default flows at the measured-S regime: y is the busiest lane / S,
+    Y is far from saturation, and the cycle sits on the 40 s floor rather
+    than the 155 s the whole-approach mismatch used to produce."""
+    flows = {key: dict(value) for key, value in control_panel.approach_configs.items()}
+    splits = webster.compute_all_nodes(flows, s=1291.0, lost_time_sec=4.0)
+    node = splits[300]
+    ew_lane = webster.critical_lane_fraction(flows["EB"]["turn_split"])
+    ns_lane = webster.critical_lane_fraction(flows["A_NB"]["turn_split"])
+    ew_flow = flows["EB"]["rate"] * 60 * ew_lane          # 720 x 0.40 = 288
+    ns_flow = flows["A_NB"]["rate"] * 60 * ns_lane        # 480 x 0.375 = 180
+
+    assert (ew_lane, ns_lane) == (0.4, 0.375)
+    assert node["EW_critical_lane_flow_veh_hr"] == ew_flow
+    assert node["NS_critical_lane_flow_veh_hr"] == ns_flow
+    assert node["y_ew"] == round(ew_flow / 1291, 3)
+    assert node["y_ns"] == round(ns_flow / 1291, 3)
+    assert node["Y"] == round((ew_flow + ns_flow) / 1291, 3)
+    assert node["Y"] < 0.4
+    assert node["cycle_source"] == "min_cycle_floor"
+    assert node["cycle_time_sec"] == 40.0
+    assert node["min_cycle_sec"] == 40.0
+    assert node["webster_optimal_cycle_sec"] < 40.0
+    # The split still follows the flow ratios inside the floored cycle.
+    assert abs(node["EW_green_sec"] / node["NS_green_sec"] - ew_flow / ns_flow) < 0.01
+    assert abs(node["EW_green_sec"] + node["NS_green_sec"] + 4.0 - 40.0) <= 0.02
+
+
+def test_min_cycle_floor_is_adjustable():
+    split = webster.compute_node_green_splits(
+        {"EW": 0.0, "NS": 0.0}, s=1800.0, lost_time_sec=4.0, min_cycle_sec=0.0
+    )
+    assert split["cycle_source"] == "webster_optimal"
+    assert split["cycle_time_sec"] == 11.0
 
 
 def test_symmetric_flows_equal_nodes():
@@ -142,7 +197,9 @@ def test_cycle_is_autoset_to_optimal(monkeypatch):
         node_x: split["cycle_time_sec"] for node_x, split in splits.items()
     }
     for split in splits.values():
-        assert split["cycle_time_sec"] == split["webster_optimal_cycle_sec"]
+        assert split["cycle_time_sec"] == max(
+            split["webster_optimal_cycle_sec"], webster.MIN_CYCLE_SEC
+        )
 
 
 def test_countdown_waits_for_calibration(monkeypatch):
@@ -374,8 +431,9 @@ def test_telemetry_records_used_cycle_per_node(tmp_path, monkeypatch):
     }
     for node_x, split in splits.items():
         exported = timing["webster_splits"][str(node_x)]
-        assert exported["cycle_time_sec"] == split["webster_optimal_cycle_sec"]
-        assert exported["cycle_source"] == "webster_optimal"
+        assert exported["cycle_time_sec"] == split["cycle_time_sec"]
+        assert exported["cycle_source"] == split["cycle_source"]
+        assert exported["cycle_source"] in ("webster_optimal", "min_cycle_floor")
 
 
 def test_baseline_and_llm_identical_timing(monkeypatch):

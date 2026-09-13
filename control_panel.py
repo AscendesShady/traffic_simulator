@@ -823,6 +823,24 @@ def write_ai_control(path=None):
 # Armed, but no model chosen: the run is an unaided baseline, so the panel
 # must not imply a decision is on its way.
 BASELINE_NO_MODEL = "BASELINE_NO_MODEL"
+# The deterministic non-LLM comparator. It is chosen through the same model
+# selector and written to the same ai_control.json field, because it produces
+# the same decision through the same path -- only the decider differs.
+RULE_BASED_MODEL = "rule-based"
+
+
+def get_decision_sources():
+    """Local decision sources: the rule comparator plus installed Ollama tags.
+
+    The rule is not a model, but it is selected like one so that a rule run
+    and a model run differ in nothing except who decides.
+    """
+    models = list(get_ollama_models())
+    if RULE_BASED_MODEL in models:
+        return models
+    insert_at = 1 if models and models[0] == "None" else 0
+    models.insert(insert_at, RULE_BASED_MODEL)
+    return models
 
 
 def set_active_ai_model(model, other_selector=None, persist=True):
@@ -1400,7 +1418,7 @@ def create_dashboard_window(parent=None):
     )
     ai_body = ai_section["body"]
 
-    available_models = get_ollama_models()
+    available_models = get_decision_sources()
     available_api_models = get_api_models()
     selected_model = str(global_config["ai_runtime"].get("model", "None"))
     if selected_model in available_api_models and selected_model != "None":

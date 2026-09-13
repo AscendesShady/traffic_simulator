@@ -12,6 +12,7 @@ import time
 from typing import TypedDict
 
 import guard
+import rule_controller
 
 try:
     import ollama
@@ -360,6 +361,19 @@ def decision_lag_seconds(latency_ms) -> float:
     if seconds is None or seconds <= 0:
         return DEFAULT_DECISION_LAG_SEC
     return round(float(seconds) / 1000.0, 1)
+
+
+def turn_decision_lag(model, carried_lag_sec) -> float:
+    """The horizon this turn should plan with.
+
+    A model's horizon is the previous turn's measured latency (carried in
+    ``carried_lag_sec``). The rule has no inference to wait for, so it plans
+    with its own near-zero lag from the first turn, and a rule turn never
+    feeds the model carry-forward.
+    """
+    if rule_controller.is_rule_model(model):
+        return rule_controller.RULE_DECISION_LAG_SEC
+    return carried_lag_sec
 
 
 def eta_at_decision_land(eta_sec, decision_lag_sec):
@@ -778,13 +792,37 @@ def _call_ollama(model: str, minimap: str) -> tuple[str, dict]:
     return content, metrics
 
 
+def _call_rule(state: AgentState) -> tuple[str, dict]:
+    """Decide with the deterministic rule instead of a model.
+
+    Serializes the rule's positional flags into the same JSON text an LLM is
+    asked to produce, so everything downstream -- the guard, the
+    locked-route overlay, decision.json, the turn log and the exports --
+    handles a rule turn identically to a model turn. There are no tokens to
+    report, and the near-zero latency this reports is itself a result: the
+    rule has no decision lag where a model does.
+    """
+    decision = rule_controller.rule_based_decision(
+        state.get("telemetry", {}),
+        decision_lag_sec=state.get("decision_lag_sec"),
+    )
+    return json.dumps(decision), {
+        "input_tokens": None,
+        "output_tokens": None,
+        "eval_duration_ns": None,
+        "total_duration_ns": None,
+    }
+
+
 def ai_turn(state: AgentState) -> dict:
     model = state.get("model", "None")
     started = time.time()
     try:
         if not model or model == "None":
             raise RuntimeError("no model selected")
-        if _is_gemini(model):
+        if rule_controller.is_rule_model(model):
+            raw_output, call_metrics = _call_rule(state)
+        elif _is_gemini(model):
             raw_output, call_metrics = _call_gemini(
                 model,
                 SYSTEM_PROMPT,
@@ -970,13 +1008,19 @@ def run_forever() -> None:
                         "recent_decisions": recent_decisions,
                         "turn": turn,
                         "model": model,
-                        "decision_lag_sec": decision_lag_sec,
+                        "decision_lag_sec": turn_decision_lag(
+                            model, decision_lag_sec
+                        ),
                     }
                 )
                 recent_decisions = result.get("recent_decisions", recent_decisions)
                 # This turn's measured latency predicts the next turn's lag.
+                # A rule turn is not a measurement of any model, so it leaves
+                # the model carry-forward untouched.
                 measured = result.get("call_metrics", {})
-                if isinstance(measured, dict):
+                if isinstance(measured, dict) and not rule_controller.is_rule_model(
+                    model
+                ):
                     decision_lag_sec = decision_lag_seconds(
                         measured.get("latency_ms")
                     )

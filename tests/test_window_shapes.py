@@ -1,0 +1,253 @@
+"""Three window shapes: compact (fitted, canvas 1:1), large (~75% screen)
+and maximized (OS zoomed), with the side panes and the scaled canvas
+following the shape."""
+import time
+import tkinter as tk
+from tkinter import ttk
+
+import pygame
+import pytest
+
+import canvas_gemini as canvas
+import control_panel
+import main
+
+
+def test_fit_canvas_size_keeps_5_3_with_integer_pixels():
+    assert main.fit_canvas_size(1000, 600) == (1000, 600)
+    for available in ((1146, 900), (2500, 700), (1500, 2000), (1780, 1068)):
+        width, height = main.fit_canvas_size(*available)
+        assert width * 3 == height * 5
+        assert width <= available[0] and height <= available[1]
+        assert width % 5 == 0
+    # Width-limited and height-limited cases land on the tight dimension.
+    assert main.fit_canvas_size(1146, 900) == (1145, 687)
+    assert main.fit_canvas_size(2500, 700) == (1165, 699)
+    # A transiently tiny pane never yields a degenerate image.
+    assert main.fit_canvas_size(0, 0) == (250, 150)
+
+
+def test_large_window_geometry_is_centered_and_never_narrower_than_the_panes():
+    min_width = (
+        main.MAX_CONTROL_PANE_WIDTH + main.MAX_TELEMETRY_PANE_WIDTH
+        + canvas.WIDTH + 2 * main.SIMULATION_PANE_GUTTER
+    )
+    width, height, x, y = main.large_window_geometry_for(1920, 1080)
+    assert width == min_width == 1764
+    assert height == 810
+    assert x == (1920 - width) // 2
+    assert y == (1080 - main.LARGE_WINDOW_SCREEN_MARGIN_Y - height) // 2
+
+    width, height, x, y = main.large_window_geometry_for(2560, 1440)
+    assert (width, height) == (1920, 1080)
+    assert (x, y) == (320, 140)
+
+
+def test_side_pane_widths_follow_the_shape():
+    assert main.side_pane_widths_for("compact", 2560) == (256, 333)
+    for shape in ("large", "maximized"):
+        assert main.side_pane_widths_for(shape, 2560) == (
+            main.MAX_CONTROL_PANE_WIDTH, main.MAX_TELEMETRY_PANE_WIDTH
+        )
+
+
+def test_classify_window_shape():
+    compact = (1613, 624)
+    assert main.classify_window_shape("zoomed", 2560, 1369, compact) == "maximized"
+    assert main.classify_window_shape("normal", 1613, 624, compact) == "compact"
+    assert main.classify_window_shape("normal", 1617, 620, compact) == "compact"
+    assert main.classify_window_shape("normal", 1920, 1080, compact) == "large"
+    assert main.classify_window_shape("normal", 1613, 700, compact) == "large"
+
+
+def test_build_main_window_exposes_the_shape_controller():
+    root, _control, _sim, _telemetry = main.build_main_window()
+    try:
+        assert isinstance(root.paned, ttk.PanedWindow)
+        controller = root.window_shape
+        assert isinstance(controller, main.WindowShapeController)
+        assert controller.shape == "compact"
+    finally:
+        root.destroy()
+
+
+def test_cycle_walks_compact_large_maximized_and_publishes_it():
+    root, _control, _sim, _telemetry = main.build_main_window()
+    saved = control_panel.global_config.get("window_shape")
+    try:
+        root.update()
+        controller = root.window_shape
+        seen = []
+        for _ in range(3):
+            controller.cycle()
+            root.update()
+            seen.append((controller.shape, control_panel.global_config["window_shape"]))
+        assert seen == [
+            ("large", "large"), ("maximized", "maximized"), ("compact", "compact")
+        ]
+        assert root.state() == "normal"
+        with pytest.raises(ValueError):
+            controller.apply("huge")
+    finally:
+        control_panel.global_config["window_shape"] = saved
+        root.destroy()
+
+
+def test_apply_pane_widths_moves_both_sashes():
+    root, control_pane, _sim, telemetry_pane = main.build_main_window()
+    try:
+        root.geometry("1800x900")
+        root.update()
+        controller = root.window_shape
+        controller._apply_pane_widths(320, 420)
+        root.update()
+        assert abs(controller.control_outer.winfo_width() - 320) <= 1
+        assert abs(controller.telemetry_outer.winfo_width() - 420) <= 1
+        controller._apply_pane_widths(256, 333)
+        root.update()
+        assert abs(controller.control_outer.winfo_width() - 256) <= 1
+        assert abs(controller.telemetry_outer.winfo_width() - 333) <= 1
+    finally:
+        root.destroy()
+
+
+def test_root_configure_handler_ignores_child_events():
+    root, _control, simulation_pane, _telemetry = main.build_main_window()
+    try:
+        controller = root.window_shape
+        root.update()
+        controller._after_id = None
+
+        class Event:
+            widget = simulation_pane
+
+        controller._on_root_configure(Event())
+        assert controller._after_id is None
+        Event.widget = root
+        controller._on_root_configure(Event())
+        assert controller._after_id is not None
+    finally:
+        root.destroy()
+
+
+def build_canvas(host):
+    pane = tk.Frame(host)
+    pane.pack()
+    simulation_canvas, push_frame = main.build_simulation_canvas(pane)
+    return simulation_canvas, push_frame
+
+
+def photo_size(simulation_canvas):
+    """(width, height) of the image the canvas item shows, queried by name
+    so the test never creates (or clobbers) an image of its own."""
+    (item,) = simulation_canvas.find_all()
+    name = simulation_canvas.itemcget(item, "image")
+    call = simulation_canvas.tk.call
+    return int(call("image", "width", name)), int(call("image", "height", name))
+
+
+def test_set_target_size_resizes_canvas_and_photo_in_place():
+    host = tk.Tk()
+    try:
+        simulation_canvas, push_frame = build_canvas(host)
+        items_before = simulation_canvas.find_all()
+        simulation_canvas.set_target_size(1150, 690)
+        host.update_idletasks()
+        assert int(simulation_canvas["width"]) == 1150
+        assert int(simulation_canvas["height"]) == 690
+        assert photo_size(simulation_canvas) == (1150, 690)
+        push_frame(pygame.Surface((canvas.WIDTH, canvas.HEIGHT)))
+        assert simulation_canvas.find_all() == items_before
+
+        simulation_canvas.set_target_size(canvas.WIDTH, canvas.HEIGHT)
+        host.update_idletasks()
+        assert int(simulation_canvas["width"]) == canvas.WIDTH
+        assert photo_size(simulation_canvas) == (canvas.WIDTH, canvas.HEIGHT)
+        assert simulation_canvas.find_all() == items_before
+    finally:
+        host.destroy()
+
+
+def test_push_frame_scales_only_when_the_target_differs(monkeypatch):
+    host = tk.Tk()
+    calls = []
+    real = pygame.transform.smoothscale
+
+    def counting(surface, size, dest=None):
+        calls.append(size)
+        return real(surface, size, dest)
+
+    monkeypatch.setattr(main.pygame.transform, "smoothscale", counting)
+    try:
+        simulation_canvas, push_frame = build_canvas(host)
+        surface = pygame.Surface((canvas.WIDTH, canvas.HEIGHT))
+        push_frame(surface)
+        assert calls == []
+        simulation_canvas.set_target_size(1150, 690)
+        push_frame(surface)
+        push_frame(surface)
+        assert calls == [(1150, 690), (1150, 690)]
+    finally:
+        host.destroy()
+
+
+def test_push_frame_halves_its_rate_above_the_pixel_threshold(monkeypatch):
+    host = tk.Tk()
+    pushes = []
+    real = pygame.image.tostring
+    monkeypatch.setattr(
+        main.pygame.image, "tostring",
+        lambda surface, fmt: pushes.append(surface.get_size()) or real(surface, fmt),
+    )
+    try:
+        simulation_canvas, push_frame = build_canvas(host)
+        surface = pygame.Surface((canvas.WIDTH, canvas.HEIGHT))
+        big = main.fit_canvas_size(3000, 1800)     # 5x native pixels
+        simulation_canvas.set_target_size(*big)
+        for _ in range(4):
+            push_frame(surface)
+        assert len(pushes) == 2
+    finally:
+        host.destroy()
+
+
+def test_shape_button_cycles_through_the_installed_hook(monkeypatch):
+    host = tk.Tk()
+    calls = []
+    monkeypatch.setitem(control_panel.window_shape_hooks, "cycle", lambda: calls.append(1))
+    saved = control_panel.global_config.get("window_shape")
+    try:
+        pane = tk.Frame(host)
+        control_panel.create_dashboard_window(pane)
+
+        def find(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Button) and "Large" in child.cget("text"):
+                    return child
+                found = find(child)
+                if found is not None:
+                    return found
+
+        button = find(pane)
+        assert button is not None
+        button.invoke()
+        assert calls == [1]
+
+        # The label follows the published shape, so an OS maximize/restore
+        # relabels it too.
+        control_panel.global_config["window_shape"] = "maximized"
+        # Pump the event loop with update() rather than mainloop(): a
+        # SystemExit that an earlier test's Tk callback raised is stored by
+        # _tkinter and re-raised from the next mainloop() in the process.
+        for _ in range(8):
+            time.sleep(0.05)
+            host.update()
+        assert "Compact" in button.cget("text")
+    finally:
+        control_panel.global_config["window_shape"] = saved
+        host.destroy()
+
+
+def test_request_cycle_without_a_hook_is_a_noop(monkeypatch):
+    monkeypatch.setitem(control_panel.window_shape_hooks, "cycle", None)
+    control_panel.request_window_shape_cycle()

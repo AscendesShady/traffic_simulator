@@ -41,6 +41,9 @@ SPACE_XS, SPACE_SM, SPACE_MD = 4, 8, 12
 LLM_PORTRAIT_COLUMNS = 2
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+assert (BASE_DIR / "requirements.txt").exists(), (
+    f"BASE_DIR does not resolve to the repo root: {BASE_DIR}"
+)
 TELEMETRY_FILE = BASE_DIR / "data" / "traffic_state_telemetry.json"
 AGENT_TURN_LOG_FILE = BASE_DIR / "logs" / "agent_turn_log.jsonl"
 TELEMETRY_LOG_FILE = BASE_DIR / "logs" / "telemetry_log.jsonl"

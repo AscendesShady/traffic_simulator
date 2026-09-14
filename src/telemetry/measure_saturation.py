@@ -29,6 +29,9 @@ import statistics
 import sys
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+assert (BASE_DIR / "requirements.txt").exists(), (
+    f"BASE_DIR does not resolve to the repo root: {BASE_DIR}"
+)
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 

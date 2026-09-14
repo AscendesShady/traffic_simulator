@@ -9,6 +9,9 @@ from src.ui import control_panel
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+assert (BASE_DIR / "requirements.txt").exists(), (
+    f"BASE_DIR does not resolve to the repo root: {BASE_DIR}"
+)
 REJECT_LOG_PATH = BASE_DIR / "logs" / "agent_rejects.log"
 ROUTE_ORDER = sorted(control_panel.bus_routes_config.keys())
 VALID_ROUTES = set(ROUTE_ORDER)

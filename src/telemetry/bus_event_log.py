@@ -16,6 +16,9 @@ from src.core.vehicle import Bus
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+assert (BASE_DIR / "requirements.txt").exists(), (
+    f"BASE_DIR does not resolve to the repo root: {BASE_DIR}"
+)
 DEFAULT_BUS_EVENTS_PATH = BASE_DIR / "logs" / "bus_events.jsonl"
 # Same threshold the telemetry queue counter uses to call a vehicle "stopped".
 STOP_SPEED_THRESHOLD = 0.25

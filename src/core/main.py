@@ -112,6 +112,9 @@ def accumulate_frame_metrics(vehicles):
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+assert (BASE_DIR / "requirements.txt").exists(), (
+    f"BASE_DIR does not resolve to the repo root: {BASE_DIR}"
+)
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
 RESULTS_DIR = BASE_DIR / "results"

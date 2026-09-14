@@ -12,6 +12,9 @@ from src.core.vehicle import Bus, DBL_LANE_INDEX, dbl_lane_is_obstructed
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+assert (BASE_DIR / "requirements.txt").exists(), (
+    f"BASE_DIR does not resolve to the repo root: {BASE_DIR}"
+)
 DEFAULT_TELEMETRY_PATH = BASE_DIR / "data" / "traffic_state_telemetry.json"
 
 

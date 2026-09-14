@@ -56,6 +56,9 @@ CHIP_PAD_Y = 4               # toggle chips: ~26px tall
 LABEL_COLUMN_CHARS = 11
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+assert (BASE_DIR / "requirements.txt").exists(), (
+    f"BASE_DIR does not resolve to the repo root: {BASE_DIR}"
+)
 AI_CONTROL_PATH = BASE_DIR / "data" / "ai_control.json"
 
 API_MODEL_REGISTRY = {

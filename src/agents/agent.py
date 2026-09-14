@@ -39,6 +39,9 @@ except ImportError:  # Reported as an all-off dependency failure at runtime.
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
+assert (BASE_DIR / "requirements.txt").exists(), (
+    f"BASE_DIR does not resolve to the repo root: {BASE_DIR}"
+)
 TELEMETRY_PATH = BASE_DIR / "data" / "traffic_state_telemetry.json"
 AI_CONTROL_PATH = BASE_DIR / "data" / "ai_control.json"
 DECISION_PATH = BASE_DIR / "data" / "decision.json"

@@ -27,6 +27,11 @@ except ImportError:  # Gemini remains unavailable without the optional SDK.
     _genai_types = None
 
 try:
+    import openai as _openai
+except ImportError:  # OpenAI remains unavailable without the optional SDK.
+    _openai = None
+
+try:
     from langgraph.graph import END, StateGraph
 except ImportError:  # Reported as an all-off dependency failure at runtime.
     END = None
@@ -57,9 +62,12 @@ DEFAULT_DECISION_LAG_SEC = 8.0
 # the right call; it will be reconsidered on a later turn.
 ACTIONABLE_HORIZON_SEC = 45.0
 GEMINI_TIMEOUT_SECONDS = 30.0
+OPENAI_TIMEOUT_SECONDS = 30.0
 OLLAMA_TIMEOUT_SECONDS = 45.0
 _GEMINI_CLIENT = None
 _GEMINI_CALL_LOCK = threading.Lock()
+_OPENAI_CLIENT = None
+_OPENAI_CALL_LOCK = threading.Lock()
 _OLLAMA_CLIENT = None
 _OLLAMA_CALL_LOCK = threading.Lock()
 
@@ -698,6 +706,86 @@ def _call_gemini(
     return text, metrics
 
 
+def _is_openai(model: str) -> bool:
+    return isinstance(model, str) and model.startswith("gpt-")
+
+
+def _get_openai_client():
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        if _openai is None:
+            raise RuntimeError("openai package not installed")
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY not set")
+        _OPENAI_CLIENT = _openai.OpenAI(api_key=api_key)
+    return _OPENAI_CLIENT
+
+
+def _call_openai(
+    model: str, system_prompt: str, minimap: str
+) -> tuple[str, dict]:
+    """Call OpenAI with low temperature and a hard, non-overlapping timeout."""
+    client = _get_openai_client()
+    call_lock = _OPENAI_CALL_LOCK
+    if not call_lock.acquire(blocking=False):
+        raise RuntimeError("previous OpenAI request is still running")
+
+    result_queue = queue.Queue(maxsize=1)
+
+    def request():
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": minimap},
+                ],
+                temperature=0.2,
+            )
+            outcome = (True, response)
+        except Exception as exc:
+            outcome = (False, exc)
+        finally:
+            call_lock.release()
+        result_queue.put(outcome)
+
+    request_thread = threading.Thread(
+        target=request,
+        name="openai-agent-request",
+        daemon=True,
+    )
+    try:
+        request_thread.start()
+    except Exception:
+        call_lock.release()
+        raise
+
+    try:
+        succeeded, value = result_queue.get(timeout=OPENAI_TIMEOUT_SECONDS)
+    except queue.Empty as exc:
+        # A thread deadline cannot kill the underlying HTTP request; the
+        # daemon and call lock let the agent continue without overlapping it.
+        raise TimeoutError(
+            f"OpenAI request exceeded {OPENAI_TIMEOUT_SECONDS:g}s timeout"
+        ) from exc
+    if not succeeded:
+        raise value
+    response = value
+    choices = getattr(response, "choices", None) or []
+    text = choices[0].message.content if choices else None
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("empty OpenAI response")
+    usage = getattr(response, "usage", None)
+    metrics = {
+        "input_tokens": getattr(usage, "prompt_tokens", None),
+        "output_tokens": getattr(usage, "completion_tokens", None),
+        "eval_duration_ns": None,
+        "total_duration_ns": None,
+    }
+    return text, metrics
+
+
 def _ollama_format_is_unsupported(exc: Exception) -> bool:
     message = str(exc).lower()
     return "format" in message and any(
@@ -824,6 +912,12 @@ def ai_turn(state: AgentState) -> dict:
             raw_output, call_metrics = _call_rule(state)
         elif _is_gemini(model):
             raw_output, call_metrics = _call_gemini(
+                model,
+                SYSTEM_PROMPT,
+                state.get("minimap", ""),
+            )
+        elif _is_openai(model):
+            raw_output, call_metrics = _call_openai(
                 model,
                 SYSTEM_PROMPT,
                 state.get("minimap", ""),

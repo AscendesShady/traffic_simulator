@@ -1,10 +1,12 @@
 """Read-only live telemetry dashboard with session-only trend history."""
 
 from collections import deque
+from datetime import datetime
 import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -58,6 +60,58 @@ WINDOW_SCREEN_MARGIN_X = 80
 WINDOW_SCREEN_MARGIN_Y = 140
 WINDOW_GEOMETRY_ENV = "TRAFFIC_TELEMETRY_GEOMETRY"
 
+
+def _filename_tag(value, fallback):
+    """Return one filesystem-safe filename field without separator ambiguity."""
+    text = str(value).strip() if value is not None else ""
+    text = re.sub(r"[^A-Za-z0-9.-]+", "-", text).strip("-.")
+    return text or fallback
+
+
+def _runtime_tag(runtime_sim_seconds):
+    """Format simulated runtime compactly while preserving partial minutes."""
+    try:
+        seconds = max(0.0, float(runtime_sim_seconds or 0.0))
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds >= 60.0:
+        minutes = seconds / 60.0
+        text = f"{minutes:.2f}".rstrip("0").rstrip(".")
+        return f"{text}min"
+    text = f"{seconds:.1f}".rstrip("0").rstrip(".")
+    return f"{text or '0'}sec"
+
+
+def build_excel_export_filename(
+    model, runtime_sim_seconds, seed, timestamp=None
+):
+    """Build ``model_runtime_seed_DDMMYYYY_HHMMSS.xlsx`` filenames."""
+    model_tag = _filename_tag(
+        "baseline" if str(model or "None") == "None" else model,
+        "baseline",
+    )
+    seed_tag = (
+        f"{_filename_tag(seed, 'no')}seed" if seed is not None else "noseed"
+    )
+    if timestamp is None:
+        stamp = time.strftime("%d%m%Y_%H%M%S")
+    elif isinstance(timestamp, datetime):
+        stamp = timestamp.strftime("%d%m%Y_%H%M%S")
+    else:
+        stamp = str(timestamp).strip()
+        for source_format in ("%Y%m%d_%H%M%S", "%d%m%Y_%H%M%S"):
+            try:
+                stamp = datetime.strptime(stamp, source_format).strftime(
+                    "%d%m%Y_%H%M%S"
+                )
+                break
+            except ValueError:
+                continue
+        stamp = re.sub(r"[^0-9_]+", "", stamp).strip("_")
+        if not stamp:
+            stamp = time.strftime("%d%m%Y_%H%M%S")
+    return f"{model_tag}_{_runtime_tag(runtime_sim_seconds)}_{seed_tag}_{stamp}.xlsx"
+
 DECISION_EXPORT_HEADERS = [
     "turn",
     "timestamp",
@@ -89,19 +143,23 @@ TELEMETRY_EXPORT_HEADERS = [
     "queues_passengers_est",
 ]
 
-# Summary KPI cards, in display order, laid out two per row (portrait).
+# Summary KPI cards, in display order, laid out as a 3 x 3 grid: three rows
+# is what lets the whole Summary tab fit a main window no taller than the
+# simulation canvas, and nine cards make the grid square.
+# Titles are short enough for a ~95px tile in a 332px column; KPI_TOOLTIPS
+# below carries each one's full definition on hover.
 SUMMARY_KPIS = (
-    ("Active Vehicles", "vehicles"),
-    ("Active Buses", "buses"),
-    ("Passenger Vol", "passengers"),
-    ("Road/Demand Queue", "queued"),
-    ("Avg Queue (20s)", "delay"),
+    ("Vehicles", "vehicles"),
+    ("Buses", "buses"),
+    ("Passengers", "passengers"),
+    ("Road queue", "queued"),
+    ("Avg queue", "delay"),
     ("Congestion", "congestion"),
-    ("TSP Active/Pending", "tsp"),
-    ("DBL Active/Pending", "dbl"),
-    ("Sim Timer", "timer"),
+    ("TSP act/pend", "tsp"),
+    ("DBL act/pend", "dbl"),
+    ("Sim timer", "timer"),
 )
-SUMMARY_KPI_COLUMNS = 2
+SUMMARY_KPI_COLUMNS = 3
 
 # Hover text for each KPI card. Keyed by the underlying metric rather than
 # display order so every card has one clear, testable definition.
@@ -391,7 +449,19 @@ class TelemetryDashboard:
         self.latest_telemetry = None
         self.last_read_error = None
         self.build_ui()
+        # Mounted in a scrollable pane, `root` is the content frame inside
+        # the pane's scroll canvas. That frame grows with its own content, so
+        # its height says nothing about what is on screen; the canvas is the
+        # viewport, and the layout must fit *that* so a short main window
+        # gets the compact profile instead of a scrollbar.
+        self.viewport = (
+            self.root.master
+            if self.embedded and isinstance(self.root.master, tk.Canvas)
+            else self.root
+        )
         self.root.bind("<Configure>", self.schedule_responsive_layout, add="+")
+        if self.viewport is not self.root:
+            self.viewport.bind("<Configure>", self.schedule_responsive_layout, add="+")
         self.root.after_idle(self.apply_responsive_layout)
         start_gpu_poll_thread()
         self.poll_telemetry()
@@ -724,6 +794,10 @@ class TelemetryDashboard:
             self.bind_tab_mousewheel(self.llm_content, self.llm_scroll_canvas)
         if self.units_scroll_canvas is not None:
             self.bind_tab_mousewheel(self.units_content, self.units_scroll_canvas)
+        # Every tab was added before its content existed, so the height each
+        # add_tab() pinned is stale; now that all four are fully built, pin
+        # the notebook to whichever tab is actually selected (Summary).
+        self.sync_notebook_height()
 
     TAB_SHADOW_STEPS = ("#12151D", "#151821", "#171B25", "#191D28")
 
@@ -776,6 +850,10 @@ class TelemetryDashboard:
         underline.pack(fill="x")
         control_panel.add_hover_state(button)
         self.tab_buttons.append({"page": page, "button": button, "underline": underline})
+        # A page's own content changing height (a longer Units section, the
+        # recovery panel expanding, a font change from responsive layout)
+        # must re-pin the notebook the same way switching tabs does.
+        page.bind("<Configure>", self.sync_notebook_height, add="+")
         self.refresh_tab_strip()
 
     def refresh_tab_strip(self, _event=None):
@@ -791,6 +869,33 @@ class TelemetryDashboard:
                 fg=COLOR_TEXT_PRIMARY if active else COLOR_TEXT_SECONDARY,
             )
             entry["underline"].config(bg=COLOR_ACCENT if active else COLOR_BG)
+        self.sync_notebook_height()
+
+    def sync_notebook_height(self, _event=None):
+        """Pin the notebook to the SELECTED tab's own height.
+
+        ttk.Notebook otherwise reserves height for the tallest page it has
+        ever shown, so switching from a long tab (Units, Trends) to a short
+        one (Summary, LLM) left a stretch of dead space below the short
+        tab's real content -- exactly the "excessive scrolling" a mounted,
+        already-scrollable side pane must not add on top of. Only relevant
+        when embedded: standalone, every height-heavy tab already scrolls
+        within its own fixed-size window instead of resizing the notebook.
+        """
+        if not self.embedded:
+            return
+        try:
+            selected = self.notebook.select()
+        except tk.TclError:
+            return
+        if not selected:
+            return
+        try:
+            page = self.notebook.nametowidget(selected)
+        except (KeyError, tk.TclError):
+            return
+        page.update_idletasks()
+        self.notebook.configure(height=page.winfo_reqheight())
 
     def create_responsive_tab(self):
         """Return a tab whose content reflows with the available window size."""
@@ -913,18 +1018,21 @@ class TelemetryDashboard:
             "metric_title_font": max(7, round(FONT_BODY_SIZE * scale)),
             "metric_value_font": max(11, min(FONT_DISPLAY_SIZE, round(FONT_DISPLAY_SIZE * scale))),
             "detail_font": max(7, round(FONT_BODY_SIZE * scale)),
-            "metric_row_height": max(26, min(40, round(height * 0.07))),
-            "phase_height": max(35, min(85, round(height * 0.11))),
+            # Height shares, sized so the Summary tab (header, tab strip, 3
+            # KPI rows, status line, phase cycle, node diagrams) fits a
+            # viewport as short as the simulation canvas without scrolling.
+            "metric_row_height": max(26, min(40, round(height * 0.06))),
+            "phase_height": max(35, min(85, round(height * 0.09))),
             # Wide enough to read as a crossing in a portrait column, but
-            # never taller than a short standalone window can spare.
-            "node_height": max(45, min(round(width * 0.36), round(height * 0.22))),
+            # never taller than a short viewport can spare.
+            "node_height": max(45, min(round(width * 0.36), round(height * 0.18))),
             "chart_height": max(72, min(150, round((height - 120) / 3))),
-            "wraplength": max(310, width - 92),
+            "wraplength": max(220, width - 92),
         }
 
     def schedule_responsive_layout(self, event=None):
         """Debounce resize work so dragging a window edge remains fluid."""
-        if event is not None and event.widget is not self.root:
+        if event is not None and event.widget not in (self.root, self.viewport):
             return
         if self._resize_after_id is not None:
             self.root.after_cancel(self._resize_after_id)
@@ -934,7 +1042,7 @@ class TelemetryDashboard:
         """Scale dashboard content to the window instead of exposing scrollbars."""
         self._resize_after_id = None
         width = self.root.winfo_width() if width is None else width
-        height = self.root.winfo_height() if height is None else height
+        height = self.viewport.winfo_height() if height is None else height
         profile = self.responsive_profile(width, height)
         compact = profile["compact"]
 
@@ -1003,6 +1111,9 @@ class TelemetryDashboard:
         self.discharge_reason_lbl.config(
             font=detail_font,
             wraplength=profile["wraplength"],
+        )
+        self.discharge_compact_lbl.config(
+            wraplength=profile["wraplength"], justify="left",
         )
         self.discharge_recommendation_lbl.config(
             font=detail_font,
@@ -1138,6 +1249,9 @@ class TelemetryDashboard:
         self.draw_phase_cycle(self.latest_telemetry)
         self.draw_node_intersections()
         self.draw_trend_charts()
+        # Font/height changes above can change the selected tab's own
+        # height even though nothing else re-pinned the notebook yet.
+        self.sync_notebook_height()
 
     DISCHARGE_QUIET_STATES = frozenset({"IDLE", "INACTIVE", "", "COMPLETED"})
 
@@ -2336,6 +2450,37 @@ class TelemetryDashboard:
                 ]
             )
 
+    def _session_runtime_seconds(self):
+        """Return the simulated horizon represented by the current export."""
+        history = getattr(self, "history", {})
+        try:
+            times = list(history.get("time", ()))
+        except AttributeError:
+            times = []
+        if times:
+            return max(float(value) for value in times)
+        telemetry = getattr(self, "latest_telemetry", None)
+        if isinstance(telemetry, dict):
+            runtime = telemetry.get("simulation_time_seconds")
+            if runtime is not None:
+                return runtime
+        config = control_panel.global_config
+        return config.get("sim_time_seconds") or config.get(
+            "test_duration_sim_seconds", 0
+        )
+
+    def _default_excel_destination(self):
+        """Use the same self-describing name for every dashboard workbook."""
+        config = control_panel.global_config
+        ai_runtime = config.get("ai_runtime", {})
+        if not isinstance(ai_runtime, dict):
+            ai_runtime = {}
+        return DASHBOARD_EXPORT_DIR / build_excel_export_filename(
+            ai_runtime.get("model", "None"),
+            self._session_runtime_seconds(),
+            config.get("random_seed"),
+        )
+
     def export_all(self, destination=None):
         """Export session logs and dashboard LLM samples into one workbook."""
         decisions = read_jsonl(AGENT_TURN_LOG_FILE)
@@ -2357,9 +2502,7 @@ class TelemetryDashboard:
 
             if destination is None:
                 DASHBOARD_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-                destination = DASHBOARD_EXPORT_DIR / (
-                    f"combined_export_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
-                )
+                destination = self._default_excel_destination()
             else:
                 destination = Path(destination)
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2463,9 +2606,7 @@ class TelemetryDashboard:
 
             if destination is None:
                 DASHBOARD_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-                destination = DASHBOARD_EXPORT_DIR / (
-                    f"llm_perf_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
-                )
+                destination = self._default_excel_destination()
             else:
                 destination = Path(destination)
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2503,7 +2644,10 @@ class TelemetryDashboard:
             for cell in sheet[1]:
                 cell.font = Font(bold=True)
             sheet.freeze_panes = "A2"
-            sheet.auto_filter.ref = sheet.dimensions
+            # A native table already owns its filter. Writing a second,
+            # worksheet-level AutoFilter over the same range creates an
+            # overlapping-filter package that desktop Excel refuses to open.
+            sheet.auto_filter.ref = None if sheet.tables else sheet.dimensions
             for column_cells in sheet.columns:
                 width = max(
                     len(str(cell.value)) if cell.value is not None else 0
@@ -2516,8 +2660,14 @@ class TelemetryDashboard:
     @staticmethod
     def _add_session_trend_charts(workbook, trends_sheet, sample_count):
         """Add editable Excel charts backed by the exported trend table."""
-        from openpyxl.chart import LineChart, Reference
-        from openpyxl.chart.series import SeriesLabel
+        from openpyxl.chart import Reference, ScatterChart, Series
+        from openpyxl.chart.text import RichText
+        from openpyxl.drawing.text import (
+            CharacterProperties,
+            Font as DrawingFont,
+            Paragraph,
+            ParagraphProperties,
+        )
 
         charts_sheet = workbook.create_sheet("Session Charts")
         charts_sheet.sheet_view.showGridLines = False
@@ -2530,8 +2680,7 @@ class TelemetryDashboard:
         )
         chart_specs = (
             {
-                "title": "Network Occupancy Over Time",
-                "y_title": "Vehicles in network",
+                "title": "Network Occupancy Over Time (vehicles)",
                 "columns": (2, 3),
                 "series": (
                     ("Vehicles", "2D8CFF"),
@@ -2541,50 +2690,84 @@ class TelemetryDashboard:
                 "number_format": "0",
             },
             {
-                "title": "Queue Pressure Over Time",
-                "y_title": "Vehicles and pending arrivals",
+                "title": "Queue Pressure Over Time (vehicles and arrivals)",
                 "columns": (4, 5),
                 "series": (
                     ("Road queue", "EF4444"),
                     ("Pending demand", "F59E0B"),
                 ),
-                "anchor": "A16",
+                "anchor": "A23",
                 "number_format": "0",
             },
             {
-                "title": "Network Congestion Over Time",
-                "y_title": "Congestion (%)",
+                "title": "Network Congestion Over Time (%)",
                 "columns": (6, 6),
                 "series": (("Congestion", "2ECC71"),),
-                "anchor": "A31",
+                "anchor": "A45",
                 "number_format": "0.0",
             },
         )
 
-        for spec in chart_specs:
-            chart = LineChart()
-            chart.title = spec["title"]
-            chart.x_axis.title = "Simulation time (seconds)"
-            chart.y_axis.title = spec["y_title"]
-            chart.y_axis.numFmt = spec["number_format"]
-            chart.legend.position = "t"
-            chart.height = 7.2
-            chart.width = 14.5
-            chart.style = 13
-
-            data = Reference(
-                trends_sheet,
-                min_col=spec["columns"][0],
-                max_col=spec["columns"][1],
-                min_row=1,
-                max_row=sample_count + 1,
+        def axis_text_properties():
+            text = CharacterProperties(
+                latin=DrawingFont(typeface="Arial"),
+                sz=900,
+                solidFill="000000",
             )
-            chart.add_data(data, titles_from_data=True)
-            chart.set_categories(categories)
-            for series, (label, color) in zip(chart.series, spec["series"]):
-                series.tx = SeriesLabel(v=label)
+            return RichText(
+                p=[
+                    Paragraph(
+                        pPr=ParagraphProperties(defRPr=text),
+                        endParaRPr=CharacterProperties(
+                            latin=DrawingFont(typeface="Arial"),
+                            sz=900,
+                            solidFill="000000",
+                        ),
+                    )
+                ]
+            )
+
+        for spec in chart_specs:
+            chart = ScatterChart()
+            chart.scatterStyle = "line"
+            chart.title = spec["title"]
+            chart.title.overlay = False
+            chart.x_axis.numFmt = "0"
+            chart.x_axis.delete = False
+            chart.x_axis.tickLblPos = "low"
+            chart.x_axis.txPr = axis_text_properties()
+            chart.y_axis.numFmt = spec["number_format"]
+            chart.y_axis.delete = False
+            chart.y_axis.tickLblPos = "low"
+            chart.y_axis.txPr = axis_text_properties()
+            chart.y_axis.scaling.min = 0
+            chart.height = 8.0
+            chart.width = 16.0
+            # Excel style 2 keeps axis labels dark and readable on the white
+            # chart background. Style 13 renders tick labels white in some
+            # desktop Excel themes, making the time/value scale disappear.
+            chart.style = 2
+            for column, (label, color) in zip(
+                range(spec["columns"][0], spec["columns"][1] + 1),
+                spec["series"],
+            ):
+                values = Reference(
+                    trends_sheet,
+                    min_col=column,
+                    min_row=2,
+                    max_row=sample_count + 1,
+                )
+                series = Series(values, categories, title=label)
+                series.marker.symbol = "none"
                 series.graphicalProperties.line.solidFill = color
                 series.graphicalProperties.line.width = 24000
+                chart.series.append(series)
+
+            if len(chart.series) > 1:
+                chart.legend.position = "b"
+                chart.legend.overlay = False
+            else:
+                chart.legend = None
 
             charts_sheet.add_chart(chart, spec["anchor"])
 
@@ -2611,9 +2794,7 @@ class TelemetryDashboard:
 
             if destination is None:
                 DASHBOARD_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-                destination = DASHBOARD_EXPORT_DIR / (
-                    f"telemetry_summary_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
-                )
+                destination = self._default_excel_destination()
             else:
                 destination = Path(destination)
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2806,9 +2987,7 @@ class TelemetryDashboard:
 
             if destination is None:
                 DASHBOARD_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-                destination = DASHBOARD_EXPORT_DIR / (
-                    f"session_trends_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
-                )
+                destination = self._default_excel_destination()
             else:
                 destination = Path(destination)
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2842,6 +3021,24 @@ class TelemetryDashboard:
             for row in rows:
                 trends_sheet.append(row)
 
+            # A native Excel table keeps the exported observations reusable
+            # for filtering, formulas, and manual extension. The charts below
+            # remain ordinary editable Excel chart objects backed by cells.
+            from openpyxl.worksheet.table import Table, TableStyleInfo
+
+            trend_table = Table(
+                displayName="SessionTrendData",
+                ref=f"A1:F{len(rows) + 1}",
+            )
+            trend_table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium2",
+                showFirstColumn=False,
+                showLastColumn=False,
+                showRowStripes=True,
+                showColumnStripes=False,
+            )
+            trends_sheet.add_table(trend_table)
+
             charts_sheet = self._add_session_trend_charts(
                 workbook,
                 trends_sheet,
@@ -2850,29 +3047,39 @@ class TelemetryDashboard:
 
             summary_sheet = workbook.create_sheet(f"{prefix}Summary")
             summary_sheet.append(["metric", "value"])
-            times = list(self.history["time"])
+            last_row = len(rows) + 1
+            source_name = trends_sheet.title.replace("'", "''")
             summary_rows = [
-                ("samples", len(rows)),
-                ("start_time_seconds", times[0]),
-                ("end_time_seconds", times[-1]),
-                ("duration_seconds", times[-1] - times[0]),
+                ("samples", f"=COUNT('{source_name}'!A2:A{last_row})"),
+                ("start_time_seconds", f"=MIN('{source_name}'!A2:A{last_row})"),
+                ("end_time_seconds", f"=MAX('{source_name}'!A2:A{last_row})"),
+                ("duration_seconds", "=B4-B3"),
             ]
-            for key, label in (
-                ("vehicles", "vehicles"),
-                ("buses", "buses"),
-                ("road_queue", "road_queue"),
-                ("pending_demand", "pending_demand"),
-                ("congestion", "congestion_pct"),
+            for column, label in (
+                ("B", "vehicles"),
+                ("C", "buses"),
+                ("D", "road_queue"),
+                ("E", "pending_demand"),
+                ("F", "congestion_pct"),
             ):
-                values = list(self.history[key])
                 summary_rows.extend(
                     [
-                        (f"average_{label}", self._average(values)),
-                        (f"peak_{label}", max(values) if values else None),
+                        (
+                            f"average_{label}",
+                            f"=AVERAGE('{source_name}'!{column}2:{column}{last_row})",
+                        ),
+                        (
+                            f"peak_{label}",
+                            f"=MAX('{source_name}'!{column}2:{column}{last_row})",
+                        ),
                     ]
                 )
             for row in summary_rows:
                 summary_sheet.append(row)
+
+            workbook.calculation.fullCalcOnLoad = True
+            workbook.calculation.forceFullCalc = True
+            workbook.calculation.calcMode = "auto"
 
             self._style_excel_sheets((trends_sheet, summary_sheet))
             if shared:

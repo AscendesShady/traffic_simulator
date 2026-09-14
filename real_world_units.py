@@ -160,6 +160,30 @@ def _green_ratios(webster_splits):
     return ratios
 
 
+def network_vc_ratio(global_config, approach_configs, approach_key="EB"):
+    """DERIVED: v/c on one approach's critical lane, exposed numerically.
+
+    This is the same figure the Units tab's Flow section reports in its note
+    text (e.g. "v/c = 0.40"), computed directly here for callers -- such as
+    the experiment summary CSV -- that need the number itself rather than a
+    string to parse. None before Webster has published splits or S has been
+    measured.
+    """
+    sim_s = global_config.get("measured_saturation_flow")
+    k = saturation_scale(sim_s)
+    if k is None:
+        return None
+    green_ratio = _green_ratios(global_config.get("webster_splits")).get(approach_key)
+    capacity = approach_capacity_veh_hr(green_ratio)
+    if capacity is None:
+        return None
+    cfg = approach_configs.get(approach_key) or {}
+    rate = float(cfg.get("rate") or 0.0) if cfg.get("active", False) else 0.0
+    lane_fraction = webster.critical_lane_fraction(cfg.get("turn_split", 0.8))
+    critical_real_flow = demand_to_real_veh_hr(rate * lane_fraction, k)
+    return volume_to_capacity(critical_real_flow, capacity)
+
+
 def _fmt(value, unit="", decimals=1):
     if value is None:
         return "--"

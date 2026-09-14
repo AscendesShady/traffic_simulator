@@ -18,6 +18,16 @@ SLOW_VEHICLE_SPEED = 0.5
 ROUTE_MERGE_AREA_PX = 80.0
 ROUTE_MERGE_SAFE_GAP_PX = 15.0
 ROUTE_MERGE_YIELD_DISTANCE_PX = 100.0
+# A car ahead of a DBL-eligible bus in the bus lane vacates that lane once the
+# bus is within this bumper gap, so an active DBL actually opens the lane in
+# front of the bus rather than only holding traffic behind it.
+DBL_CLEAR_AHEAD_PX = 200.0
+# Lateral step per frame for any cooperative lane change; matches the bus's
+# own merge step so no vehicle ever jumps between lanes.
+LANE_CHANGE_STEP_PX = 0.5
+# A car opening a gap for a bus merging into the DBL lane caps its speed at
+# this fraction of its own maximum until the bus's corridor is clear.
+DBL_MERGE_YIELD_SPEED_RATIO = 0.5
 
 
 def corridor_blockers(mover, desired_y, all_vehicles):
@@ -114,6 +124,20 @@ def should_yield_for_route_merge(vehicle, all_vehicles, int_x_list, h_y, road_w)
     return False
 
 
+def dbl_merge_bus_blocked_by(vehicle, all_vehicles):
+    """Return the bus whose DBL-lane merge `vehicle` is the chosen blocker of.
+
+    A bus names exactly one blocker per frame (the nearest car in its merge
+    corridor), so at most one car is ever asked to make room for it.
+    """
+    for bus in all_vehicles or []:
+        if bus is vehicle or not isinstance(bus, Bus):
+            continue
+        if getattr(bus, "dbl_merge_blocker", None) is vehicle:
+            return bus
+    return None
+
+
 class Vehicle:
     def __init__(self, x, y, direction, max_speed=1.0, color=(50, 150, 250), is_heavy=False, target_turn="STRAIGHT", lane_index=2, assigned_node_x=None):
         self.x = float(x)
@@ -136,10 +160,58 @@ class Vehicle:
         self.merge_hold_distance = 35.0
         self.route_merge_hold_active = False
         self.route_exit_merge_blocked = False
+        # Cooperative lane change in progress (target lane index), used by a
+        # car clearing the DBL lane ahead of a bus or making room for a bus
+        # merging into it. None when no lane change is under way.
+        self.lane_vacate_target = None
+        self.dbl_merge_yield_slow = False
         # NB/SB traffic belongs to one physical vertical road. Pinning that
         # node prevents it from falsely "completing" the remote intersection,
         # which shares the same horizontal y-coordinate.
         self.assigned_node_x = assigned_node_x
+
+    def lane_center_y(self, lane_index, h_y, lane_w=22):
+        offset = (lane_index + 0.5) * lane_w
+        return h_y - offset if self.direction == "EB" else h_y + offset
+
+    def is_target_lane_clear(self, desired_y, all_vehicles):
+        return not corridor_blockers(self, desired_y, all_vehicles)
+
+    def choose_vacate_lane(self, candidate_lanes, h_y, lane_w, all_vehicles):
+        """First lane in `candidate_lanes` whose whole corridor is clear."""
+        for lane_index in candidate_lanes:
+            if lane_index == self.lane_index:
+                continue
+            desired_y = self.lane_center_y(lane_index, h_y, lane_w)
+            if self.is_target_lane_clear(desired_y, all_vehicles):
+                return lane_index
+        return None
+
+    def step_lane_vacate(self, int_x_list, h_y, road_w, lane_w, all_vehicles):
+        """Advance an in-progress cooperative lane change by one small step.
+
+        The move pauses (never reverses, never jumps) while the corridor is
+        occupied or the vehicle is inside an intersection box, and resumes
+        once it is clear again, so a started change always completes.
+        """
+        if self.lane_vacate_target is None:
+            return
+        if self.direction not in ("EB", "WB"):
+            self.lane_vacate_target = None
+            return
+        if vehicle_is_inside_any_intersection(self, int_x_list, h_y, road_w):
+            return
+        desired_y = self.lane_center_y(self.lane_vacate_target, h_y, lane_w)
+        if not self.is_target_lane_clear(desired_y, all_vehicles):
+            return
+        if abs(self.y - desired_y) > 1.0:
+            self.y += (
+                LANE_CHANGE_STEP_PX if self.y < desired_y else -LANE_CHANGE_STEP_PX
+            )
+        else:
+            self.y = desired_y
+            self.lane_index = self.lane_vacate_target
+            self.lane_vacate_target = None
 
     def get_next_target_node(self, int_x_list):
         sorted_nodes = sorted(int_x_list)
@@ -270,7 +342,11 @@ class Vehicle:
         elif self.leg_state == "APPROACHING" and target_node_x not in self.passed_nodes:
             self.leg_state = "TURNING" if self.target_turn == "LEFT" else "IN_INTERSECTION"
 
-        # 1. UPSTREAM DBL YIELDING (F-01 Fixed: Car yields only if BEHIND the priority bus)
+        # 1. UPSTREAM DBL YIELDING. A car BEHIND the priority bus in its lane
+        #    yields (F-01). A car AHEAD of the bus in the DBL lane vacates it
+        #    into lane 1 or 0 so the bus has an open lane; if neither lane is
+        #    clear it simply keeps driving and is retried next frame.
+        self.dbl_merge_yield_slow = False
         if not isinstance(self, Bus) and signal_controller:
             dbl_request = signal_controller.get_active_dbl_request(
                 target_node_x, self.direction
@@ -279,15 +355,56 @@ class Vehicle:
                 dist_to_stop = self.distance_to_node_stop_bar(target_node_x, h_y, road_w, stop_offset)
                 eligibility_px = signal_controller.get_priority_eligibility_px()
                 if 0.0 <= dist_to_stop <= eligibility_px:
-                    # Check if a DBL bus is directly behind us pushing forward
-                    is_car_ahead_of_bus = False
+                    # Nearest DBL bus behind us (bumper gap), if any.
+                    bus_behind_gap = None
                     for other in all_vehicles:
-                        if isinstance(other, Bus) and signal_controller.is_bus_dbl_eligible(other, target_node_x):
-                            if self.direction == "EB" and other.x < self.x: is_car_ahead_of_bus = True
-                            elif self.direction == "WB" and other.x > self.x: is_car_ahead_of_bus = True
-                    
-                    if not is_car_ahead_of_bus:
+                        if not isinstance(other, Bus) or other.direction != self.direction:
+                            continue
+                        if not signal_controller.is_bus_dbl_eligible(other, target_node_x):
+                            continue
+                        if (self.direction == "EB" and other.x < self.x) or (
+                            self.direction == "WB" and other.x > self.x
+                        ):
+                            gap = abs(self.x - other.x) - (self.length + other.length) / 2.0
+                            if bus_behind_gap is None or gap < bus_behind_gap:
+                                bus_behind_gap = gap
+
+                    if bus_behind_gap is None:
                         should_stop = True
+                    elif (
+                        bus_behind_gap <= DBL_CLEAR_AHEAD_PX
+                        and self.lane_vacate_target is None
+                        and self.lane_index == DBL_LANE_INDEX
+                    ):
+                        # Only start a change that can finish before the stop
+                        # bar, so the car never enters the box mid-lane.
+                        run_out_px = (lane_w / LANE_CHANGE_STEP_PX) * self.max_speed
+                        if dist_to_stop >= run_out_px:
+                            self.lane_vacate_target = self.choose_vacate_lane(
+                                (1, 0), h_y, lane_w, all_vehicles
+                            )
+
+        # 1b. DBL MERGE GAP. A bus moving into the DBL lane names the one car
+        #     blocking its corridor. Ahead of the bus, that car tries to leave
+        #     the DBL lane (else drives on normally); behind or alongside, it
+        #     eases off so the bus pulls clear. Never inside an intersection.
+        if not isinstance(self, Bus) and self.direction in ("EB", "WB"):
+            merging_bus = dbl_merge_bus_blocked_by(self, all_vehicles)
+            if merging_bus and not vehicle_is_inside_any_intersection(
+                self, int_x_list, h_y, road_w
+            ):
+                if merging_bus.blocker_is_ahead(self):
+                    if (
+                        self.lane_vacate_target is None
+                        and self.lane_index == DBL_LANE_INDEX
+                    ):
+                        self.lane_vacate_target = self.choose_vacate_lane(
+                            (1, 0), h_y, lane_w, all_vehicles
+                        )
+                else:
+                    self.dbl_merge_yield_slow = True
+
+        self.step_lane_vacate(int_x_list, h_y, road_w, lane_w, all_vehicles)
 
         # A bus changing lanes between route legs owns a small cooperative
         # merge gap.  Only traffic behind it in the target lane yields; traffic
@@ -345,6 +462,9 @@ class Vehicle:
             self.speed = max(0.0, self.speed - 0.05) if self.speed > target_speed else self.speed
         else:
             self.speed = min(self.max_speed, self.speed + 0.05)
+
+        if self.dbl_merge_yield_slow and not should_stop:
+            self.speed = min(self.speed, self.max_speed * DBL_MERGE_YIELD_SPEED_RATIO)
 
         if should_stop and upstream and signal_controller:
             signal_controller.cancel_intersection_entry(self, target_node_x)
@@ -460,6 +580,8 @@ class Bus(Vehicle):
         self._dbl_merge_leg_key = None
         self.route_merge_active = False
         self.route_merge_desired_y = None
+        # The single car asked to make room for this bus's DBL-lane merge.
+        self.dbl_merge_blocker = None
 
     def get_active_route_leg(self, int_x_list):
         """Return canonical metadata for the next unfinished route leg."""
@@ -544,9 +666,6 @@ class Bus(Vehicle):
             return blocker.x < self.x
         return False
 
-    def is_target_lane_clear(self, desired_y, all_vehicles):
-        return not corridor_blockers(self, desired_y, all_vehicles)
-
     def update(self, signal_data, int_x_list, h_y, road_w=132, stop_offset=10, lane_w=22, all_vehicles=None, signal_controller=None):
         if all_vehicles is None: all_vehicles = []
         leg = self.get_active_route_leg(int_x_list)
@@ -558,6 +677,7 @@ class Bus(Vehicle):
         self.route_exit_merge_blocked = False
         self.route_merge_active = False
         self.route_merge_desired_y = None
+        self.dbl_merge_blocker = None
 
         # Before entering the current node, reserve physical storage for a
         # lane change required by the following route leg.  R2/R4 therefore do
@@ -646,6 +766,20 @@ class Bus(Vehicle):
                 else:
                     self.y = desired_y
                     self.lane_index = target_lane
+            elif dbl_merge_due and target_lane == DBL_LANE_INDEX:
+                # Ask the nearest car in the DBL-lane corridor to make room
+                # (see Vehicle.update step 1b). The bus itself still waits
+                # until the corridor is actually clear; if no car can move
+                # safely this is exactly the existing hold-and-abandon path.
+                cars = [
+                    item
+                    for item in corridor_blockers(self, desired_y, all_vehicles)
+                    if not isinstance(item, Bus)
+                ]
+                if cars:
+                    self.dbl_merge_blocker = min(
+                        cars, key=lambda item: abs(item.x - self.x)
+                    )
             if self.lane_index != target_lane:
                 self.must_hold_for_lane = True
 

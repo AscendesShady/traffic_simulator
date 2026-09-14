@@ -8,6 +8,8 @@ from tkinter import ttk
 import tempfile
 import sys
 
+import batch_runner
+
 # ==========================================================
 # COLOR PALETTE & DESIGN SYSTEM CONSTANTS
 # ==========================================================
@@ -37,15 +39,21 @@ SPACE_XS = 4
 SPACE_SM = 8
 SPACE_MD = 12
 SPACE_LG = 16
-PAGE_GUTTER = SPACE_MD       # column edge -> card edge
-CARD_PAD = SPACE_MD          # card edge -> content
+PAGE_GUTTER = SPACE_MD       # column edge -> card edge (matches the canvas gutter)
+CARD_PAD = SPACE_SM          # card edge -> content
 ROW_GAP = SPACE_XS           # between rows inside a card
+# Collapsed cards stack on the tight end of the grid: with eight of them the
+# whole column (title, status, every header) fits a main window that is only
+# as tall as the simulation canvas, so nothing scrolls until a card opens.
+SECTION_GAP = SPACE_XS       # between cards
+SECTION_HEADER_PAD_Y = SPACE_XS  # disclosure header: ~28px tall at 10pt
 BUTTON_PAD_Y = 7             # action buttons: ~32px tall at 9pt
 CHIP_PAD_Y = 4               # toggle chips: ~26px tall
-# Shared column grid inside a card: label | value | control. Fixed character
-# widths keep every slider starting on the same vertical line.
-LABEL_COLUMN_CHARS = 15
-VALUE_COLUMN_CHARS = 7
+# Shared column grid inside a card: label | control. A fixed label width
+# keeps every selector and entry starting on the same vertical line. Sliders
+# do not use the column -- see add_slider_row -- so it only needs to fit the
+# longest selector label ("Local model").
+LABEL_COLUMN_CHARS = 11
 
 BASE_DIR = Path(__file__).resolve().parent
 AI_CONTROL_PATH = BASE_DIR / "ai_control.json"
@@ -55,6 +63,11 @@ API_MODEL_REGISTRY = {
         "gemini-2.5-flash",
         "gemini-3.5-flash-lite",
         "gemini-2.5-pro",
+    ],
+    "OPENAI_API_KEY": [
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-4.1",
     ],
 }
 
@@ -67,13 +80,45 @@ SYM_BUS = "\u1f68c"           # 🚌
 SYM_DISCLOSURE_OPEN = "\u25bc"    # ▼
 SYM_DISCLOSURE_CLOSED = "\u25b6"  # ▶
 
+SYM_HOURGLASS = "\N{HOURGLASS WITH FLOWING SAND}"  # ⏳ START while calibrating
+SYM_EXPAND = "\N{NORTH EAST AND SOUTH WEST ARROW}"   # ⤢ grow the window
+SYM_COMPACT = "\N{NORTH WEST AND SOUTH EAST ARROW}"  # ⤡ shrink it back
+
+# Window shapes, owned by main.WindowShapeController; the panel only shows a
+# button whose label names the *next* shape (the Start/Stop convention) and
+# asks main, through window_shape_hooks, to cycle. The current shape is read
+# back from global_config["window_shape"], which the controller also updates
+# when the OS maximize/restore buttons change the window.
+WINDOW_SHAPE_BUTTON_LABELS = {
+    "compact": f"{SYM_EXPAND}  Large",
+    "large": f"{SYM_EXPAND}  Maximize",
+    "maximized": f"{SYM_COMPACT}  Compact",
+}
+
+# Card-header colour by group, so the column reads as three tiers: what you
+# configure (white), what you run (amber), what you intervene with (red).
+SECTION_ACCENT_CONFIG = COLOR_TEXT_PRIMARY
+SECTION_ACCENT_RUN = COLOR_WARNING
+SECTION_ACCENT_INTERVENTION = COLOR_DANGER
+# Launch order of the collapsible cards, top to bottom.
+SECTION_ORDER = (
+    "Approach Traffic",
+    "Bus Routes",
+    "AI / LLM",
+    "Run Controls",
+    "Benchmark Test",
+    "Batch Benchmark",
+    "Tuning",
+    "Gridlock Discharge",
+)
+
 CONTROL_PANEL_MIN_HEIGHT = 360
 CONTROL_PANEL_BOTTOM_MARGIN = 40
 # Standalone-window width and the widest a wrapped status line may run.
 # Both sized for the portrait column this panel now lays itself out as,
 # whether it owns its own window or is mounted into MainWindow's left pane.
-CONTROL_PANEL_WIDTH = 520
-PORTRAIT_WRAP_LENGTH = 320
+CONTROL_PANEL_WIDTH = 256
+PORTRAIT_WRAP_LENGTH = 196
 BENCHMARK_COUNTDOWN_WIDTH = len("00:00 PAUSED")
 
 # Timed-benchmark durations, measured in SIMULATION seconds so a run is
@@ -98,12 +143,37 @@ DISCHARGE_OPTIONS = (
     "Node B Southbound",
 )
 
+# Explicit baseline entry for the Batch Benchmark Runner's model picker, so
+# the no-LLM Webster baseline can be swept as a batch condition alongside
+# real decision sources. Maps to the ordinary "None" model when applied.
+BATCH_BASELINE_LABEL = "None (baseline)"
+
+DEFAULT_BATCH_RUNTIME = {
+    "active": False,
+    "models": [],
+    "seeds": [],
+    "total": 0,
+    "current": None,
+    "results": [],
+}
+
 # Live widget references used by the periodic repaint poller. The data in
 # bus_routes_config remains authoritative whether a human or the LLM changed it.
 route_flag_buttons = {}
 # Collapsible sections by title: {"card", "header", "body", "state", "toggle"}.
 # Filled by make_section so callers can expand/collapse without widget access.
 control_panel_sections = {}
+# main.py installs its shape controller's cycle() here at startup; the panel
+# never imports main (main imports the panel at load time).
+window_shape_hooks = {"cycle": None}
+
+
+def request_window_shape_cycle():
+    """Ask the composition root for the next window shape; a no-op when the
+    panel is running standalone with nothing installed."""
+    callback = window_shape_hooks.get("cycle")
+    if callback is not None:
+        callback()
 
 # ==========================================================
 # SHARED STATE DICTIONARIES (Accessed by main.py)
@@ -125,7 +195,11 @@ global_config = {
     "test_model": "None",    # Model captured when the test started
     "test_seed": None,       # Seed captured when the test started
     "test_last_export": "",  # Filename written by the last completed test
+    "batch_start_requested": False,  # RUN BATCH requests one queued sweep
+    "batch_stop_requested": False,   # STOP BATCH: finish current run, then halt
+    "batch_runtime": dict(DEFAULT_BATCH_RUNTIME),
     "sim_time_seconds": 0.0, # Simulation clock, published by main.py
+    "window_shape": "compact",  # compact | large | maximized, owned by main.py
     # Derived per-node cycle lengths, published at START after calibration.
     # This is runtime output, never an operator input.
     "cycle_time_sec": {},
@@ -176,29 +250,89 @@ def set_vehicle_speed_scale(value):
     return normalized
 
 
-def describe_webster_timing():
-    """Full per-node Webster diagnostics for the read-only panel status area."""
+def get_webster_timing_summary():
+    """Return presentation-ready Webster timing data for the control panel.
+
+    The measured saturation flow applies to both nodes, while the cycle,
+    green split and demand ratios are node-specific. Keeping those levels
+    separate prevents the UI from repeating one dense diagnostic sentence
+    for every node.
+    """
     if global_config.get("calibrating", False):
-        return "Calibrating Webster, please wait...", "CALIBRATING"
+        return {
+            "state": "CALIBRATING",
+            "message": "Measuring lane capacity - please wait...",
+            "saturation_flow": None,
+            "nodes": [],
+        }
     saturation = global_config.get("measured_saturation_flow")
     if not saturation:
-        return "Webster timing calibrates on START", "IDLE"
+        return {
+            "state": "IDLE",
+            "message": "Timing is calculated automatically when START is pressed.",
+            "saturation_flow": None,
+            "nodes": [],
+        }
     splits = global_config.get("webster_splits") or {}
-    lines = []
+    nodes = []
     has_oversaturated_node = False
     for node_x, node_name in ((300, "A"), (700, "B")):
         split = splits.get(node_x) or splits.get(str(node_x))
         if not isinstance(split, dict):
+            nodes.append({
+                "position": node_x,
+                "name": node_name,
+                "available": False,
+                "status": "Unavailable",
+            })
+            continue
+        oversaturated = bool(split.get("oversaturated", False))
+        if oversaturated:
+            has_oversaturated_node = True
+        nodes.append({
+            "position": node_x,
+            "name": node_name,
+            "available": True,
+            "status": "Oversaturated" if oversaturated else "Optimal",
+            "oversaturated": oversaturated,
+            "cycle_time_sec": float(split.get("cycle_time_sec") or 0.0),
+            "total_ratio": float(split.get("Y") or 0.0),
+            "ew_ratio": float(split.get("y_ew") or 0.0),
+            "ns_ratio": float(split.get("y_ns") or 0.0),
+            "ew_green_sec": float(split.get("EW_green_sec") or 0.0),
+            "ns_green_sec": float(split.get("NS_green_sec") or 0.0),
+        })
+    return {
+        "state": "OVERSATURATED" if has_oversaturated_node else "READY",
+        "message": f"Measured lane capacity: {float(saturation):,.0f} vehicles/hour/lane",
+        "saturation_flow": float(saturation),
+        "nodes": nodes,
+    }
+
+
+def describe_webster_timing():
+    """Full per-node Webster diagnostics for logs and compatibility callers."""
+    summary = get_webster_timing_summary()
+    if not summary["nodes"]:
+        if summary["state"] == "CALIBRATING":
+            return "Calibrating Webster, please wait...", summary["state"]
+        return "Webster timing calibrates on START", summary["state"]
+
+    saturation = summary["saturation_flow"]
+    lines = []
+    for node in summary["nodes"]:
+        node_x = node["position"]
+        node_name = node["name"]
+        if not node["available"]:
             lines.append(f"NODE {node_x} ({node_name}): Webster timing unavailable")
             continue
-        cycle = float(split.get("cycle_time_sec") or 0.0)
-        total_y = float(split.get("Y") or 0.0)
-        y_ew = float(split.get("y_ew") or 0.0)
-        y_ns = float(split.get("y_ns") or 0.0)
-        ew_green = float(split.get("EW_green_sec") or 0.0)
-        ns_green = float(split.get("NS_green_sec") or 0.0)
-        if split.get("oversaturated", False):
-            has_oversaturated_node = True
+        cycle = node["cycle_time_sec"]
+        total_y = node["total_ratio"]
+        y_ew = node["ew_ratio"]
+        y_ns = node["ns_ratio"]
+        ew_green = node["ew_green_sec"]
+        ns_green = node["ns_green_sec"]
+        if node["oversaturated"]:
             lines.append(
                 f"NODE {node_x} ({node_name}):  S={float(saturation):.0f} veh/hr  "
                 f"Y={total_y:.2f}  OVERSATURATED — cycle capped at {cycle:.0f}s"
@@ -218,9 +352,7 @@ def describe_webster_timing():
                 f"NS green {ns_green:.1f}s  "
                 f"(y_ew={y_ew:.2f}, y_ns={y_ns:.2f})"
             )
-    return "\n".join(lines), (
-        "OVERSATURATED" if has_oversaturated_node else "READY"
-    )
+    return "\n".join(lines), summary["state"]
 
 
 def request_start_stop():
@@ -566,24 +698,82 @@ def add_labeled_row(parent, label_text, pady=(0, ROW_GAP)):
 
 
 def add_slider_row(
-    parent, label_text, value_text, from_, to, value, command, step, style
+    parent, label_text, value_text, from_, to, value, command, step, style,
+    pady=(0, ROW_GAP),
 ):
-    """Label | value | slider on the shared column grid.
+    """Label and live value on one line, a full-width slider beneath them.
+
+    The panel is a ~256px column: a slider beside its label would be left
+    with almost no travel, so the caption takes one line (label left, value
+    right) and the slider gets the whole card width below it.
 
     Returns (value_label, scale). The scale is keyboard-adjustable by
     exactly ``step`` per arrow press.
     """
-    row = add_labeled_row(parent, label_text)
+    surface = parent.cget("bg")
+    caption = tk.Frame(parent, bg=surface)
+    caption.pack(fill="x")
+    make_label(caption, label_text, color=COLOR_TEXT_SECONDARY).pack(side="left")
     value_label = make_label(
-        row, value_text, bold=True, color=COLOR_ACCENT, width=VALUE_COLUMN_CHARS
+        caption, value_text, bold=True, color=COLOR_ACCENT, anchor="e"
     )
-    value_label.pack(side="left")
+    value_label.pack(side="right")
     scale = ttk.Scale(
-        row, from_=from_, to=to, value=value, style=style, command=command
+        parent, from_=from_, to=to, value=value, style=style, command=command
     )
-    scale.pack(side="left", fill="x", expand=True, padx=(SPACE_XS, 0))
+    scale.pack(fill="x", pady=pady)
     enable_scale_keyboard(scale, step=step)
     return value_label, scale
+
+
+def make_spinbox(parent, from_, to, value, width=3):
+    """A dark-themed integer stepper on the card surface.
+
+    Typed values are committed by ``bind_spinbox_changes``; the arrow
+    buttons and Up/Down keys step by one.
+    """
+    box = tk.Spinbox(
+        parent, from_=from_, to=to, increment=1, width=width, font=FONT_BODY,
+        bg=COLOR_CARD_ALT, fg=COLOR_TEXT_PRIMARY, insertbackground=COLOR_TEXT_PRIMARY,
+        buttonbackground=COLOR_CARD_BORDER, relief="flat", bd=0,
+        highlightthickness=1, highlightbackground=COLOR_CARD_BORDER,
+        highlightcolor=COLOR_ACCENT, justify="right",
+    )
+    box.delete(0, "end")
+    box.insert(0, str(int(value)))
+    return box
+
+
+def bind_spinbox_changes(box, apply):
+    """Run ``apply(commit)`` for every way a Spinbox value can change.
+
+    Arrow buttons / Up-Down keys (``command``), Return and focus leaving
+    are commits (``commit=True``: junk in the field is replaced by the value
+    in effect); a key release while typing is not (``commit=False``: a
+    half-typed number is left alone but a valid one already takes effect).
+    """
+    box.config(command=lambda: apply(True))
+    box.bind("<Return>", lambda _e: apply(True), add="+")
+    box.bind("<FocusOut>", lambda _e: apply(True), add="+")
+    box.bind("<KeyRelease>", lambda _e: apply(False), add="+")
+    return box
+
+
+def make_item_card(parent):
+    """One bordered item card inside a long editor; returns its content frame.
+
+    The approach and bus-route editors stack six of these each. They sit on
+    the tight end of the spacing grid (SPACE_XS above, below and between
+    cards) so most of an editor is visible in one expansion of its section.
+    """
+    card = tk.Frame(
+        parent, bg=COLOR_CARD_ALT, highlightbackground=COLOR_CARD_BORDER,
+        highlightthickness=1, bd=0,
+    )
+    card.pack(fill="x", pady=(0, SPACE_XS))
+    inner = tk.Frame(card, bg=COLOR_CARD_ALT)
+    inner.pack(fill="x", padx=SPACE_SM, pady=SPACE_XS)
+    return inner
 
 
 def make_section(parent, title, accent=COLOR_TEXT_PRIMARY, expanded=True, on_toggle=None):
@@ -598,7 +788,7 @@ def make_section(parent, title, accent=COLOR_TEXT_PRIMARY, expanded=True, on_tog
         parent, bg=COLOR_CARD, highlightbackground=COLOR_CARD_BORDER,
         highlightthickness=1, bd=0,
     )
-    card.pack(fill="x", padx=PAGE_GUTTER, pady=(0, SPACE_SM))
+    card.pack(fill="x", padx=PAGE_GUTTER, pady=(0, SECTION_GAP))
     header = tk.Button(
         card,
         font=FONT_SECTION,
@@ -611,7 +801,7 @@ def make_section(parent, title, accent=COLOR_TEXT_PRIMARY, expanded=True, on_tog
         cursor="hand2",
         anchor="w",
         padx=CARD_PAD,
-        pady=SPACE_SM,
+        pady=SECTION_HEADER_PAD_Y,
         highlightthickness=1,
         highlightbackground=COLOR_CARD,
         highlightcolor=COLOR_ACCENT,
@@ -723,6 +913,20 @@ approach_configs = {
     "B_NB": {"active": True,  "model": "Poisson", "rate": 8,  "turn_split": 0.75, "heavy_ratio": 0.15},
     "B_SB": {"active": True,  "model": "Poisson", "rate": 8,  "turn_split": 0.75, "heavy_ratio": 0.15},
 }
+
+# Inflow demand per approach, vehicles per minute. 0 means no arrivals
+# (main.should_spawn_vehicle returns early on a non-positive rate).
+INFLOW_MIN_VPM = 0
+INFLOW_MAX_VPM = 60
+
+# Arrival-generation models selectable per approach (see main.py spawner).
+ARRIVAL_MODELS = (
+    "Random",
+    "Poisson",
+    "Binomial",
+    "Neg Binomial",
+    "Congestion Peak",
+)
 
 APPROACH_NAMES = {
     "EB": "EB Corridor",
@@ -860,6 +1064,52 @@ def set_active_ai_model(model, other_selector=None, persist=True):
         write_ai_control()
     return selected_model
 
+
+def get_batch_model_choices():
+    """Every decision source selectable as a Batch Benchmark Runner
+    condition: the explicit baseline, the rule comparator, every installed
+    Ollama tag, and any API model whose provider key is present in the
+    environment (get_api_models() already gates on that)."""
+    local_choices = [model for model in get_decision_sources() if model != "None"]
+    api_choices = [model for model in get_api_models() if model != "None"]
+    return [BATCH_BASELINE_LABEL] + local_choices + api_choices
+
+
+def request_start_batch(models, seeds):
+    """Queue a Batch Benchmark Runner sweep: every (model, seed) pair at the
+    currently configured duration, chained through the same
+    request_start_test single-run path. Regime (demand, headways, speed
+    scale, eligibility) is left exactly as the operator calibrated it -- the
+    batch changes only seed and model between runs. Returns the queued run
+    count, or None if the request is invalid or a batch is already active.
+    """
+    if not global_config.get("test_duration_sim_seconds"):
+        return None
+    models = list(dict.fromkeys(models or []))
+    seeds = list(dict.fromkeys(seeds or []))
+    if not models or not seeds:
+        return None
+    runtime = global_config.setdefault("batch_runtime", dict(DEFAULT_BATCH_RUNTIME))
+    if runtime.get("active", False):
+        return None
+    total = len(models) * len(seeds)
+    runtime.update({
+        "active": True,
+        "models": models,
+        "seeds": seeds,
+        "total": total,
+        "current": None,
+        "results": [],
+    })
+    global_config["batch_start_requested"] = True
+    return total
+
+
+def request_stop_batch():
+    """STOP BATCH: finish the run in flight, then halt -- never mid-run."""
+    global_config["batch_stop_requested"] = True
+
+
 def create_dashboard_window(parent=None):
     """Build every control-panel widget and return their container.
 
@@ -873,11 +1123,10 @@ def create_dashboard_window(parent=None):
     the agent subprocess depends on `ai_control.json` and nothing here
     changes what gets written to it.
 
-    Layout: one portrait column of collapsible cards, each built by
-    ``make_section`` so every header, row, button and toggle shares the same
-    type scale and spacing grid. Run Controls, Benchmark and AI/LLM open by
-    default; the long tuning and per-route/per-approach editors start
-    collapsed.
+    Layout: one portrait column of collapsible cards in ``SECTION_ORDER``,
+    each built by ``make_section`` so every header, row, button and toggle
+    shares the same type scale and spacing grid. Every card starts collapsed
+    so the full column is visible at launch.
     """
     route_flag_buttons.clear()
     control_panel_sections.clear()
@@ -961,9 +1210,12 @@ def create_dashboard_window(parent=None):
 
     # One slider look for the whole panel; a focused slider swaps its bevel
     # to amber so the operator can see which control the arrow keys drive.
-    for style_name, background in (
-        ("Modern.Horizontal.TScale", COLOR_CARD_ALT),
-        ("Global.Horizontal.TScale", COLOR_CARD),
+    # "Thin" is the same slider at two thirds the height, for the paired
+    # percentage controls in the approach cards.
+    for style_name, background, slider_thickness, slider_length, groove in (
+        ("Modern.Horizontal.TScale", COLOR_CARD_ALT, 14, 22, 4),
+        ("Global.Horizontal.TScale", COLOR_CARD, 14, 22, 4),
+        ("Thin.Horizontal.TScale", COLOR_CARD_ALT, 10, 16, 3),
     ):
         style.configure(
             style_name,
@@ -973,9 +1225,9 @@ def create_dashboard_window(parent=None):
             bordercolor=COLOR_CARD_BORDER,
             lightcolor=COLOR_ACCENT,
             darkcolor=COLOR_ACCENT,
-            groovethickness=4,
-            sliderthickness=14,
-            sliderlength=22,
+            groovethickness=groove,
+            sliderthickness=slider_thickness,
+            sliderlength=slider_length,
         )
         style.map(
             style_name,
@@ -986,12 +1238,32 @@ def create_dashboard_window(parent=None):
 
     # 1. HEADER & STATUS ---------------------------------------------------
     header_frame = tk.Frame(root, bg=COLOR_BG)
-    header_frame.pack(fill="x", padx=PAGE_GUTTER, pady=(SPACE_MD, SPACE_SM))
+    header_frame.pack(fill="x", padx=PAGE_GUTTER, pady=(SPACE_MD, SPACE_XS))
 
+    # Title on the left, the window-shape cycle button on the right.
+    title_row = tk.Frame(header_frame, bg=COLOR_BG)
+    title_row.pack(fill="x")
     make_label(
-        header_frame, "Network Control", font=FONT_TITLE,
+        title_row, "Network Control", font=FONT_TITLE,
         color=COLOR_TEXT_PRIMARY,
-    ).pack(fill="x")
+    ).pack(side="left", fill="x", expand=True)
+    window_shape_btn = make_button(
+        title_row,
+        WINDOW_SHAPE_BUTTON_LABELS[global_config.get("window_shape", "compact")],
+        "neutral", request_window_shape_cycle, padx=SPACE_SM, pady=CHIP_PAD_Y,
+    )
+    window_shape_btn.pack(side="right")
+
+    def refresh_window_shape_button():
+        label = WINDOW_SHAPE_BUTTON_LABELS.get(
+            global_config.get("window_shape", "compact"),
+            WINDOW_SHAPE_BUTTON_LABELS["compact"],
+        )
+        if window_shape_btn.cget("text") != label:
+            window_shape_btn.config(text=label)
+        root.after(250, refresh_window_shape_button)
+
+    root.after(250, refresh_window_shape_button)
 
     # Status sits under the title: beside it, the title alone fills a
     # portrait-width pane and the status text gets clipped.
@@ -1006,414 +1278,239 @@ def create_dashboard_window(parent=None):
     )
     status_text.pack(side="left", fill="x", expand=True)
 
-    # 2. RUN CONTROLS ------------------------------------------------------
-    run_section = make_section(
-        root, "Run Controls", expanded=True, on_toggle=schedule_panel_fit
+    # Cards are built in operator order: the three configuration editors
+    # (white headers) come first, then the three run/benchmark tools (amber),
+    # then the two intervention cards (red). Every card starts collapsed so
+    # the whole column is visible at launch and the operator opens only the
+    # card they are working in.
+    # 1. PER-APPROACH TRAFFIC ----------------------------------------------
+    approaches_section = make_section(
+        root, "Approach Traffic", accent=SECTION_ACCENT_CONFIG,
+        expanded=False, on_toggle=schedule_panel_fit,
     )
-    run_body = run_section["body"]
+    approaches_body = approaches_section["body"]
 
-    # START/PAUSE share a row, RESET gets its own full-width row below -- a
-    # narrow side pane has no room for all three abreast.
-    controls_row = tk.Frame(run_body, bg=COLOR_CARD)
-    controls_row.pack(fill="x", pady=(0, SPACE_SM))
-    controls_row.grid_columnconfigure(0, weight=1, uniform="run_buttons")
-    controls_row.grid_columnconfigure(1, weight=1, uniform="run_buttons")
+    # One item card per approach. Row 1 = name + ON/OFF chip, row 2 = the
+    # generation model + inflow stepper, row 3 = straight % and trucks % as
+    # two thin sliders side by side. Same approach_configs keys as before.
+    for key, name in APPROACH_NAMES.items():
+        inner = make_item_card(approaches_body)
 
-    def toggle_start_stop():
-        request_start_stop()
-        write_ai_control()
+        name_row = tk.Frame(inner, bg=COLOR_CARD_ALT)
+        name_row.pack(fill="x", pady=(0, ROW_GAP))
+        make_label(name_row, name, bold=True).pack(side="left", fill="x", expand=True)
 
-    start_stop_btn = make_button(
-        controls_row, f"{SYM_PLAY}  Start", "success", toggle_start_stop
-    )
-    start_stop_btn.grid(row=0, column=0, sticky="ew", padx=(0, SPACE_XS))
+        def make_toggle(k, btn):
+            def toggle():
+                approach_configs[k]["active"] = not approach_configs[k]["active"]
+                paint_toggle_chip(
+                    btn, approach_configs[k]["active"], COLOR_SUCCESS, "ON", "OFF"
+                )
+            return toggle
 
-    def toggle_pause():
-        request_pause_resume()
+        t_btn = make_toggle_chip(
+            name_row, approach_configs[key]["active"], COLOR_SUCCESS, "ON", "OFF",
+            width=4,
+        )
+        t_btn.config(command=make_toggle(key, t_btn))
+        t_btn.pack(side="right")
 
-    pause_btn = make_button(
-        controls_row, f"{SYM_PAUSE}  Pause", "neutral", toggle_pause
-    )
-    pause_btn.grid(row=0, column=1, sticky="ew", padx=(SPACE_XS, 0))
+        # Row 2: model selector | inflow stepper. Inflow is an exact integer,
+        # so a stepper (typed or arrowed, 0-60 v/m) fits it better than a
+        # slider and takes a third of the width.
+        demand_row = tk.Frame(inner, bg=COLOR_CARD_ALT)
+        demand_row.pack(fill="x", pady=(0, ROW_GAP))
+        model_box = ttk.Combobox(
+            demand_row,
+            values=list(ARRIVAL_MODELS),
+            width=max(len(model) for model in ARRIVAL_MODELS) - 3,
+            state="readonly",
+            style="Modern.TCombobox", font=FONT_BODY,
+        )
+        model_box.set(approach_configs[key]["model"])
+        model_box.pack(side="left", fill="x", expand=True)
 
-    def trigger_reset():
-        global_config["reset_triggered"] = True
+        def make_model_change(k, box):
+            def change(event):
+                approach_configs[k]["model"] = box.get()
+            return change
+        model_box.bind("<<ComboboxSelected>>", make_model_change(key, model_box))
 
-    reset_btn = make_button(
-        run_body, f"{SYM_RESET}  Reset vehicles", "neutral", trigger_reset,
-        fg=COLOR_DANGER, activeforeground=COLOR_DANGER,
-    )
-    reset_btn.pack(fill="x", pady=(0, SPACE_MD))
+        make_label(demand_row, "v/m", color=COLOR_TEXT_SECONDARY).pack(
+            side="right", padx=(SPACE_XS, 0)
+        )
+        rate_box = make_spinbox(
+            demand_row, INFLOW_MIN_VPM, INFLOW_MAX_VPM, approach_configs[key]["rate"]
+        )
+        rate_box.pack(side="right", padx=(SPACE_SM, 0))
 
-    def update_speed(val):
-        v = float(val)
-        global_config["sim_speed"] = v
-        speed_val_lbl.config(text=f"{v:.1f}x")
+        def make_rate_change(k, box):
+            def apply(commit):
+                text = box.get().strip()
+                if text.lstrip("-").isdigit():
+                    value = max(INFLOW_MIN_VPM, min(INFLOW_MAX_VPM, int(text)))
+                    approach_configs[k]["rate"] = value
+                elif commit:
+                    value = int(approach_configs[k]["rate"])  # junk: restore
+                else:
+                    return  # mid-edit: leave both field and config alone
+                if str(value) != text:
+                    box.delete(0, "end")
+                    box.insert(0, str(value))
+            return apply
 
-    speed_val_lbl, speed_slider = add_slider_row(
-        run_body, "Sim speed", "1.0x", 0.5, 3.0, 1.0, update_speed,
-        step=0.1, style="Global.Horizontal.TScale",
-    )
+        bind_spinbox_changes(rate_box, make_rate_change(key, rate_box))
 
-    seed_row = add_labeled_row(run_body, "Seed")
-    seed_entry = tk.Entry(
-        seed_row, width=8, font=FONT_BODY,
-        bg=COLOR_CARD_ALT, fg=COLOR_TEXT_PRIMARY,
-        insertbackground=COLOR_TEXT_PRIMARY, relief="flat",
-        highlightthickness=1, highlightbackground=COLOR_CARD_BORDER,
-        highlightcolor=COLOR_ACCENT,
-    )
-    configured_seed = global_config.get("random_seed")
-    if configured_seed is not None:
-        seed_entry.insert(0, str(configured_seed))
-    seed_entry.pack(side="left", padx=(0, SPACE_XS), ipady=3)
+        # Row 3: the two percentage controls side by side, each a caption
+        # (label + live value) over a thin slider.
+        pct_row = tk.Frame(inner, bg=COLOR_CARD_ALT)
+        pct_row.pack(fill="x")
+        pct_row.grid_columnconfigure(0, weight=1, uniform="approach_pct")
+        pct_row.grid_columnconfigure(1, weight=1, uniform="approach_pct")
+        split_col = tk.Frame(pct_row, bg=COLOR_CARD_ALT)
+        split_col.grid(row=0, column=0, sticky="ew", padx=(0, SPACE_XS))
+        heavy_col = tk.Frame(pct_row, bg=COLOR_CARD_ALT)
+        heavy_col.grid(row=0, column=1, sticky="ew", padx=(SPACE_XS, 0))
 
-    def apply_seed_from_entry(_event=None):
-        try:
-            seed = set_random_seed(seed_entry.get())
-        except (TypeError, ValueError):
-            status_text.config(text="Seed must be an integer", fg=COLOR_DANGER)
-            return
-        refresh_seed_state_label()
-        if seed is None:
-            status_text.config(
-                text="Random seed cleared; applies on reset", fg=COLOR_TEXT_SECONDARY
-            )
-        else:
-            status_text.config(
-                text=f"Seed {seed} set; applies on reset", fg=COLOR_SUCCESS
-            )
+        def make_split_slider(k, lbl):
+            def update(val):
+                v_f = float(val) / 100.0
+                approach_configs[k]["turn_split"] = v_f
+                lbl.config(text=f"{int(v_f*100)}%")
+            return update
 
-    seed_btn = make_button(
-        seed_row, "Set", "neutral", apply_seed_from_entry,
-        padx=SPACE_MD, pady=CHIP_PAD_Y,
-    )
-    seed_btn.pack(side="left", padx=(0, SPACE_SM))
+        split_val, split_slider = add_slider_row(
+            split_col, "Straight", f"{int(approach_configs[key]['turn_split']*100)}%",
+            0, 100, int(approach_configs[key]["turn_split"] * 100), None, step=1,
+            style="Thin.Horizontal.TScale", pady=0,
+        )
+        split_slider.config(command=make_split_slider(key, split_val))
 
-    # Persistent readout of the seed actually in effect, so the operator can
-    # confirm it at a glance instead of relying on the transient status line.
-    seed_state_lbl = make_label(seed_row, "", bold=True, color=COLOR_SUCCESS)
-    seed_state_lbl.pack(side="left", fill="x", expand=True)
+        def make_heavy_slider(k, lbl):
+            def update(val):
+                v_f = float(val) / 100.0
+                approach_configs[k]["heavy_ratio"] = v_f
+                lbl.config(text=f"{int(v_f*100)}%")
+            return update
 
-    def refresh_seed_state_label():
-        seed = global_config.get("random_seed")
-        if seed is None:
-            seed_state_lbl.config(text="random", fg=COLOR_TEXT_SECONDARY)
-        else:
-            seed_state_lbl.config(text=f"set to {seed}", fg=COLOR_SUCCESS)
+        heavy_val, heavy_slider = add_slider_row(
+            heavy_col, "Trucks", f"{int(approach_configs[key]['heavy_ratio']*100)}%",
+            0, 50, int(approach_configs[key]["heavy_ratio"] * 100), None, step=1,
+            style="Thin.Horizontal.TScale", pady=0,
+        )
+        heavy_slider.config(command=make_heavy_slider(key, heavy_val))
 
-    refresh_seed_state_label()
-    seed_entry.bind("<Return>", apply_seed_from_entry)
-    seed_entry.bind("<FocusOut>", apply_seed_from_entry)
-
-    webster_status_lbl = make_label(
-        run_body, "Webster timing calibrates on START", bold=True,
-        color=COLOR_TEXT_SECONDARY, wraplength=PORTRAIT_WRAP_LENGTH,
-    )
-    webster_status_lbl.pack(fill="x", pady=(SPACE_XS, 0))
-
-    def refresh_webster_status():
-        text, state = describe_webster_timing()
-        colour = {
-            "CALIBRATING": COLOR_WARNING,
-            "READY": COLOR_SUCCESS,
-            "OVERSATURATED": COLOR_DANGER,
-        }.get(state, COLOR_TEXT_SECONDARY)
-        webster_status_lbl.config(text=text, fg=colour)
-        root.after(150, refresh_webster_status)
-
-    root.after(150, refresh_webster_status)
-
-    # 3. BENCHMARK TEST ----------------------------------------------------
-    test_section = make_section(
-        root, "Benchmark Test", accent=COLOR_WARNING, expanded=True,
+    # 2. BUS ROUTES (TSP / DBL) --------------------------------------------
+    transit_section = make_section(
+        root, "Bus Routes", accent=SECTION_ACCENT_CONFIG, expanded=False,
         on_toggle=schedule_panel_fit,
     )
-    test_body = test_section["body"]
+    transit_body = transit_section["body"]
 
-    duration_row = add_labeled_row(test_body, "Duration")
-    test_duration_box = ttk.Combobox(
-        duration_row, values=list(TEST_DURATIONS), width=8,
+    # Route selector over its action: abreast, the column leaves the
+    # selector too narrow to show a route name.
+    dispatch_row = tk.Frame(transit_body, bg=COLOR_CARD)
+    dispatch_row.pack(fill="x", pady=(0, SPACE_SM))
+
+    disp_route_box = ttk.Combobox(
+        dispatch_row, values=[r["name"] for r in bus_routes_config.values()],
         state="readonly", style="Modern.TCombobox", font=FONT_BODY,
     )
-    test_duration_box.pack(side="left")
-    countdown_lbl = make_label(
-        duration_row, "--:--", bold=True, color=COLOR_TEXT_SECONDARY,
-        # Reserve the longest runtime state ("00:00 PAUSED") up front. Without
-        # this width, Tk sizes the benchmark card for "--:--" and clips the
-        # countdown when the label grows after a test starts.
-        width=BENCHMARK_COUNTDOWN_WIDTH, anchor="e",
+    disp_route_box.set(bus_routes_config["R1_EB_A_NB"]["name"])
+    disp_route_box.pack(fill="x", pady=(0, ROW_GAP))
+
+    def trigger_manual_dispatch():
+        selected_name = disp_route_box.get()
+        for r_id, r_cfg in bus_routes_config.items():
+            if r_cfg["name"] == selected_name:
+                if r_cfg["active"]:
+                    r_cfg["manual_dispatch"] = True
+                break
+
+    manual_btn = make_button(
+        dispatch_row, "Dispatch now", "warning", trigger_manual_dispatch
     )
-    countdown_lbl.pack(side="right")
+    manual_btn.pack(fill="x")
 
-    def refresh_test_countdown():
-        if global_config.get("test_running", False):
-            remaining = format_test_countdown(
-                global_config.get("test_duration_sim_seconds"),
-                global_config.get("sim_time_seconds", 0.0),
-            )
-            if remaining is not None:
-                paused = bool(global_config.get("is_paused", False))
-                countdown_lbl.config(
-                    text=f"{remaining} PAUSED" if paused else remaining,
-                    fg=COLOR_WARNING if paused else COLOR_SUCCESS,
-                )
-            else:
-                countdown_lbl.config(text="--:--", fg=COLOR_TEXT_SECONDARY)
-        elif global_config.get("test_last_export"):
-            countdown_lbl.config(text="00:00", fg=COLOR_ACCENT)
-        else:
-            countdown_lbl.config(text="--:--", fg=COLOR_TEXT_SECONDARY)
-        root.after(200, refresh_test_countdown)
+    # One item card per route. Row 1 = name + ON/OFF chip, row 2 = headway
+    # slider, row 3 = the TSP and DBL chips as two equal halves. Every
+    # callback and bus_routes_config key is the same as before.
+    for r_id, r_cfg in bus_routes_config.items():
+        inner = make_item_card(transit_body)
 
-    root.after(200, refresh_test_countdown)
-
-    def on_test_duration_selected(_event=None):
-        global_config["test_duration_sim_seconds"] = TEST_DURATIONS.get(
-            test_duration_box.get()
+        name_row = tk.Frame(inner, bg=COLOR_CARD_ALT)
+        name_row.pack(fill="x", pady=(0, ROW_GAP))
+        make_label(name_row, r_cfg["name"], bold=True).pack(
+            side="left", fill="x", expand=True
         )
 
-    test_duration_box.bind("<<ComboboxSelected>>", on_test_duration_selected)
+        def make_route_toggle(key, btn):
+            def toggle():
+                bus_routes_config[key]["active"] = not bus_routes_config[key]["active"]
+                act = bus_routes_config[key]["active"]
+                paint_toggle_chip(btn, act, COLOR_SUCCESS, "ON", "OFF")
+                if not act:
+                    bus_routes_config[key]["manual_dispatch"] = False
+            return toggle
 
-    def start_test():
-        if request_start_test() is None:
-            status_text.config(text="Select duration first", fg=COLOR_WARNING)
-            return
-        write_ai_control()
-
-    start_test_btn = make_button(test_body, "Start test", "warning", start_test)
-    start_test_btn.pack(fill="x", pady=(SPACE_XS, 0))
-
-    def refresh_simulation_status():
-        running = bool(global_config.get("is_running", False))
-        starting = bool(global_config.get("start_requested", False))
-        paused = bool(global_config.get("is_paused", False))
-        testing = bool(global_config.get("test_running", False))
-        if running:
-            start_stop_btn.config(
-                text=f"{SYM_STOP}  Stop", bg=COLOR_DANGER,
-                fg=COLOR_TEXT_PRIMARY, activeforeground=COLOR_TEXT_PRIMARY,
-            )
-            pause_btn.config(state="normal")
-            if paused:
-                pause_btn.config(
-                    text=f"{SYM_PLAY}  Resume", bg=COLOR_SUCCESS, fg=COLOR_BG
-                )
-                dot_lbl.config(fg=COLOR_WARNING)
-                status_text.config(text="Paused", fg=COLOR_WARNING)
-            elif testing:
-                pause_btn.config(
-                    text=f"{SYM_PAUSE}  Pause", bg=COLOR_CARD,
-                    fg=COLOR_TEXT_PRIMARY,
-                )
-                dot_lbl.config(fg=COLOR_SUCCESS)
-                duration = global_config.get("test_duration_sim_seconds")
-                duration_label = next(
-                    (
-                        label
-                        for label, seconds in TEST_DURATIONS.items()
-                        if seconds == duration
-                    ),
-                    f"{int(duration) // 60} min" if duration else "?",
-                )
-                status_text.config(
-                    text=(
-                        f"Test running: {global_config.get('test_model', 'None')}"
-                        f" for {duration_label}"
-                    ),
-                    fg=COLOR_SUCCESS,
-                )
-            else:
-                pause_btn.config(
-                    text=f"{SYM_PAUSE}  Pause", bg=COLOR_CARD,
-                    fg=COLOR_TEXT_PRIMARY,
-                )
-                dot_lbl.config(fg=COLOR_SUCCESS)
-                status_text.config(text="Running", fg=COLOR_SUCCESS)
-        else:
-            start_stop_btn.config(
-                text=f"{SYM_PLAY}  Start", bg=COLOR_SUCCESS,
-                fg=COLOR_BG, activeforeground=COLOR_BG,
-            )
-            pause_btn.config(
-                state="disabled", text=f"{SYM_PAUSE}  Pause",
-                bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY,
-            )
-            dot_lbl.config(fg=COLOR_TEXT_SECONDARY)
-            if starting:
-                status_text.config(text="Starting fresh run…", fg=COLOR_WARNING)
-            elif global_config.get("test_last_export"):
-                status_text.config(
-                    text=(
-                        "Test complete — exported "
-                        f"{global_config['test_last_export']}"
-                    ),
-                    fg=COLOR_SUCCESS,
-                )
-            elif global_config.get("run_has_started", False):
-                status_text.config(
-                    text="Stopped — export or START new run",
-                    fg=COLOR_TEXT_SECONDARY,
-                )
-            else:
-                status_text.config(
-                    text="Idle — press START", fg=COLOR_TEXT_SECONDARY
-                )
-        refresh_seed_state_label()
-        root.after(100, refresh_simulation_status)
-
-    root.after(100, refresh_simulation_status)
-
-    # 4. MOTION / PRIORITY TUNING -----------------------------------------
-    tuning_section = make_section(
-        root, "Tuning", expanded=False, on_toggle=schedule_panel_fit
-    )
-    tuning_body = tuning_section["body"]
-
-    def update_priority_eligibility(value):
-        pixels = set_priority_eligibility_px(value)
-        eligibility_value.config(text=f"{pixels} px")
-
-    eligibility_value, eligibility_slider = add_slider_row(
-        tuning_body, "Eligibility zone",
-        f"{global_config['priority_eligibility_px']} px",
-        250, 800, global_config["priority_eligibility_px"],
-        update_priority_eligibility, step=10, style="Global.Horizontal.TScale",
-    )
-
-    def update_vehicle_scale(value):
-        scale = set_vehicle_speed_scale(value)
-        vehicle_scale_value.config(text=f"{scale:.2f}x")
-
-    vehicle_scale_value, vehicle_scale_slider = add_slider_row(
-        tuning_body, "Vehicle speed",
-        f"{global_config['vehicle_speed_scale']:.2f}x",
-        0.25, 1.0, global_config["vehicle_speed_scale"],
-        update_vehicle_scale, step=0.05, style="Global.Horizontal.TScale",
-    )
-
-    make_label(
-        tuning_body, "Applies on next START / RESET", color=COLOR_TEXT_SECONDARY,
-    ).pack(fill="x")
-
-    # 5. NETWORK GRIDLOCK RECOVERY ----------------------------------------
-    recovery_section = make_section(
-        root, "Gridlock Discharge", accent=COLOR_DANGER, expanded=False,
-        on_toggle=schedule_panel_fit,
-    )
-    recovery_body = recovery_section["body"]
-
-    corridor_row = add_labeled_row(recovery_body, "Corridor")
-    discharge_mode_box = ttk.Combobox(
-        corridor_row,
-        values=list(DISCHARGE_OPTIONS),
-        state="readonly",
-        style="Modern.TCombobox", font=FONT_BODY,
-    )
-    discharge_mode_box.set(global_config["discharge_selection"])
-    discharge_mode_box.pack(side="left", fill="x", expand=True)
-
-    # The two actions take their own row under the corridor selector.
-    recovery_actions = tk.Frame(recovery_body, bg=COLOR_CARD)
-    recovery_actions.pack(fill="x", pady=(SPACE_XS, SPACE_SM))
-    recovery_actions.grid_columnconfigure(0, weight=1, uniform="recovery_buttons")
-    recovery_actions.grid_columnconfigure(1, weight=1, uniform="recovery_buttons")
-
-    def on_discharge_mode_selected(event):
-        global_config["discharge_selection"] = discharge_mode_box.get()
-
-    discharge_mode_box.bind(
-        "<<ComboboxSelected>>", on_discharge_mode_selected
-    )
-
-    def start_discharge():
-        selected = discharge_mode_box.get()
-        if selected not in DISCHARGE_OPTIONS:
-            selected = DISCHARGE_AUTO
-            discharge_mode_box.set(selected)
-        global_config["discharge_selection"] = selected
-        global_config["discharge_stop_requested"] = False
-        global_config["discharge_start_requested"] = True
-        runtime = global_config.setdefault("discharge_runtime", {})
-        runtime.update(
-            {
-                "selected": selected,
-                "status": "REQUESTED",
-                "reason": "Waiting for the simulation controller",
-                "recommendation": "Recovery will begin with a safe transition",
-            }
+        t_btn = make_toggle_chip(
+            name_row, r_cfg["active"], COLOR_SUCCESS, "ON", "OFF", width=4
         )
+        t_btn.config(command=make_route_toggle(r_id, t_btn))
+        t_btn.pack(side="right")
 
-    start_discharge_btn = make_button(
-        recovery_actions, "Start discharge", "danger", start_discharge
-    )
-    start_discharge_btn.grid(row=0, column=0, sticky="ew", padx=(0, SPACE_XS))
+        def make_hw_slider(key, lbl):
+            def update(val):
+                sec = int(float(val))
+                bus_routes_config[key]["headway_sec"] = sec
+                lbl.config(text=f"{sec}s" if sec > 0 else "OFF")
+            return update
 
-    def safe_stop_discharge():
-        global_config["discharge_start_requested"] = False
-        global_config["discharge_stop_requested"] = True
-
-    stop_discharge_btn = make_button(
-        recovery_actions, "Safe stop", "neutral", safe_stop_discharge
-    )
-    stop_discharge_btn.grid(row=0, column=1, sticky="ew", padx=(SPACE_XS, 0))
-
-    recovery_status = tk.Frame(recovery_body, bg=COLOR_CARD_ALT)
-    recovery_status.pack(fill="x")
-    discharge_status_lbl = make_label(
-        recovery_status, "Selected: Auto (Recommended)  |  Status: IDLE",
-        bold=True, color=COLOR_TEXT_SECONDARY, wraplength=PORTRAIT_WRAP_LENGTH,
-    )
-    discharge_status_lbl.pack(fill="x", padx=SPACE_SM, pady=(SPACE_XS, 0))
-    discharge_reason_lbl = make_label(
-        recovery_status, "Reason: Normal signal control is active",
-        wraplength=PORTRAIT_WRAP_LENGTH,
-    )
-    discharge_reason_lbl.pack(fill="x", padx=SPACE_SM)
-    discharge_recommendation_lbl = make_label(
-        recovery_status,
-        "Recommended first action: Select Auto or a corridor, then start discharge",
-        color=COLOR_WARNING, wraplength=PORTRAIT_WRAP_LENGTH,
-    )
-    discharge_recommendation_lbl.pack(fill="x", padx=SPACE_SM, pady=(0, SPACE_XS))
-
-    def refresh_discharge_status():
-        runtime = global_config.get("discharge_runtime", {})
-        selected = runtime.get(
-            "selected", global_config.get("discharge_selection", DISCHARGE_AUTO)
+        hw_val_lbl, hw_slider = add_slider_row(
+            inner, "Headway", f"{r_cfg['headway_sec']}s", 0, 90,
+            r_cfg["headway_sec"], None, step=1, style="Modern.Horizontal.TScale",
         )
-        status = runtime.get("status", "IDLE")
-        stage = runtime.get("stage", "")
-        reason = runtime.get("reason", "Normal signal control is active")
-        recommendation = runtime.get(
-            "recommendation", "Select Auto or a corridor, then start discharge"
-        )
-        discharged = int(runtime.get("vehicles_discharged", 0))
-        status_color = {
-            "DISCHARGING": COLOR_SUCCESS,
-            "WAITING": COLOR_WARNING,
-            "REQUESTED": COLOR_WARNING,
-            "TRANSITIONING": COLOR_WARNING,
-            "STOPPING": COLOR_WARNING,
-            "COMPLETED": COLOR_SUCCESS,
-        }.get(status, COLOR_TEXT_SECONDARY)
-        status_text_value = f"Selected: {selected}  |  Status: {status}"
-        if stage:
-            status_text_value += f"  |  Stage: {stage}"
-        if discharged:
-            status_text_value += f"  |  Discharged: {discharged}"
-        discharge_status_lbl.config(text=status_text_value, fg=status_color)
-        discharge_reason_lbl.config(text=f"Reason: {reason}")
-        discharge_recommendation_lbl.config(
-            text=f"Recommended first action: {recommendation}"
-        )
-        root.after(250, refresh_discharge_status)
+        hw_slider.config(command=make_hw_slider(r_id, hw_val_lbl))
 
-    root.after(250, refresh_discharge_status)
+        flags_row = tk.Frame(inner, bg=COLOR_CARD_ALT)
+        flags_row.pack(fill="x")
+        flags_row.grid_columnconfigure(0, weight=1, uniform="route_flags")
+        flags_row.grid_columnconfigure(1, weight=1, uniform="route_flags")
 
-    # 6. AI / LLM CONTROL --------------------------------------------------
+        def make_tsp_toggle(key, btn):
+            def toggle():
+                bus_routes_config[key]["tsp_enabled"] = not bus_routes_config[key]["tsp_enabled"]
+                paint_toggle_chip(
+                    btn, bus_routes_config[key]["tsp_enabled"],
+                    COLOR_SUCCESS, "TSP ON", "TSP OFF",
+                )
+            return toggle
+
+        tsp_btn = make_toggle_chip(
+            flags_row, r_cfg["tsp_enabled"], COLOR_SUCCESS, "TSP ON", "TSP OFF"
+        )
+        tsp_btn.config(command=make_tsp_toggle(r_id, tsp_btn))
+        tsp_btn.grid(row=0, column=0, sticky="ew", padx=(0, SPACE_XS))
+
+        def make_dbl_toggle(key, btn):
+            def toggle():
+                bus_routes_config[key]["dbl_enabled"] = not bus_routes_config[key]["dbl_enabled"]
+                paint_toggle_chip(
+                    btn, bus_routes_config[key]["dbl_enabled"],
+                    COLOR_ACCENT, "DBL ON", "DBL OFF",
+                )
+            return toggle
+
+        dbl_btn = make_toggle_chip(
+            flags_row, r_cfg["dbl_enabled"], COLOR_ACCENT, "DBL ON", "DBL OFF"
+        )
+        dbl_btn.config(command=make_dbl_toggle(r_id, dbl_btn))
+        dbl_btn.grid(row=0, column=1, sticky="ew", padx=(SPACE_XS, 0))
+        route_flag_buttons[r_id] = {"tsp": tsp_btn, "dbl": dbl_btn}
+
+    # 3. AI / LLM CONTROL --------------------------------------------------
     ai_section = make_section(
-        root, "AI / LLM Control", accent=COLOR_WARNING, expanded=True,
+        root, "AI / LLM", accent=SECTION_ACCENT_CONFIG, expanded=False,
         on_toggle=schedule_panel_fit,
     )
     ai_body = ai_section["body"]
@@ -1497,31 +1594,35 @@ def create_dashboard_window(parent=None):
         step=1, style="Global.Horizontal.TScale",
     )
 
-    # Arm button and live status on their own row under the selectors.
-    ai_row_run = tk.Frame(ai_body, bg=COLOR_CARD)
-    ai_row_run.pack(fill="x", pady=(SPACE_XS, SPACE_SM))
+    # Arm button, then the live status on its own line under it: a status
+    # such as "LLM WAITING_FOR_DECISION | TURN 3" needs the full column.
+    run_llm_btn = make_button(ai_body, f"{SYM_PLAY}  Run LLM", "warning", on_run_llm)
+    run_llm_btn.pack(fill="x", pady=(SPACE_XS, ROW_GAP))
 
-    run_llm_btn = make_button(ai_row_run, f"{SYM_PLAY}  Run LLM", "warning", on_run_llm)
-    run_llm_btn.pack(side="left", padx=(0, SPACE_SM))
-
-    llm_dot = make_label(ai_row_run, SYM_DOT, color=COLOR_TEXT_SECONDARY)
+    ai_row_status = tk.Frame(ai_body, bg=COLOR_CARD)
+    ai_row_status.pack(fill="x", pady=(0, SPACE_SM))
+    llm_dot = make_label(ai_row_status, SYM_DOT, color=COLOR_TEXT_SECONDARY)
     llm_dot.pack(side="left", padx=(0, SPACE_XS))
     llm_status_text = make_label(
-        ai_row_run, "LLM INACTIVE", bold=True, color=COLOR_TEXT_SECONDARY,
-        wraplength=PORTRAIT_WRAP_LENGTH - 140,
+        ai_row_status, "LLM INACTIVE", bold=True, color=COLOR_TEXT_SECONDARY,
+        wraplength=PORTRAIT_WRAP_LENGTH - SPACE_LG,
     )
     llm_status_text.pack(side="left", fill="x", expand=True)
 
     # Selected model and control scope, one line each.
     selected_row = add_labeled_row(ai_body, "Selected")
-    selected_val_lbl = make_label(selected_row, selected_model, bold=True, color=COLOR_ACCENT)
+    selected_val_lbl = make_label(
+        selected_row, selected_model, bold=True, color=COLOR_ACCENT,
+        wraplength=PORTRAIT_WRAP_LENGTH - 80,
+    )
     selected_val_lbl.pack(side="left", fill="x", expand=True)
 
-    scope_row = add_labeled_row(ai_body, "Control scope", pady=0)
-    ctrl_val_lbl = make_label(scope_row, "TSP + DBL", bold=True, color=COLOR_ACCENT)
-    ctrl_val_lbl.pack(side="left")
-    ctrl_rest_lbl = make_label(scope_row, " for all bus routes")
-    ctrl_rest_lbl.pack(side="left")
+    scope_row = add_labeled_row(ai_body, "Scope", pady=0)
+    ctrl_val_lbl = make_label(
+        scope_row, "TSP + DBL, all bus routes", bold=True, color=COLOR_ACCENT,
+        wraplength=PORTRAIT_WRAP_LENGTH - 80,
+    )
+    ctrl_val_lbl.pack(side="left", fill="x", expand=True)
 
     def refresh_llm_status():
         runtime = global_config.get("ai_runtime", {})
@@ -1560,218 +1661,795 @@ def create_dashboard_window(parent=None):
 
     root.after(250, refresh_route_buttons)
 
-    # 7. BUS ROUTES (TSP / DBL) --------------------------------------------
-    transit_section = make_section(
-        root, "Bus Routes (TSP / DBL)", accent=COLOR_WARNING, expanded=False,
+    # 4. RUN CONTROLS ------------------------------------------------------
+    run_section = make_section(
+        root, "Run Controls", accent=SECTION_ACCENT_RUN, expanded=False,
         on_toggle=schedule_panel_fit,
     )
-    transit_body = transit_section["body"]
+    run_body = run_section["body"]
 
-    dispatch_row = tk.Frame(transit_body, bg=COLOR_CARD)
-    dispatch_row.pack(fill="x", pady=(0, SPACE_SM))
+    # START/PAUSE share a row, RESET gets its own full-width row below -- a
+    # narrow side pane has no room for all three abreast.
+    controls_row = tk.Frame(run_body, bg=COLOR_CARD)
+    controls_row.pack(fill="x", pady=(0, SPACE_SM))
+    controls_row.grid_columnconfigure(0, weight=1, uniform="run_buttons")
+    controls_row.grid_columnconfigure(1, weight=1, uniform="run_buttons")
 
-    disp_route_box = ttk.Combobox(
-        dispatch_row, values=[r["name"] for r in bus_routes_config.values()],
+    def paint_calibrating():
+        """Repaint START as "Calibrating…" and flush it to the screen.
+
+        START's first job in main.py is a synchronous saturation-flow
+        measurement; the Tk loop is busy for its whole duration, so the
+        100 ms status poller below cannot repaint until it ends. Painting
+        here, in the click handler, is the only way the operator sees the
+        button change the moment they press it.
+        """
+        start_stop_btn.config(
+            text=f"{SYM_HOURGLASS}  Calibrating…", bg=COLOR_WARNING, fg=COLOR_BG,
+            activebackground=COLOR_WARNING, activeforeground=COLOR_BG,
+        )
+        dot_lbl.config(fg=COLOR_WARNING)
+        status_text.config(text="Calibrating signal timing…", fg=COLOR_WARNING)
+        root.update_idletasks()
+
+    def toggle_start_stop():
+        if request_start_stop() == "START_REQUESTED":
+            paint_calibrating()
+        write_ai_control()
+
+    start_stop_btn = make_button(
+        controls_row, f"{SYM_PLAY}  Start", "success", toggle_start_stop
+    )
+    start_stop_btn.grid(row=0, column=0, sticky="ew", padx=(0, SPACE_XS))
+
+    def toggle_pause():
+        request_pause_resume()
+
+    pause_btn = make_button(
+        controls_row, f"{SYM_PAUSE}  Pause", "neutral", toggle_pause
+    )
+    pause_btn.grid(row=0, column=1, sticky="ew", padx=(SPACE_XS, 0))
+
+    def trigger_reset():
+        global_config["reset_triggered"] = True
+
+    reset_btn = make_button(
+        run_body, f"{SYM_RESET}  Reset vehicles", "neutral", trigger_reset,
+        fg=COLOR_DANGER, activeforeground=COLOR_DANGER,
+    )
+    reset_btn.pack(fill="x", pady=(0, SPACE_MD))
+
+    def update_speed(val):
+        v = float(val)
+        global_config["sim_speed"] = v
+        speed_val_lbl.config(text=f"{v:.1f}x")
+
+    speed_val_lbl, speed_slider = add_slider_row(
+        run_body, "Sim speed", "1.0x", 0.5, 3.0, 1.0, update_speed,
+        step=0.1, style="Global.Horizontal.TScale",
+    )
+
+    # Seed: caption line (label left, seed in effect right) over the entry
+    # and its Set button, the same shape as a slider row.
+    seed_caption = tk.Frame(run_body, bg=COLOR_CARD)
+    seed_caption.pack(fill="x")
+    make_label(seed_caption, "Seed", color=COLOR_TEXT_SECONDARY).pack(side="left")
+    # Persistent readout of the seed actually in effect, so the operator can
+    # confirm it at a glance instead of relying on the transient status line.
+    seed_state_lbl = make_label(seed_caption, "", bold=True, color=COLOR_SUCCESS, anchor="e")
+    seed_state_lbl.pack(side="right")
+
+    seed_row = tk.Frame(run_body, bg=COLOR_CARD)
+    seed_row.pack(fill="x", pady=(0, ROW_GAP))
+    seed_entry = tk.Entry(
+        seed_row, width=8, font=FONT_BODY,
+        bg=COLOR_CARD_ALT, fg=COLOR_TEXT_PRIMARY,
+        insertbackground=COLOR_TEXT_PRIMARY, relief="flat",
+        highlightthickness=1, highlightbackground=COLOR_CARD_BORDER,
+        highlightcolor=COLOR_ACCENT,
+    )
+    configured_seed = global_config.get("random_seed")
+    if configured_seed is not None:
+        seed_entry.insert(0, str(configured_seed))
+    seed_entry.pack(side="left", fill="x", expand=True, padx=(0, SPACE_XS), ipady=3)
+
+    def apply_seed_from_entry(_event=None):
+        try:
+            seed = set_random_seed(seed_entry.get())
+        except (TypeError, ValueError):
+            status_text.config(text="Seed must be an integer", fg=COLOR_DANGER)
+            return
+        refresh_seed_state_label()
+        if seed is None:
+            status_text.config(
+                text="Random seed cleared; applies on reset", fg=COLOR_TEXT_SECONDARY
+            )
+        else:
+            status_text.config(
+                text=f"Seed {seed} set; applies on reset", fg=COLOR_SUCCESS
+            )
+
+    seed_btn = make_button(
+        seed_row, "Set", "neutral", apply_seed_from_entry,
+        padx=SPACE_MD, pady=CHIP_PAD_Y,
+    )
+    seed_btn.pack(side="left")
+
+    def refresh_seed_state_label():
+        seed = global_config.get("random_seed")
+        if seed is None:
+            seed_state_lbl.config(text="random", fg=COLOR_TEXT_SECONDARY)
+        else:
+            seed_state_lbl.config(text=f"set to {seed}", fg=COLOR_SUCCESS)
+
+    refresh_seed_state_label()
+    seed_entry.bind("<Return>", apply_seed_from_entry)
+    seed_entry.bind("<FocusOut>", apply_seed_from_entry)
+
+    timing_heading = tk.Frame(run_body, bg=COLOR_CARD)
+    timing_heading.pack(fill="x", pady=(SPACE_SM, SPACE_XS))
+    make_label(
+        timing_heading, "Webster signal timing", bold=True,
+    ).pack(side="left")
+    make_label(
+        timing_heading, "AUTO", bold=True, color=COLOR_TEXT_SECONDARY,
+    ).pack(side="right")
+
+    timing_summary = tk.Frame(
+        run_body, bg=COLOR_CARD_ALT, highlightbackground=COLOR_CARD_BORDER,
+        highlightthickness=1, bd=0,
+    )
+    timing_summary.pack(fill="x")
+
+    webster_status_lbl = make_label(
+        timing_summary,
+        "Timing is calculated automatically when START is pressed.",
+        bold=True, color=COLOR_TEXT_SECONDARY,
+        wraplength=PORTRAIT_WRAP_LENGTH,
+    )
+    webster_status_lbl.pack(fill="x", padx=SPACE_SM, pady=SPACE_SM)
+
+    node_cards = {}
+
+    def add_timing_value_row(parent_widget, label_text):
+        # Label over value: a per-node value like "EW 26.5 s · NS 18.0 s"
+        # needs the full node-card width to stay on one line.
+        row = tk.Frame(parent_widget, bg=COLOR_CARD)
+        row.pack(fill="x", padx=SPACE_SM, pady=(0, SPACE_XS))
+        make_label(row, label_text, color=COLOR_TEXT_SECONDARY).pack(fill="x")
+        value_label = make_label(
+            row, "--", bold=True, color=COLOR_TEXT_PRIMARY,
+            wraplength=PORTRAIT_WRAP_LENGTH - 2 * SPACE_LG,
+        )
+        value_label.pack(fill="x")
+        return value_label
+
+    node_cards_holder = tk.Frame(timing_summary, bg=COLOR_CARD_ALT)
+    node_cards_holder.pack(fill="x", padx=SPACE_SM, pady=(0, SPACE_SM))
+    for node_x, node_name in ((300, "A"), (700, "B")):
+        node_card = tk.Frame(
+            node_cards_holder, bg=COLOR_CARD,
+            highlightbackground=COLOR_CARD_BORDER, highlightthickness=1, bd=0,
+        )
+        node_header = tk.Frame(node_card, bg=COLOR_CARD)
+        node_header.pack(fill="x", padx=SPACE_SM, pady=SPACE_SM)
+        make_label(
+            node_header, f"Node {node_name}  ·  {node_x} px", bold=True,
+        ).pack(side="left")
+        state_label = make_label(
+            node_header, "Waiting", bold=True, color=COLOR_TEXT_SECONDARY,
+        )
+        state_label.pack(side="right")
+        node_cards[node_x] = {
+            "card": node_card,
+            "state": state_label,
+            "cycle": add_timing_value_row(node_card, "Cycle length"),
+            "green": add_timing_value_row(node_card, "Green time"),
+            "ratio": add_timing_value_row(node_card, "Demand ratio"),
+            "note": make_label(
+                node_card, "", bold=True, color=COLOR_DANGER,
+                wraplength=PORTRAIT_WRAP_LENGTH,
+            ),
+        }
+        node_cards[node_x]["note"].pack(
+            fill="x", padx=SPACE_SM, pady=(0, SPACE_SM)
+        )
+        # Cards appear only after calibration has produced node data.
+        node_card.pack_forget()
+
+    def refresh_webster_status():
+        summary = get_webster_timing_summary()
+        state = summary["state"]
+        colour = {
+            "CALIBRATING": COLOR_WARNING,
+            "READY": COLOR_SUCCESS,
+            "OVERSATURATED": COLOR_DANGER,
+        }.get(state, COLOR_TEXT_SECONDARY)
+        webster_status_lbl.config(text=summary["message"], fg=colour)
+
+        visible_positions = set()
+        for node in summary["nodes"]:
+            refs = node_cards[node["position"]]
+            visible_positions.add(node["position"])
+            if not refs["card"].winfo_manager():
+                refs["card"].pack(fill="x", pady=(0, SPACE_SM))
+            if not node["available"]:
+                refs["state"].config(text="Unavailable", fg=COLOR_WARNING)
+                refs["cycle"].config(text="No timing data")
+                refs["green"].config(text="--")
+                refs["ratio"].config(text="--")
+                refs["note"].config(text="")
+                continue
+
+            oversaturated = node["oversaturated"]
+            refs["state"].config(
+                text=node["status"],
+                fg=COLOR_DANGER if oversaturated else COLOR_SUCCESS,
+            )
+            cycle_suffix = "capped" if oversaturated else "optimal"
+            refs["cycle"].config(
+                text=f"{node['cycle_time_sec']:.0f} s  ·  {cycle_suffix}"
+            )
+            refs["green"].config(
+                text=(
+                    f"EW {node['ew_green_sec']:.1f} s  ·  "
+                    f"NS {node['ns_green_sec']:.1f} s"
+                )
+            )
+            refs["ratio"].config(
+                text=(
+                    f"EW {node['ew_ratio']:.2f}  ·  NS {node['ns_ratio']:.2f}  ·  "
+                    f"Total {node['total_ratio']:.2f}"
+                )
+            )
+            refs["note"].config(
+                text=(
+                    "Reduce demand or increase vehicle speed."
+                    if oversaturated else ""
+                )
+            )
+
+        for node_x, refs in node_cards.items():
+            if node_x not in visible_positions and refs["card"].winfo_manager():
+                refs["card"].pack_forget()
+        root.after(150, refresh_webster_status)
+
+    root.after(150, refresh_webster_status)
+
+    # 5. BENCHMARK TEST ----------------------------------------------------
+    test_section = make_section(
+        root, "Benchmark Test", accent=SECTION_ACCENT_RUN, expanded=False,
+        on_toggle=schedule_panel_fit,
+    )
+    test_body = test_section["body"]
+
+    # Caption line (label left, countdown right) over the duration selector,
+    # the same shape as a slider row.
+    duration_caption = tk.Frame(test_body, bg=COLOR_CARD)
+    duration_caption.pack(fill="x")
+    make_label(duration_caption, "Duration", color=COLOR_TEXT_SECONDARY).pack(side="left")
+    countdown_lbl = make_label(
+        duration_caption, "--:--", bold=True, color=COLOR_TEXT_SECONDARY,
+        # Reserve the longest runtime state ("00:00 PAUSED") up front. Without
+        # this width, Tk sizes the benchmark card for "--:--" and clips the
+        # countdown when the label grows after a test starts.
+        width=BENCHMARK_COUNTDOWN_WIDTH, anchor="e",
+    )
+    countdown_lbl.pack(side="right")
+    test_duration_box = ttk.Combobox(
+        test_body, values=list(TEST_DURATIONS),
         state="readonly", style="Modern.TCombobox", font=FONT_BODY,
     )
-    disp_route_box.set(bus_routes_config["R1_EB_A_NB"]["name"])
-    disp_route_box.pack(side="left", fill="x", expand=True, padx=(0, SPACE_SM))
+    test_duration_box.pack(fill="x", pady=(0, ROW_GAP))
 
-    def trigger_manual_dispatch():
-        selected_name = disp_route_box.get()
-        for r_id, r_cfg in bus_routes_config.items():
-            if r_cfg["name"] == selected_name:
-                if r_cfg["active"]:
-                    r_cfg["manual_dispatch"] = True
-                break
+    def refresh_test_countdown():
+        if global_config.get("test_running", False):
+            remaining = format_test_countdown(
+                global_config.get("test_duration_sim_seconds"),
+                global_config.get("sim_time_seconds", 0.0),
+            )
+            if remaining is not None:
+                paused = bool(global_config.get("is_paused", False))
+                countdown_lbl.config(
+                    text=f"{remaining} PAUSED" if paused else remaining,
+                    fg=COLOR_WARNING if paused else COLOR_SUCCESS,
+                )
+            else:
+                countdown_lbl.config(text="--:--", fg=COLOR_TEXT_SECONDARY)
+        elif global_config.get("test_last_export"):
+            countdown_lbl.config(text="00:00", fg=COLOR_ACCENT)
+        else:
+            countdown_lbl.config(text="--:--", fg=COLOR_TEXT_SECONDARY)
+        root.after(200, refresh_test_countdown)
 
-    manual_btn = make_button(
-        dispatch_row, "Dispatch now", "warning", trigger_manual_dispatch
+    root.after(200, refresh_test_countdown)
+
+    def on_test_duration_selected(_event=None):
+        global_config["test_duration_sim_seconds"] = TEST_DURATIONS.get(
+            test_duration_box.get()
+        )
+        refresh_batch_preview()
+
+    test_duration_box.bind("<<ComboboxSelected>>", on_test_duration_selected)
+
+    def start_test():
+        if request_start_test() is None:
+            status_text.config(text="Select duration first", fg=COLOR_WARNING)
+            return
+        # A test starts through the same START path, so it calibrates too.
+        paint_calibrating()
+        write_ai_control()
+
+    start_test_btn = make_button(test_body, "Start test", "warning", start_test)
+    start_test_btn.pack(fill="x", pady=(SPACE_XS, 0))
+
+    # --- Batch Benchmark Runner: its own card ------------------------------
+    # Chains request_start_test() across every (model x seed) combination at
+    # this same duration, unattended. Regime (demand/headway/speed) is never
+    # touched here -- only seed and model vary between queued runs. Kept as
+    # a separate section (rather than living inside Benchmark Test) since it
+    # is a distinct tool with its own inputs -- Start test still runs the one
+    # model/seed already selected elsewhere in the panel.
+    batch_section = make_section(
+        root, "Batch Benchmark", accent=SECTION_ACCENT_RUN, expanded=False,
+        on_toggle=schedule_panel_fit,
     )
-    manual_btn.pack(side="left")
+    batch_body = batch_section["body"]
 
-    # One stacked card per route. Row 1 = name + ON/OFF chip, row 2 = headway
-    # slider, row 3 = the TSP and DBL chips as two equal halves. Every
-    # callback and bus_routes_config key is the same as before.
-    for r_id, r_cfg in bus_routes_config.items():
-        row_frame = tk.Frame(
-            transit_body, bg=COLOR_CARD_ALT, highlightbackground=COLOR_CARD_BORDER,
-            highlightthickness=1, bd=0,
-        )
-        row_frame.pack(fill="x", pady=(0, SPACE_SM))
-        inner = tk.Frame(row_frame, bg=COLOR_CARD_ALT)
-        inner.pack(fill="x", padx=SPACE_SM, pady=SPACE_SM)
-
-        name_row = tk.Frame(inner, bg=COLOR_CARD_ALT)
-        name_row.pack(fill="x", pady=(0, ROW_GAP))
-        make_label(name_row, r_cfg["name"], bold=True).pack(
-            side="left", fill="x", expand=True
-        )
-
-        def make_route_toggle(key, btn):
-            def toggle():
-                bus_routes_config[key]["active"] = not bus_routes_config[key]["active"]
-                act = bus_routes_config[key]["active"]
-                paint_toggle_chip(btn, act, COLOR_SUCCESS, "ON", "OFF")
-                if not act:
-                    bus_routes_config[key]["manual_dispatch"] = False
-            return toggle
-
-        t_btn = make_toggle_chip(
-            name_row, r_cfg["active"], COLOR_SUCCESS, "ON", "OFF", width=4
-        )
-        t_btn.config(command=make_route_toggle(r_id, t_btn))
-        t_btn.pack(side="right")
-
-        def make_hw_slider(key, lbl):
-            def update(val):
-                sec = int(float(val))
-                bus_routes_config[key]["headway_sec"] = sec
-                lbl.config(text=f"{sec}s" if sec > 0 else "OFF")
-            return update
-
-        hw_val_lbl, hw_slider = add_slider_row(
-            inner, "Headway", f"{r_cfg['headway_sec']}s", 0, 90,
-            r_cfg["headway_sec"], None, step=1, style="Modern.Horizontal.TScale",
-        )
-        hw_slider.config(command=make_hw_slider(r_id, hw_val_lbl))
-
-        flags_row = tk.Frame(inner, bg=COLOR_CARD_ALT)
-        flags_row.pack(fill="x")
-        flags_row.grid_columnconfigure(0, weight=1, uniform="route_flags")
-        flags_row.grid_columnconfigure(1, weight=1, uniform="route_flags")
-
-        def make_tsp_toggle(key, btn):
-            def toggle():
-                bus_routes_config[key]["tsp_enabled"] = not bus_routes_config[key]["tsp_enabled"]
-                paint_toggle_chip(
-                    btn, bus_routes_config[key]["tsp_enabled"],
-                    COLOR_SUCCESS, "TSP ON", "TSP OFF",
-                )
-            return toggle
-
-        tsp_btn = make_toggle_chip(
-            flags_row, r_cfg["tsp_enabled"], COLOR_SUCCESS, "TSP ON", "TSP OFF"
-        )
-        tsp_btn.config(command=make_tsp_toggle(r_id, tsp_btn))
-        tsp_btn.grid(row=0, column=0, sticky="ew", padx=(0, SPACE_XS))
-
-        def make_dbl_toggle(key, btn):
-            def toggle():
-                bus_routes_config[key]["dbl_enabled"] = not bus_routes_config[key]["dbl_enabled"]
-                paint_toggle_chip(
-                    btn, bus_routes_config[key]["dbl_enabled"],
-                    COLOR_ACCENT, "DBL ON", "DBL OFF",
-                )
-            return toggle
-
-        dbl_btn = make_toggle_chip(
-            flags_row, r_cfg["dbl_enabled"], COLOR_ACCENT, "DBL ON", "DBL OFF"
-        )
-        dbl_btn.config(command=make_dbl_toggle(r_id, dbl_btn))
-        dbl_btn.grid(row=0, column=1, sticky="ew", padx=(SPACE_XS, 0))
-        route_flag_buttons[r_id] = {"tsp": tsp_btn, "dbl": dbl_btn}
-
-    # 8. PER-APPROACH TRAFFIC ----------------------------------------------
-    approaches_section = make_section(
-        root, "Approach Traffic", expanded=False, on_toggle=schedule_panel_fit
+    seed_list_row = add_labeled_row(batch_body, "Seeds")
+    batch_seed_entry = tk.Entry(
+        seed_list_row, font=FONT_BODY, bg=COLOR_CARD_ALT, fg=COLOR_TEXT_PRIMARY,
+        insertbackground=COLOR_TEXT_PRIMARY, relief="flat",
     )
-    approaches_body = approaches_section["body"]
+    batch_seed_entry.pack(side="left", fill="x", expand=True)
 
-    # One stacked card per approach. Row 1 = name + ON/OFF chip, row 2 =
-    # generation model, then one slider row each for inflow, straight % and
-    # trucks %. Same callbacks and approach_configs keys as before.
-    for key, name in APPROACH_NAMES.items():
-        card = tk.Frame(
-            approaches_body, bg=COLOR_CARD_ALT, highlightbackground=COLOR_CARD_BORDER,
-            highlightthickness=1, bd=0,
+    batch_seed_status_lbl = make_label(
+        batch_body, "e.g. 42,43,44 or 42-46 or 42,45-47,50",
+        color=COLOR_TEXT_SECONDARY, wraplength=PORTRAIT_WRAP_LENGTH,
+    )
+    batch_seed_status_lbl.pack(fill="x", pady=(0, SPACE_XS))
+
+    # Selections persist while the panel stays open, per the spec.
+    batch_selected_models = []
+
+    model_picker_row = tk.Frame(batch_body, bg=COLOR_CARD)
+    model_picker_row.pack(fill="x", pady=(0, SPACE_XS))
+
+    model_count_lbl = make_label(
+        model_picker_row, "0 selected", color=COLOR_TEXT_SECONDARY, anchor="e"
+    )
+
+    def open_model_picker():
+        choices = get_batch_model_choices()
+        picker = tk.Toplevel(root)
+        picker.title("Select batch models")
+        picker.configure(bg=COLOR_CARD)
+        picker.transient(root)
+
+        vars_by_model = {}
+        for choice in choices:
+            var = tk.BooleanVar(value=choice in batch_selected_models)
+            vars_by_model[choice] = var
+            tk.Checkbutton(
+                picker, text=choice, variable=var, anchor="w",
+                bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY, selectcolor=COLOR_CARD_ALT,
+                activebackground=COLOR_CARD, activeforeground=COLOR_TEXT_PRIMARY,
+                font=FONT_BODY, highlightthickness=0,
+            ).pack(fill="x", anchor="w", padx=SPACE_MD, pady=2)
+
+        def apply_and_close():
+            batch_selected_models[:] = [
+                model for model, var in vars_by_model.items() if var.get()
+            ]
+            model_count_lbl.config(text=f"{len(batch_selected_models)} selected")
+            refresh_batch_preview()
+            picker.destroy()
+
+        make_button(picker, "Done", "primary", apply_and_close).pack(
+            fill="x", padx=SPACE_MD, pady=SPACE_MD
         )
-        card.pack(fill="x", pady=(0, SPACE_SM))
-        inner = tk.Frame(card, bg=COLOR_CARD_ALT)
-        inner.pack(fill="x", padx=SPACE_SM, pady=SPACE_SM)
 
-        name_row = tk.Frame(inner, bg=COLOR_CARD_ALT)
-        name_row.pack(fill="x", pady=(0, ROW_GAP))
-        make_label(name_row, name, bold=True).pack(side="left", fill="x", expand=True)
+    model_picker_btn = make_button(
+        model_picker_row, "Select models…", "neutral", open_model_picker
+    )
+    model_picker_btn.pack(side="left")
+    model_count_lbl.pack(side="right", fill="x", expand=True, padx=(SPACE_SM, 0))
 
-        def make_toggle(k, btn):
-            def toggle():
-                approach_configs[k]["active"] = not approach_configs[k]["active"]
-                paint_toggle_chip(
-                    btn, approach_configs[k]["active"], COLOR_SUCCESS, "ON", "OFF"
+    batch_preview_lbl = make_label(
+        batch_body, "", color=COLOR_TEXT_SECONDARY,
+        wraplength=PORTRAIT_WRAP_LENGTH, justify="left",
+    )
+    batch_preview_lbl.pack(fill="x", pady=(SPACE_XS, SPACE_XS))
+
+    def batch_can_run():
+        seeds, error = batch_runner.parse_seed_list(batch_seed_entry.get())
+        return (
+            not error and bool(seeds) and bool(batch_selected_models)
+            and bool(global_config.get("test_duration_sim_seconds"))
+        )
+
+    def batch_checkpoint_marks():
+        # Lazy import: main.py (the composition root) imports control_panel
+        # at module load time, so importing main back here at call time --
+        # long after both modules have finished loading -- reuses its single
+        # source of truth for the checkpoint schedule without a load-time
+        # circular import.
+        try:
+            import main
+            return main.CHECKPOINT_MARKS_SEC
+        except Exception:
+            return batch_runner.DEFAULT_CHECKPOINT_MARKS_SEC
+
+    def refresh_batch_preview(*_args):
+        seeds, error = batch_runner.parse_seed_list(batch_seed_entry.get())
+        if error:
+            batch_seed_status_lbl.config(text=error, fg=COLOR_DANGER)
+            seeds = []
+        else:
+            batch_seed_status_lbl.config(
+                text=batch_runner.describe_seeds(seeds), fg=COLOR_TEXT_SECONDARY
+            )
+        duration = global_config.get("test_duration_sim_seconds")
+        preview = batch_runner.compute_batch_preview(
+            model_count=len(batch_selected_models),
+            seed_count=len(seeds),
+            duration_sim_seconds=duration,
+            duration_label=test_duration_box.get(),
+            checkpoint_marks_sec=batch_checkpoint_marks(),
+            sim_speed=global_config.get("sim_speed", 1.0),
+        )
+        batch_preview_lbl.config(text=preview["text"])
+        if not global_config.get("batch_runtime", {}).get("active", False):
+            set_batch_button_enabled(
+                run_batch_btn, batch_can_run(), COLOR_WARNING, COLOR_BG
+            )
+
+    batch_seed_entry.bind("<KeyRelease>", refresh_batch_preview)
+
+    batch_buttons_row = tk.Frame(batch_body, bg=COLOR_CARD)
+    batch_buttons_row.pack(fill="x", pady=(0, SPACE_XS))
+
+    def on_run_batch():
+        seeds, error = batch_runner.parse_seed_list(batch_seed_entry.get())
+        if error or not seeds or not batch_selected_models:
+            return
+        request_start_batch(list(batch_selected_models), seeds)
+        refresh_batch_preview()
+
+    def on_stop_batch():
+        request_stop_batch()
+
+    run_batch_btn = make_button(
+        batch_buttons_row, "Run batch", "warning", on_run_batch
+    )
+    run_batch_btn.pack(side="left", fill="x", expand=True, padx=(0, SPACE_XS))
+
+    stop_batch_btn = make_button(
+        batch_buttons_row, "Stop batch", "danger", on_stop_batch
+    )
+    stop_batch_btn.pack(side="left", fill="x", expand=True)
+
+    # tk.Button's own "disabled" state leaves the filled warning/danger
+    # background in place and only swaps the text colour, which reads as
+    # grey-on-amber / grey-on-red -- unreadable. Repaint bg+fg explicitly to
+    # a neutral card colour when disabled instead, the same way pause_btn
+    # and start_stop_btn already do above.
+    def set_batch_button_enabled(button, enabled, on_bg, on_fg):
+        if enabled:
+            button.config(
+                state="normal", bg=on_bg, fg=on_fg,
+                activebackground=on_bg, activeforeground=on_fg,
+            )
+        else:
+            button.config(
+                state="disabled", bg=COLOR_CARD_ALT, fg=COLOR_TEXT_SECONDARY,
+                activebackground=COLOR_CARD_ALT, activeforeground=COLOR_TEXT_SECONDARY,
+            )
+
+    set_batch_button_enabled(run_batch_btn, False, COLOR_WARNING, COLOR_BG)
+    set_batch_button_enabled(stop_batch_btn, False, COLOR_DANGER, COLOR_TEXT_PRIMARY)
+
+    batch_progress_lbl = make_label(
+        batch_body, "", bold=True, color=COLOR_TEXT_SECONDARY,
+        wraplength=PORTRAIT_WRAP_LENGTH,
+    )
+    batch_progress_lbl.pack(fill="x", pady=(SPACE_XS, 0))
+
+    # width=1: a Text's default 80-character request would otherwise be the
+    # widest thing in the column and force the whole card past the pane;
+    # fill="x" below stretches it to the card instead.
+    batch_log_text = tk.Text(
+        batch_body, width=1, height=5, bg=COLOR_CARD_ALT, fg=COLOR_TEXT_PRIMARY,
+        font=FONT_BODY, relief="flat", state="disabled", wrap="word",
+        highlightthickness=0, bd=0,
+    )
+    batch_log_text.pack(fill="x", pady=(SPACE_XS, 0))
+
+    def refresh_batch_status():
+        runtime = global_config.get("batch_runtime", DEFAULT_BATCH_RUNTIME)
+        active = bool(runtime.get("active", False))
+        current = runtime.get("current")
+        total = int(runtime.get("total", 0))
+        results = runtime.get("results", [])
+
+        set_batch_button_enabled(stop_batch_btn, active, COLOR_DANGER, COLOR_TEXT_PRIMARY)
+        set_batch_button_enabled(
+            run_batch_btn, (not active) and batch_can_run(), COLOR_WARNING, COLOR_BG
+        )
+
+        if active and current:
+            batch_progress_lbl.config(
+                text=(
+                    f"Run {len(results) + 1}/{total}: {current.get('model')} "
+                    f"seed {current.get('seed')} — running…"
+                ),
+                fg=COLOR_WARNING,
+            )
+        elif active:
+            batch_progress_lbl.config(
+                text=f"Batch: {len(results)}/{total} complete", fg=COLOR_WARNING
+            )
+        elif results:
+            completed = sum(1 for row in results if row.get("status") == "COMPLETED")
+            failed = sum(1 for row in results if row.get("status") == "FAILED")
+            skipped = sum(1 for row in results if row.get("status") == "SKIPPED")
+            batch_progress_lbl.config(
+                text=(
+                    f"Batch finished: {completed} completed, "
+                    f"{failed} failed, {skipped} skipped"
+                ),
+                fg=COLOR_SUCCESS,
+            )
+        else:
+            batch_progress_lbl.config(text="", fg=COLOR_TEXT_SECONDARY)
+
+        batch_log_text.config(state="normal")
+        batch_log_text.delete("1.0", "end")
+        for row in results[-30:]:
+            line = f"[{row.get('status')}] {row.get('model')} seed {row.get('seed')}"
+            if row.get("reason"):
+                line += f" — {row['reason']}"
+            batch_log_text.insert("end", line + "\n")
+        batch_log_text.config(state="disabled")
+
+        root.after(300, refresh_batch_status)
+
+    root.after(300, refresh_batch_status)
+    refresh_batch_preview()
+
+    def refresh_simulation_status():
+        running = bool(global_config.get("is_running", False))
+        starting = bool(global_config.get("start_requested", False))
+        calibrating = bool(global_config.get("calibrating", False))
+        paused = bool(global_config.get("is_paused", False))
+        testing = bool(global_config.get("test_running", False))
+        if starting or calibrating:
+            # START is measuring saturation flow; nothing else has begun.
+            paint_calibrating()
+            pause_btn.config(
+                state="disabled", text=f"{SYM_PAUSE}  Pause",
+                bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY,
+            )
+        elif running:
+            start_stop_btn.config(
+                text=f"{SYM_STOP}  Stop", bg=COLOR_DANGER,
+                fg=COLOR_TEXT_PRIMARY, activeforeground=COLOR_TEXT_PRIMARY,
+            )
+            pause_btn.config(state="normal")
+            if paused:
+                pause_btn.config(
+                    text=f"{SYM_PLAY}  Resume", bg=COLOR_SUCCESS, fg=COLOR_BG
                 )
-            return toggle
+                dot_lbl.config(fg=COLOR_WARNING)
+                status_text.config(text="Paused", fg=COLOR_WARNING)
+            elif testing:
+                pause_btn.config(
+                    text=f"{SYM_PAUSE}  Pause", bg=COLOR_CARD,
+                    fg=COLOR_TEXT_PRIMARY,
+                )
+                dot_lbl.config(fg=COLOR_SUCCESS)
+                duration = global_config.get("test_duration_sim_seconds")
+                duration_label = next(
+                    (
+                        label
+                        for label, seconds in TEST_DURATIONS.items()
+                        if seconds == duration
+                    ),
+                    f"{int(duration) // 60} min" if duration else "?",
+                )
+                status_text.config(
+                    text=(
+                        f"Test running: {global_config.get('test_model', 'None')}"
+                        f" for {duration_label}"
+                    ),
+                    fg=COLOR_SUCCESS,
+                )
+            else:
+                pause_btn.config(
+                    text=f"{SYM_PAUSE}  Pause", bg=COLOR_CARD,
+                    fg=COLOR_TEXT_PRIMARY,
+                )
+                dot_lbl.config(fg=COLOR_SUCCESS)
+                status_text.config(text="Running", fg=COLOR_SUCCESS)
+        else:
+            start_stop_btn.config(
+                text=f"{SYM_PLAY}  Start", bg=COLOR_SUCCESS,
+                fg=COLOR_BG, activeforeground=COLOR_BG,
+            )
+            pause_btn.config(
+                state="disabled", text=f"{SYM_PAUSE}  Pause",
+                bg=COLOR_CARD, fg=COLOR_TEXT_SECONDARY,
+            )
+            dot_lbl.config(fg=COLOR_TEXT_SECONDARY)
+            if global_config.get("test_last_export"):
+                status_text.config(
+                    text=(
+                        "Test complete — exported "
+                        f"{global_config['test_last_export']}"
+                    ),
+                    fg=COLOR_SUCCESS,
+                )
+            elif global_config.get("run_has_started", False):
+                status_text.config(
+                    text="Stopped — export or START new run",
+                    fg=COLOR_TEXT_SECONDARY,
+                )
+            else:
+                status_text.config(
+                    text="Idle — press START", fg=COLOR_TEXT_SECONDARY
+                )
+        refresh_seed_state_label()
+        root.after(100, refresh_simulation_status)
 
-        t_btn = make_toggle_chip(
-            name_row, approach_configs[key]["active"], COLOR_SUCCESS, "ON", "OFF",
-            width=4,
+    root.after(100, refresh_simulation_status)
+
+    # 7. MOTION / PRIORITY TUNING -----------------------------------------
+    tuning_section = make_section(
+        root, "Tuning", accent=SECTION_ACCENT_INTERVENTION, expanded=False,
+        on_toggle=schedule_panel_fit,
+    )
+    tuning_body = tuning_section["body"]
+
+    def update_priority_eligibility(value):
+        pixels = set_priority_eligibility_px(value)
+        eligibility_value.config(text=f"{pixels} px")
+
+    eligibility_value, eligibility_slider = add_slider_row(
+        tuning_body, "Eligibility zone",
+        f"{global_config['priority_eligibility_px']} px",
+        250, 800, global_config["priority_eligibility_px"],
+        update_priority_eligibility, step=10, style="Global.Horizontal.TScale",
+    )
+
+    def update_vehicle_scale(value):
+        scale = set_vehicle_speed_scale(value)
+        vehicle_scale_value.config(text=f"{scale:.2f}x")
+
+    vehicle_scale_value, vehicle_scale_slider = add_slider_row(
+        tuning_body, "Vehicle speed",
+        f"{global_config['vehicle_speed_scale']:.2f}x",
+        0.25, 1.0, global_config["vehicle_speed_scale"],
+        update_vehicle_scale, step=0.05, style="Global.Horizontal.TScale",
+    )
+
+    make_label(
+        tuning_body, "Applies on next START / RESET", color=COLOR_TEXT_SECONDARY,
+    ).pack(fill="x")
+
+    # 8. NETWORK GRIDLOCK RECOVERY ----------------------------------------
+    recovery_section = make_section(
+        root, "Gridlock Discharge", accent=SECTION_ACCENT_INTERVENTION, expanded=False,
+        on_toggle=schedule_panel_fit,
+    )
+    recovery_body = recovery_section["body"]
+
+    # Label over the selector: "Auto (Recommended)" needs the full column.
+    make_label(recovery_body, "Corridor", color=COLOR_TEXT_SECONDARY).pack(fill="x")
+    discharge_mode_box = ttk.Combobox(
+        recovery_body,
+        values=list(DISCHARGE_OPTIONS),
+        state="readonly",
+        style="Modern.TCombobox", font=FONT_BODY,
+    )
+    discharge_mode_box.set(global_config["discharge_selection"])
+    discharge_mode_box.pack(fill="x")
+
+    # The two actions stack under the corridor selector: "Start discharge"
+    # does not fit half of this column.
+    recovery_actions = tk.Frame(recovery_body, bg=COLOR_CARD)
+    recovery_actions.pack(fill="x", pady=(SPACE_XS, SPACE_SM))
+
+    def on_discharge_mode_selected(event):
+        global_config["discharge_selection"] = discharge_mode_box.get()
+
+    discharge_mode_box.bind(
+        "<<ComboboxSelected>>", on_discharge_mode_selected
+    )
+
+    def start_discharge():
+        selected = discharge_mode_box.get()
+        if selected not in DISCHARGE_OPTIONS:
+            selected = DISCHARGE_AUTO
+            discharge_mode_box.set(selected)
+        global_config["discharge_selection"] = selected
+        global_config["discharge_stop_requested"] = False
+        global_config["discharge_start_requested"] = True
+        runtime = global_config.setdefault("discharge_runtime", {})
+        runtime.update(
+            {
+                "selected": selected,
+                "status": "REQUESTED",
+                "reason": "Waiting for the simulation controller",
+                "recommendation": "Recovery will begin with a safe transition",
+            }
         )
-        t_btn.config(command=make_toggle(key, t_btn))
-        t_btn.pack(side="right")
 
-        model_row = add_labeled_row(inner, "Model")
-        model_box = ttk.Combobox(
-            model_row,
-            values=[
-                "Random",
-                "Poisson",
-                "Binomial",
-                "Neg Binomial",
-                "Congestion Peak",
-            ],
-            state="readonly",
-            style="Modern.TCombobox", font=FONT_BODY,
+    start_discharge_btn = make_button(
+        recovery_actions, "Start discharge", "danger", start_discharge
+    )
+    start_discharge_btn.pack(fill="x", pady=(0, ROW_GAP))
+
+    def safe_stop_discharge():
+        global_config["discharge_start_requested"] = False
+        global_config["discharge_stop_requested"] = True
+
+    stop_discharge_btn = make_button(
+        recovery_actions, "Safe stop", "neutral", safe_stop_discharge
+    )
+    stop_discharge_btn.pack(fill="x")
+
+    recovery_status = tk.Frame(recovery_body, bg=COLOR_CARD_ALT)
+    recovery_status.pack(fill="x")
+    discharge_status_lbl = make_label(
+        recovery_status, "Selected: Auto (Recommended)  |  Status: IDLE",
+        bold=True, color=COLOR_TEXT_SECONDARY, wraplength=PORTRAIT_WRAP_LENGTH,
+    )
+    discharge_status_lbl.pack(fill="x", padx=SPACE_SM, pady=(SPACE_XS, 0))
+    discharge_reason_lbl = make_label(
+        recovery_status, "Reason: Normal signal control is active",
+        wraplength=PORTRAIT_WRAP_LENGTH,
+    )
+    discharge_reason_lbl.pack(fill="x", padx=SPACE_SM)
+    discharge_recommendation_lbl = make_label(
+        recovery_status,
+        "Recommended first action: Select Auto or a corridor, then start discharge",
+        color=COLOR_WARNING, wraplength=PORTRAIT_WRAP_LENGTH,
+    )
+    discharge_recommendation_lbl.pack(fill="x", padx=SPACE_SM, pady=(0, SPACE_XS))
+
+    def refresh_discharge_status():
+        runtime = global_config.get("discharge_runtime", {})
+        selected = runtime.get(
+            "selected", global_config.get("discharge_selection", DISCHARGE_AUTO)
         )
-        model_box.set(approach_configs[key]["model"])
-        model_box.pack(side="left", fill="x", expand=True)
-
-        def make_model_change(k, box):
-            def change(event):
-                approach_configs[k]["model"] = box.get()
-            return change
-        model_box.bind("<<ComboboxSelected>>", make_model_change(key, model_box))
-
-        def make_rate_slider(k, lbl):
-            def update(val):
-                v = int(float(val))
-                approach_configs[k]["rate"] = v
-                lbl.config(text=f"{v} v/m")
-            return update
-
-        rate_val, rate_slider = add_slider_row(
-            inner, "Inflow", f"{approach_configs[key]['rate']} v/m", 1, 30,
-            approach_configs[key]["rate"], None, step=1,
-            style="Modern.Horizontal.TScale",
+        status = runtime.get("status", "IDLE")
+        stage = runtime.get("stage", "")
+        reason = runtime.get("reason", "Normal signal control is active")
+        recommendation = runtime.get(
+            "recommendation", "Select Auto or a corridor, then start discharge"
         )
-        rate_slider.config(command=make_rate_slider(key, rate_val))
-
-        def make_split_slider(k, lbl):
-            def update(val):
-                v_f = float(val) / 100.0
-                approach_configs[k]["turn_split"] = v_f
-                lbl.config(text=f"{int(v_f*100)}%")
-            return update
-
-        split_val, split_slider = add_slider_row(
-            inner, "Straight", f"{int(approach_configs[key]['turn_split']*100)}%",
-            0, 100, int(approach_configs[key]["turn_split"] * 100), None, step=1,
-            style="Modern.Horizontal.TScale",
+        discharged = int(runtime.get("vehicles_discharged", 0))
+        status_color = {
+            "DISCHARGING": COLOR_SUCCESS,
+            "WAITING": COLOR_WARNING,
+            "REQUESTED": COLOR_WARNING,
+            "TRANSITIONING": COLOR_WARNING,
+            "STOPPING": COLOR_WARNING,
+            "COMPLETED": COLOR_SUCCESS,
+        }.get(status, COLOR_TEXT_SECONDARY)
+        status_text_value = f"Selected: {selected}  |  Status: {status}"
+        if stage:
+            status_text_value += f"  |  Stage: {stage}"
+        if discharged:
+            status_text_value += f"  |  Discharged: {discharged}"
+        discharge_status_lbl.config(text=status_text_value, fg=status_color)
+        discharge_reason_lbl.config(text=f"Reason: {reason}")
+        discharge_recommendation_lbl.config(
+            text=f"Recommended first action: {recommendation}"
         )
-        split_slider.config(command=make_split_slider(key, split_val))
+        root.after(250, refresh_discharge_status)
 
-        def make_heavy_slider(k, lbl):
-            def update(val):
-                v_f = float(val) / 100.0
-                approach_configs[k]["heavy_ratio"] = v_f
-                lbl.config(text=f"{int(v_f*100)}%")
-            return update
-
-        heavy_val, heavy_slider = add_slider_row(
-            inner, "Trucks", f"{int(approach_configs[key]['heavy_ratio']*100)}%",
-            0, 50, int(approach_configs[key]["heavy_ratio"] * 100), None, step=1,
-            style="Modern.Horizontal.TScale",
-        )
-        heavy_slider.config(command=make_heavy_slider(key, heavy_val))
+    root.after(250, refresh_discharge_status)
 
     # Collapsed sections keep every widget alive with its value and callback;
     # only the body frames are unmapped.

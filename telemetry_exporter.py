@@ -198,6 +198,16 @@ class TelemetryExporter:
         )
         stopped_frames = int(throughput_state.get("stopped_vehicle_frames", 0) or 0)
         vehicles_served = int(throughput_state.get("vehicles_served_total", 0) or 0)
+        bus_delay_frames = int(
+            throughput_state.get("bus_passenger_delay_frames", 0) or 0
+        )
+        car_delay_frames = int(
+            throughput_state.get("car_passenger_delay_frames", 0) or 0
+        )
+        bus_pax_served = int(throughput_state.get("passengers_served_bus", 0) or 0)
+        car_pax_served = int(throughput_state.get("passengers_served_car", 0) or 0)
+        bus_passenger_delay_sec = round(bus_delay_frames / 60.0, 1)
+        car_passenger_delay_sec = round(car_delay_frames / 60.0, 1)
         buses = [
             self._bus_state(vehicle, signal_controller)
             for vehicle in vehicles
@@ -399,6 +409,30 @@ class TelemetryExporter:
                 "mean_stopped_delay_sec_per_vehicle": (
                     round(stopped_frames / 60.0 / vehicles_served, 2)
                     if vehicles_served else None
+                ),
+            },
+            # Passenger-weighted delay, split bus vs car/truck: the standard
+            # transit-priority metric (occupancy x wait), since a bus and a
+            # car waiting the same time do not cost passengers the same.
+            "delay": {
+                "bus_passenger_delay_sec": bus_passenger_delay_sec,
+                "car_passenger_delay_sec": car_passenger_delay_sec,
+                "mean_bus_passenger_delay_sec": (
+                    round(bus_passenger_delay_sec / bus_pax_served, 2)
+                    if bus_pax_served else None
+                ),
+                "mean_car_passenger_delay_sec": (
+                    round(car_passenger_delay_sec / car_pax_served, 2)
+                    if car_pax_served else None
+                ),
+                "total_person_hours_delay": round(
+                    (bus_passenger_delay_sec + car_passenger_delay_sec) / 3600.0, 4
+                ),
+                "bus_person_hours_delay": round(
+                    bus_passenger_delay_sec / 3600.0, 4
+                ),
+                "car_person_hours_delay": round(
+                    car_passenger_delay_sec / 3600.0, 4
                 ),
             },
             "demand_generation": demand_state,

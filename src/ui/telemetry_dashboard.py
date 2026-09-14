@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import re
 import subprocess
 import threading
@@ -13,7 +14,13 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from . import control_panel
+# Running this file directly (python src/.../x.py, or the IDE Run button) puts
+# its own folder on sys.path instead of the repo root; put the root back so
+# the src.* imports below resolve the same way they do under run.py / -m.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from src.ui import control_panel
 from src.telemetry import real_world_units
 from src.core.guard import ROUTE_ORDER
 

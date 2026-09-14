@@ -7,7 +7,7 @@ from typing import Any
 
 from src.ui import control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
-from .vehicle import Bus, DBL_LANE_INDEX
+from src.core.vehicle import Bus, DBL_LANE_INDEX
 
 RED = "RED"
 YELLOW = "YELLOW"

@@ -5,14 +5,21 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 import queue
 import tempfile
 import threading
 import time
 from typing import TypedDict
 
+# Running this file directly (python src/.../x.py, or the IDE Run button) puts
+# its own folder on sys.path instead of the repo root; put the root back so
+# the src.* imports below resolve the same way they do under run.py / -m.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from src.core import guard
-from . import rule_controller
+from src.agents import rule_controller
 
 try:
     import ollama

@@ -76,7 +76,7 @@ def _agent_module():
     main_module = sys.modules.get("__main__")
     if str(getattr(main_module, "__file__", "")).endswith("agent.py"):
         return main_module
-    from . import agent
+    from src.agents import agent
 
     return agent
 

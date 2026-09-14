@@ -11,13 +11,19 @@ import time
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
+# Running this file directly (python src/.../x.py, or the IDE Run button) puts
+# its own folder on sys.path instead of the repo root; put the root back so
+# the src.* imports below resolve the same way they do under run.py / -m.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from src.ui import canvas_gemini as canvas
 from src.ui import control_panel
-from . import guard
-from . import webster
+from src.core import guard
+from src.core import webster
 from src.experiments import batch_runner
-from .vehicle import Vehicle, Bus
-from .signal_controller import SignalController
+from src.core.vehicle import Vehicle, Bus
+from src.core.signal_controller import SignalController
 from src.ui.telemetry_dashboard import TelemetryDashboard, build_excel_export_filename
 from src.telemetry.telemetry_exporter import TelemetryExporter
 from src.telemetry.bus_event_log import BusEventTracker, write_bus_events_sheet
@@ -1377,7 +1383,7 @@ def calibrate_saturation_flow(
     behind; the caller re-seeds traffic generation afterwards so the measured
     run itself starts from a clean RNG.
     """
-    from .signal_controller import SignalController
+    from src.core.signal_controller import SignalController
 
     approach_cfg = dict(control_panel.approach_configs[CALIBRATION_APPROACH])
     approach_cfg.update(

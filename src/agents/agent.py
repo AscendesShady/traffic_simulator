@@ -73,11 +73,17 @@ DEFAULT_DECISION_LAG_SEC = 8.0
 ACTIONABLE_HORIZON_SEC = 45.0
 GEMINI_TIMEOUT_SECONDS = 30.0
 OPENAI_TIMEOUT_SECONDS = 30.0
+GROK_TIMEOUT_SECONDS = 30.0
+# xAI serves Grok through an OpenAI-compatible endpoint, so it reuses the
+# openai SDK and the same call path as OpenAI, pointed at a different host.
+GROK_BASE_URL = "https://api.x.ai/v1"
 OLLAMA_TIMEOUT_SECONDS = 45.0
 _GEMINI_CLIENT = None
 _GEMINI_CALL_LOCK = threading.Lock()
 _OPENAI_CLIENT = None
 _OPENAI_CALL_LOCK = threading.Lock()
+_GROK_CLIENT = None
+_GROK_CALL_LOCK = threading.Lock()
 _OLLAMA_CLIENT = None
 _OLLAMA_CALL_LOCK = threading.Lock()
 
@@ -732,14 +738,48 @@ def _get_openai_client():
     return _OPENAI_CLIENT
 
 
+def _is_grok(model: str) -> bool:
+    return isinstance(model, str) and model.startswith("grok-")
+
+
+def _get_grok_client():
+    global _GROK_CLIENT
+    if _GROK_CLIENT is None:
+        if _openai is None:
+            raise RuntimeError("openai package not installed")
+        api_key = os.environ.get("GROK_API_KEY")
+        if not api_key:
+            raise RuntimeError("GROK_API_KEY not set")
+        _GROK_CLIENT = _openai.OpenAI(api_key=api_key, base_url=GROK_BASE_URL)
+    return _GROK_CLIENT
+
+
 def _call_openai(
     model: str, system_prompt: str, minimap: str
 ) -> tuple[str, dict]:
     """Call OpenAI with low temperature and a hard, non-overlapping timeout."""
-    client = _get_openai_client()
-    call_lock = _OPENAI_CALL_LOCK
+    return _call_openai_compatible(
+        "OpenAI", _get_openai_client(), _OPENAI_CALL_LOCK,
+        OPENAI_TIMEOUT_SECONDS, model, system_prompt, minimap,
+    )
+
+
+def _call_grok(
+    model: str, system_prompt: str, minimap: str
+) -> tuple[str, dict]:
+    """Call xAI Grok through its OpenAI-compatible endpoint."""
+    return _call_openai_compatible(
+        "Grok", _get_grok_client(), _GROK_CALL_LOCK,
+        GROK_TIMEOUT_SECONDS, model, system_prompt, minimap,
+    )
+
+
+def _call_openai_compatible(
+    provider: str, client, call_lock, timeout_seconds: float,
+    model: str, system_prompt: str, minimap: str,
+) -> tuple[str, dict]:
     if not call_lock.acquire(blocking=False):
-        raise RuntimeError("previous OpenAI request is still running")
+        raise RuntimeError(f"previous {provider} request is still running")
 
     result_queue = queue.Queue(maxsize=1)
 
@@ -762,7 +802,7 @@ def _call_openai(
 
     request_thread = threading.Thread(
         target=request,
-        name="openai-agent-request",
+        name=f"{provider.lower()}-agent-request",
         daemon=True,
     )
     try:
@@ -772,12 +812,12 @@ def _call_openai(
         raise
 
     try:
-        succeeded, value = result_queue.get(timeout=OPENAI_TIMEOUT_SECONDS)
+        succeeded, value = result_queue.get(timeout=timeout_seconds)
     except queue.Empty as exc:
         # A thread deadline cannot kill the underlying HTTP request; the
         # daemon and call lock let the agent continue without overlapping it.
         raise TimeoutError(
-            f"OpenAI request exceeded {OPENAI_TIMEOUT_SECONDS:g}s timeout"
+            f"{provider} request exceeded {timeout_seconds:g}s timeout"
         ) from exc
     if not succeeded:
         raise value
@@ -785,7 +825,7 @@ def _call_openai(
     choices = getattr(response, "choices", None) or []
     text = choices[0].message.content if choices else None
     if not isinstance(text, str) or not text.strip():
-        raise RuntimeError("empty OpenAI response")
+        raise RuntimeError(f"empty {provider} response")
     usage = getattr(response, "usage", None)
     metrics = {
         "input_tokens": getattr(usage, "prompt_tokens", None),
@@ -928,6 +968,12 @@ def ai_turn(state: AgentState) -> dict:
             )
         elif _is_openai(model):
             raw_output, call_metrics = _call_openai(
+                model,
+                SYSTEM_PROMPT,
+                state.get("minimap", ""),
+            )
+        elif _is_grok(model):
+            raw_output, call_metrics = _call_grok(
                 model,
                 SYSTEM_PROMPT,
                 state.get("minimap", ""),

@@ -72,6 +72,11 @@ API_MODEL_REGISTRY = {
         "gpt-5-mini",
         "gpt-4.1",
     ],
+    "GROK_API_KEY": [
+        "grok-4.6",
+        "grok-4",
+        "grok-3-mini",
+    ],
 }
 
 SYM_DOT = "\u25cf"            # ●

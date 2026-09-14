@@ -285,9 +285,14 @@ def test_api_dropdown_hidden_without_key(monkeypatch):
     assert control_panel.get_api_models() == ["None"]
 
 
+def _clear_api_keys(monkeypatch):
+    for environment_variable in control_panel.API_MODEL_REGISTRY:
+        monkeypatch.delenv(environment_variable, raising=False)
+
+
 def test_api_dropdown_lists_models_with_key(monkeypatch):
+    _clear_api_keys(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "configured-for-test")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     assert control_panel.get_api_models() == [
         "None",
@@ -296,7 +301,7 @@ def test_api_dropdown_lists_models_with_key(monkeypatch):
 
 
 def test_api_dropdown_lists_openai_models_with_key(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    _clear_api_keys(monkeypatch)
     monkeypatch.setenv("OPENAI_API_KEY", "configured-for-test")
 
     assert control_panel.get_api_models() == [
@@ -305,14 +310,27 @@ def test_api_dropdown_lists_openai_models_with_key(monkeypatch):
     ]
 
 
+def test_api_dropdown_lists_grok_models_with_key(monkeypatch):
+    _clear_api_keys(monkeypatch)
+    monkeypatch.setenv("GROK_API_KEY", "configured-for-test")
+
+    assert control_panel.get_api_models() == [
+        "None",
+        *control_panel.API_MODEL_REGISTRY["GROK_API_KEY"],
+    ]
+
+
 def test_api_dropdown_lists_every_configured_provider(monkeypatch):
+    _clear_api_keys(monkeypatch)
     monkeypatch.setenv("GEMINI_API_KEY", "configured-for-test")
     monkeypatch.setenv("OPENAI_API_KEY", "configured-for-test")
+    monkeypatch.setenv("GROK_API_KEY", "configured-for-test")
 
     assert control_panel.get_api_models() == [
         "None",
         *control_panel.API_MODEL_REGISTRY["GEMINI_API_KEY"],
         *control_panel.API_MODEL_REGISTRY["OPENAI_API_KEY"],
+        *control_panel.API_MODEL_REGISTRY["GROK_API_KEY"],
     ]
 
 
@@ -1291,6 +1309,110 @@ def test_openai_call_uses_key_prompt_and_low_temperature(monkeypatch):
         "eval_duration_ns": None,
         "total_duration_ns": None,
     }
+
+
+def test_grok_routing(monkeypatch):
+    assert agent._is_grok("grok-4.6") is True
+    assert agent._is_grok("grok-3-mini") is True
+    assert agent._is_grok("gpt-5") is False
+    assert agent._is_openai("grok-4.6") is False
+    assert agent._is_gemini("grok-4.6") is False
+
+    calls = []
+    monkeypatch.setattr(
+        agent,
+        "_call_grok",
+        lambda model, system_prompt, minimap: (
+            calls.append((model, system_prompt, minimap))
+            or (
+                json.dumps(positional_output(reason="Grok route.")),
+                {
+                    "input_tokens": 42,
+                    "output_tokens": 12,
+                    "eval_duration_ns": None,
+                    "total_duration_ns": None,
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        agent, "_call_openai",
+        lambda *a, **k: pytest.fail("OpenAI must not handle Grok"),
+    )
+    monkeypatch.setattr(
+        agent,
+        "ollama",
+        SimpleNamespace(
+            chat=lambda **kwargs: pytest.fail("Ollama must not handle Grok")
+        ),
+    )
+
+    result = agent.ai_turn(agent_state(model="grok-4.6", minimap="network snapshot"))
+
+    assert result["status"] == "OK"
+    assert calls == [("grok-4.6", agent.SYSTEM_PROMPT, "network snapshot")]
+
+
+def test_grok_call_uses_xai_endpoint_and_key(monkeypatch):
+    """Grok goes through the openai SDK pointed at xAI's base_url, with the
+    Grok key -- never the OpenAI key or the default OpenAI host."""
+    calls = []
+
+    class FakeMessage:
+        content = "  guarded JSON  "
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[FakeChoice()],
+                usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3),
+            )
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    class FakeOpenAI:
+        @staticmethod
+        def OpenAI(api_key, base_url=None):
+            calls.append({"api_key": api_key, "base_url": base_url})
+            return FakeClient()
+
+    monkeypatch.setenv("GROK_API_KEY", "grok-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setattr(agent, "_openai", FakeOpenAI)
+    monkeypatch.setattr(agent, "_GROK_CLIENT", None)
+    monkeypatch.setattr(agent, "_GROK_CALL_LOCK", threading.Lock())
+
+    text, metrics = agent._call_grok("grok-4.6", "system", "minimap")
+
+    assert text == "  guarded JSON  "
+    assert calls[0] == {"api_key": "grok-secret", "base_url": agent.GROK_BASE_URL}
+    assert agent.GROK_BASE_URL == "https://api.x.ai/v1"
+    assert calls[1]["model"] == "grok-4.6"
+    assert calls[1]["temperature"] == 0.2
+    assert metrics["input_tokens"] == 7 and metrics["output_tokens"] == 3
+
+
+def test_grok_missing_key_holds_all_off(monkeypatch):
+    monkeypatch.delenv("GROK_API_KEY", raising=False)
+    monkeypatch.setattr(agent, "_openai", SimpleNamespace(OpenAI=lambda **k: None))
+    monkeypatch.setattr(agent, "_GROK_CLIENT", None)
+    state = agent_state(model="grok-4.6")
+
+    failed = agent.ai_turn(state)
+    guarded = agent.anti_cheat({**state, **failed})
+
+    assert failed["status"] == "INVALID"
+    assert "GROK_API_KEY" in failed["raw_output"]
+    assert guarded["decision"]["status"] == "HELD_ALL_OFF"
 
 
 def test_openai_failure_holds_all_off(monkeypatch):

@@ -411,7 +411,9 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "TELEMETRY_PATH", tmp_path / "no_snapshot.json")
     destination = tmp_path / "rule_run.xlsx"
     assert main.export_test_workbook("rule-based", 60, 1, destination) == destination
-    assert main.build_test_export_filename("rule-based", 300, 7, "ts").startswith("test_rule-based_5min_seed7")
+    assert main.build_test_export_filename(
+        "rule-based", 300, 7, "20260914_112746"
+    ) == "rule-based_5min_7seed_14092026_112746.xlsx"
 
     workbook = load_workbook(destination, data_only=True)
     try:

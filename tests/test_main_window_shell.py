@@ -45,18 +45,54 @@ def test_center_pane_claims_dominant_share_on_resize():
     try:
         root.update_idletasks()
         root.update()
-        expected_side_width = max(
-            main.MIN_SIDE_PANE_WIDTH,
-            min(
-                main.MAX_SIDE_PANE_WIDTH,
-                round(root.winfo_width() * main.SIDE_PANE_WIDTH_FRACTION),
-            ),
-        )
+        screen_width = root.winfo_screenwidth()
+        control_width = main.control_pane_width_for(screen_width)
+        telemetry_width = main.telemetry_pane_width_for(screen_width)
         # The side panes hold close to their configured width; the center
         # pane is not artificially pinned to a small size.
-        assert control_pane.winfo_width() > expected_side_width * 0.8
-        assert telemetry_pane.winfo_width() > expected_side_width * 0.8
-        assert simulation_pane.winfo_width() > expected_side_width * 0.5
+        assert control_pane.winfo_width() > control_width * 0.8
+        assert telemetry_pane.winfo_width() > telemetry_width * 0.8
+        assert simulation_pane.winfo_width() > telemetry_width * 0.5
+    finally:
+        root.destroy()
+
+
+def test_window_width_fits_side_panes_and_canvas_without_slack():
+    """The window is sized to its content, not the screen: two side panes
+    plus the canvas and its gutter, so the network never floats in a wide
+    empty center pane on a large monitor."""
+    import canvas_gemini as canvas
+
+    wide_screen = 3840
+    control = main.control_pane_width_for(wide_screen)
+    telemetry = main.telemetry_pane_width_for(wide_screen)
+    assert control == main.MAX_CONTROL_PANE_WIDTH
+    assert telemetry == main.MAX_TELEMETRY_PANE_WIDTH
+    assert main.main_window_width_for(wide_screen) == (
+        control + telemetry + canvas.WIDTH + 2 * main.SIMULATION_PANE_GUTTER
+    )
+    # The control column is a single stack of controls; telemetry keeps
+    # roughly 30% more for its KPI grid and side-by-side node diagrams.
+    assert main.control_pane_width_for(2560) == 256
+    assert main.telemetry_pane_width_for(2560) == 333
+    # A screen too narrow for all three still gets a usable window.
+    assert main.main_window_width_for(1024) == 964
+    # Height frames the canvas with the same gutter top and bottom.
+    assert main.main_window_height_for(1440) == (
+        canvas.HEIGHT + 2 * main.SIMULATION_PANE_GUTTER
+    )
+    assert main.main_window_height_for(700) == 600
+
+    root, _control, simulation_pane, _telemetry = main.build_main_window()
+    try:
+        root.update_idletasks()
+        root.update()
+        fitted = main.main_window_width_for(root.winfo_screenwidth())
+        if root.winfo_screenwidth() - 60 >= fitted:
+            # Center pane is the canvas plus its gutter (sashes excepted).
+            assert simulation_pane.winfo_width() <= (
+                canvas.WIDTH + 2 * main.SIMULATION_PANE_GUTTER + 16
+            )
     finally:
         root.destroy()
 

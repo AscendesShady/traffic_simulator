@@ -57,6 +57,11 @@ def write_logs(tmp_path, monkeypatch, turns=2, telemetry_rows=2):
     monkeypatch.setattr(main, "AGENT_TURN_LOG_PATH", turn_log)
     monkeypatch.setattr(main, "TELEMETRY_LOG_PATH", telemetry_log)
     monkeypatch.setattr(main, "EXCEL_EXPORT_DIR", tmp_path / "excel_exports")
+    monkeypatch.setattr(
+        main, "EXPERIMENT_SUMMARY_PATH", tmp_path / "experiment_summary.csv"
+    )
+    monkeypatch.setattr(main, "BUS_EVENTS_LOG_PATH", tmp_path / "bus_events.jsonl")
+    monkeypatch.setattr(main, "TELEMETRY_PATH", tmp_path / "snapshot.json")
     return turn_log, telemetry_log
 
 
@@ -176,7 +181,7 @@ def test_test_autoexports_with_correct_filename(tmp_path, monkeypatch):
 
     assert destination is not None and destination.exists()
     assert re.fullmatch(
-        r"test_nemotron-3-nano-4b_30min_seed43_\d{8}_\d{6}\.xlsx",
+        r"nemotron-3-nano-4b_30min_43seed_\d{8}_\d{6}\.xlsx",
         destination.name,
     ), destination.name
     assert control_panel.global_config["test_last_export"] == destination.name
@@ -224,7 +229,8 @@ def test_baseline_test_runs_with_model_none(tmp_path, monkeypatch):
 
     assert destination is not None and destination.exists()
     assert re.fullmatch(
-        r"test_baseline_10min_seedNone_\d{8}_\d{6}\.xlsx", destination.name
+        r"baseline_10min_noseed_\d{8}_\d{6}\.xlsx",
+        destination.name,
     ), destination.name
 
 
@@ -245,14 +251,14 @@ def test_manual_stop_during_test_no_autoexport(tmp_path, monkeypatch):
     # Logs are preserved for a manual EXPORT ALL.
     assert turn_log.exists() and telemetry_log.exists()
     # No workbook was written by the interrupted test.
-    assert not export_dir.exists() or not list(export_dir.glob("test_*.xlsx"))
+    assert not export_dir.exists() or not list(export_dir.glob("*.xlsx"))
 
 
 def test_filename_sanitises_model_separators():
     name = main.build_test_export_filename(
         "vendor/family:8b", 900, 5, timestamp="20260908_143005"
     )
-    assert name == "test_vendor-family-8b_15min_seed5_20260908_143005.xlsx"
+    assert name == "vendor-family-8b_15min_5seed_08092026_143005.xlsx"
 
 
 def test_arming_without_a_model_reports_baseline_not_waiting(monkeypatch):

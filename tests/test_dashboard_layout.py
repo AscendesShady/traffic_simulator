@@ -76,9 +76,11 @@ def test_kpi_grid_carries_every_summary_metric():
         "dbl",
         "timer",
     }
-    # Portrait layout: two cards per row, full titles rather than
+    # A square 3 x 3 grid: three rows keep the Summary tab inside a viewport
+    # no taller than the simulation canvas; full titles rather than
     # abbreviations since each card has its own line for the title.
-    assert telemetry_dashboard_module.SUMMARY_KPI_COLUMNS == 2
+    assert telemetry_dashboard_module.SUMMARY_KPI_COLUMNS == 3
+    assert len(telemetry_dashboard_module.SUMMARY_KPIS) == 9
     source = inspect.getsource(TelemetryDashboard.build_ui)
     assert "divmod(index, SUMMARY_KPI_COLUMNS)" in source
 
@@ -183,6 +185,63 @@ def test_embedded_dashboard_never_nests_a_scrollbar():
         assert standalone.embedded is False
         assert isinstance(standalone.trends_scroll_canvas, tk.Canvas)
         assert len(scrollbars_under(standalone.notebook)) == 3
+    finally:
+        host.destroy()
+
+
+def test_notebook_height_matches_selected_tab_not_the_tallest():
+    """ttk.Notebook otherwise reserves height for the tallest page it has
+    ever shown, so a mounted dashboard's short tabs (Summary, LLM) would
+    inherit dead space sized for its longest one (Units) -- excessive
+    scrolling on tabs that do not need it. Only relevant when embedded:
+    standalone, every height-heavy tab already scrolls within its own
+    fixed-size window instead of resizing the notebook."""
+    import tkinter as tk
+
+    host = tk.Tk()
+    try:
+        dashboard = TelemetryDashboard(tk.Frame(host))
+        host.update_idletasks()
+
+        summary_height = dashboard.summary_content.winfo_reqheight()
+        llm_height = dashboard.llm_content.winfo_reqheight()
+        units_height = dashboard.units_content.winfo_reqheight()
+        # Units carries far more rows than Summary/LLM, so this assumption
+        # (needed for the rest of the test to be meaningful) should hold
+        # for as long as that remains true.
+        assert units_height > summary_height and units_height > llm_height
+
+        # The notebook's own style may add a few px of chrome on top of the
+        # pinned page height, so compare within a small tolerance rather
+        # than exact equality.
+        def close_to(actual, expected):
+            return abs(actual - expected) <= 10
+
+        assert close_to(dashboard.notebook.winfo_reqheight(), summary_height)
+
+        # select() queues the <<NotebookTabChanged>> virtual event, which
+        # only a full update() (not update_idletasks()) dispatches -- the
+        # same event loop pumping a running mainloop does continuously.
+        dashboard.notebook.select(dashboard.llm_tab)
+        host.update()
+        assert close_to(dashboard.notebook.winfo_reqheight(), llm_height)
+
+        dashboard.notebook.select(dashboard.units_tab)
+        host.update()
+        assert close_to(dashboard.notebook.winfo_reqheight(), units_height)
+
+        # Switching back down must shrink again, not stay pinned to Units.
+        dashboard.notebook.select(dashboard.summary_tab)
+        host.update()
+        assert close_to(dashboard.notebook.winfo_reqheight(), summary_height)
+        assert dashboard.notebook.winfo_reqheight() < units_height - 50
+
+        # Standalone owns its own resizable window; every height-heavy tab
+        # already scrolls internally, so the notebook is left to size itself
+        # naturally rather than being pinned tab-by-tab.
+        standalone = TelemetryDashboard(tk.Toplevel(host))
+        assert standalone.sync_notebook_height() is None
+        assert standalone.notebook.cget("height") in (0, "0")
     finally:
         host.destroy()
 

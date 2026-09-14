@@ -337,6 +337,50 @@ def test_panel_reports_calibration_state(monkeypatch):
     assert "Y=0.70  cycle=48s (optimal)" in text
 
 
+def test_panel_builds_clear_per_node_timing_summary(monkeypatch):
+    monkeypatch.setitem(control_panel.global_config, "calibrating", False)
+    monkeypatch.setitem(
+        control_panel.global_config, "measured_saturation_flow", 1366
+    )
+    monkeypatch.setitem(
+        control_panel.global_config,
+        "webster_splits",
+        {
+            300: {
+                "cycle_time_sec": 55.0,
+                "EW_green_sec": 30.0,
+                "NS_green_sec": 21.0,
+                "y_ew": 0.45,
+                "y_ns": 0.30,
+                "Y": 0.75,
+                "oversaturated": False,
+            },
+            700: {
+                "cycle_time_sec": 120.0,
+                "EW_green_sec": 70.0,
+                "NS_green_sec": 46.0,
+                "y_ew": 0.75,
+                "y_ns": 0.50,
+                "Y": 1.25,
+                "oversaturated": True,
+            },
+        },
+    )
+
+    summary = control_panel.get_webster_timing_summary()
+
+    assert summary["state"] == "OVERSATURATED"
+    assert summary["message"] == (
+        "Measured lane capacity: 1,366 vehicles/hour/lane"
+    )
+    assert [(node["name"], node["status"]) for node in summary["nodes"]] == [
+        ("A", "Optimal"),
+        ("B", "Oversaturated"),
+    ]
+    assert summary["nodes"][0]["cycle_time_sec"] == 55.0
+    assert summary["nodes"][1]["total_ratio"] == 1.25
+
+
 def test_panel_warns_for_oversaturated_node(monkeypatch):
     monkeypatch.setitem(control_panel.global_config, "calibrating", False)
     monkeypatch.setitem(control_panel.global_config, "measured_saturation_flow", 1200)

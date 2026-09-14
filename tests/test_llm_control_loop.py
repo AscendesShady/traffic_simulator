@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -278,17 +279,40 @@ def test_control_panel_writes_atomic_agent_control_and_discovers_models(
 
 
 def test_api_dropdown_hidden_without_key(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    for environment_variable in control_panel.API_MODEL_REGISTRY:
+        monkeypatch.delenv(environment_variable, raising=False)
 
     assert control_panel.get_api_models() == ["None"]
 
 
 def test_api_dropdown_lists_models_with_key(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "configured-for-test")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     assert control_panel.get_api_models() == [
         "None",
         *control_panel.API_MODEL_REGISTRY["GEMINI_API_KEY"],
+    ]
+
+
+def test_api_dropdown_lists_openai_models_with_key(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "configured-for-test")
+
+    assert control_panel.get_api_models() == [
+        "None",
+        *control_panel.API_MODEL_REGISTRY["OPENAI_API_KEY"],
+    ]
+
+
+def test_api_dropdown_lists_every_configured_provider(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "configured-for-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "configured-for-test")
+
+    assert control_panel.get_api_models() == [
+        "None",
+        *control_panel.API_MODEL_REGISTRY["GEMINI_API_KEY"],
+        *control_panel.API_MODEL_REGISTRY["OPENAI_API_KEY"],
     ]
 
 
@@ -1179,6 +1203,157 @@ def test_gemini_timeout_holds_all_off(monkeypatch):
     assert guarded["decision"]["flags"] == guard.all_off_flags()
 
 
+def test_openai_routing(monkeypatch):
+    assert agent._is_openai("gpt-5") is True
+    assert agent._is_openai("gpt-4.1") is True
+    assert agent._is_openai("llama3.1:8b") is False
+    assert agent._is_openai("gemini-2.5-flash") is False
+
+    calls = []
+    monkeypatch.setattr(
+        agent,
+        "_call_openai",
+        lambda model, system_prompt, minimap: (
+            calls.append((model, system_prompt, minimap))
+            or (
+                json.dumps(positional_output(reason="OpenAI route.")),
+                {
+                    "input_tokens": 42,
+                    "output_tokens": 12,
+                    "eval_duration_ns": None,
+                    "total_duration_ns": None,
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "ollama",
+        SimpleNamespace(
+            chat=lambda **kwargs: pytest.fail("Ollama must not handle OpenAI")
+        ),
+    )
+
+    result = agent.ai_turn(agent_state(model="gpt-5", minimap="network snapshot"))
+
+    assert result["status"] == "OK"
+    assert calls == [("gpt-5", agent.SYSTEM_PROMPT, "network snapshot")]
+
+
+def test_openai_call_uses_key_prompt_and_low_temperature(monkeypatch):
+    calls = []
+
+    class FakeMessage:
+        content = "  guarded JSON  "
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[FakeChoice()],
+                usage=SimpleNamespace(prompt_tokens=42, completion_tokens=12),
+            )
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeOpenAIClient:
+        chat = FakeChat()
+
+    class FakeOpenAI:
+        @staticmethod
+        def OpenAI(api_key):
+            calls.append({"api_key": api_key})
+            return FakeOpenAIClient()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-secret")
+    monkeypatch.setattr(agent, "_openai", FakeOpenAI)
+    monkeypatch.setattr(agent, "_OPENAI_CLIENT", None)
+    monkeypatch.setattr(agent, "_OPENAI_CALL_LOCK", threading.Lock())
+
+    text, metrics = agent._call_openai("gpt-5", "system", "minimap")
+
+    assert text == "  guarded JSON  "
+    assert calls[0] == {"api_key": "test-secret"}
+    assert calls[1]["model"] == "gpt-5"
+    assert calls[1]["messages"] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "minimap"},
+    ]
+    assert calls[1]["temperature"] == 0.2
+    assert metrics == {
+        "input_tokens": 42,
+        "output_tokens": 12,
+        "eval_duration_ns": None,
+        "total_duration_ns": None,
+    }
+
+
+def test_openai_failure_holds_all_off(monkeypatch):
+    monkeypatch.setattr(
+        agent,
+        "_call_openai",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("cloud unavailable")),
+    )
+    state = agent_state(model="gpt-5")
+
+    failed = agent.ai_turn(state)
+    guarded = agent.anti_cheat({**state, **failed})
+
+    assert failed["status"] == "INVALID"
+    assert guarded["decision"]["status"] == "HELD_ALL_OFF"
+    assert guarded["decision"]["flags"] == guard.all_off_flags()
+
+
+def test_openai_timeout_holds_all_off(monkeypatch):
+    class SlowCompletions:
+        @staticmethod
+        def create(**kwargs):
+            time.sleep(0.2)
+            return SimpleNamespace(choices=[])
+
+    class SlowChat:
+        completions = SlowCompletions()
+
+    monkeypatch.setattr(
+        agent,
+        "_OPENAI_CLIENT",
+        SimpleNamespace(chat=SlowChat()),
+    )
+    monkeypatch.setattr(agent, "_OPENAI_CALL_LOCK", threading.Lock())
+    monkeypatch.setattr(agent, "OPENAI_TIMEOUT_SECONDS", 0.02)
+    state = agent_state(model="gpt-5")
+
+    started = time.perf_counter()
+    failed = agent.ai_turn(state)
+    elapsed = time.perf_counter() - started
+    guarded = agent.anti_cheat({**state, **failed})
+
+    assert elapsed < 0.15
+    assert failed["status"] == "INVALID"
+    assert "TimeoutError" in failed["raw_output"]
+    assert guarded["decision"]["status"] == "HELD_ALL_OFF"
+    assert guarded["decision"]["flags"] == guard.all_off_flags()
+
+
+def test_openai_missing_key_holds_all_off(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(agent, "_openai", SimpleNamespace(OpenAI=lambda **k: None))
+    monkeypatch.setattr(agent, "_OPENAI_CLIENT", None)
+    state = agent_state(model="gpt-5")
+
+    failed = agent.ai_turn(state)
+    guarded = agent.anti_cheat({**state, **failed})
+
+    assert failed["status"] == "INVALID"
+    assert "OPENAI_API_KEY" in failed["raw_output"]
+    assert guarded["decision"]["status"] == "HELD_ALL_OFF"
+
+
 def test_langgraph_runs_one_complete_network_turn(tmp_path, monkeypatch):
     flags = valid_flags(dbl_route="R5_WB_B_SB")
     reason = "Open the dynamic lane for the nearest loaded bus."
@@ -1564,11 +1739,21 @@ def test_default_excel_export_uses_dedicated_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "EXCEL_EXPORT_DIR", export_folder)
     monkeypatch.setattr(main, "TELEMETRY_LOG_PATH", telemetry_log)
     monkeypatch.setattr(main, "AGENT_TURN_LOG_PATH", tmp_path / "missing-turns.jsonl")
+    monkeypatch.setitem(
+        control_panel.global_config,
+        "ai_runtime",
+        {"model": "gemini2.5"},
+    )
+    monkeypatch.setitem(control_panel.global_config, "sim_time_seconds", 300)
+    monkeypatch.setitem(control_panel.global_config, "random_seed", 42)
 
     destination = main.export_session_excel()
 
     assert destination is not None
     assert destination.parent == export_folder
-    assert destination.name.startswith("session_export_")
+    assert re.fullmatch(
+        r"gemini2\.5_5min_42seed_\d{8}_\d{6}\.xlsx",
+        destination.name,
+    )
     assert destination.suffix == ".xlsx"
     assert destination.exists()

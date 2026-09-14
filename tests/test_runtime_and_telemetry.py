@@ -14,7 +14,12 @@ import pygame
 import telemetry_dashboard as telemetry_dashboard_module
 from canvas_gemini import H_Y, LANE
 from signal_controller import SignalController
-from telemetry_dashboard import HISTORY_MAX_POINTS, TelemetryDashboard, _gpu_none
+from telemetry_dashboard import (
+    HISTORY_MAX_POINTS,
+    TelemetryDashboard,
+    _gpu_none,
+    build_excel_export_filename,
+)
 from telemetry_exporter import DEFAULT_TELEMETRY_PATH, TelemetryExporter
 from vehicle import Bus, Vehicle
 from tests.helpers import make_bus_for_leg
@@ -1583,7 +1588,7 @@ def test_session_trends_export_uses_only_in_memory_history(tmp_path):
 
     assert dashboard.export_session_trends(destination) == destination
 
-    workbook = load_workbook(destination, data_only=True)
+    workbook = load_workbook(destination, data_only=False)
     try:
         assert workbook.sheetnames == [
             "Session Trends",
@@ -1600,29 +1605,39 @@ def test_session_trends_export_uses_only_in_memory_history(tmp_path):
             "pending_demand",
             "congestion_pct",
         ]
+        assert "SessionTrendData" in trends.tables
+        assert trends.tables["SessionTrendData"].ref == "A1:F3"
+        assert trends.auto_filter.ref is None
         summary = {
             row[0]: row[1]
             for row in workbook["Summary"].iter_rows(
                 min_row=2, values_only=True
             )
         }
-        assert summary["samples"] == 2
-        assert summary["average_vehicles"] == 10.0
-        assert summary["peak_road_queue"] == 6
+        assert summary["samples"] == "=COUNT('Session Trends'!A2:A3)"
+        assert summary["duration_seconds"] == "=B4-B3"
+        assert summary["average_vehicles"] == (
+            "=AVERAGE('Session Trends'!B2:B3)"
+        )
+        assert summary["peak_road_queue"] == "=MAX('Session Trends'!D2:D3)"
+        assert workbook.calculation.fullCalcOnLoad is True
+        assert workbook.calculation.forceFullCalc is True
 
         charts = workbook["Session Charts"]._charts
         assert len(charts) == 3
         assert [len(chart.series) for chart in charts] == [2, 2, 1]
+        assert [chart.anchor._from.row for chart in charts] == [0, 22, 44]
+        assert not workbook["Session Charts"]._images
         assert [chart.title.tx.rich.p[0].r[0].t for chart in charts] == [
-            "Network Occupancy Over Time",
-            "Queue Pressure Over Time",
-            "Network Congestion Over Time",
+            "Network Occupancy Over Time (vehicles)",
+            "Queue Pressure Over Time (vehicles and arrivals)",
+            "Network Congestion Over Time (%)",
         ]
-        assert [chart.x_axis.title.tx.rich.p[0].r[0].t for chart in charts] == [
-            "Simulation time (seconds)",
-            "Simulation time (seconds)",
-            "Simulation time (seconds)",
-        ]
+        assert all(chart.x_axis.title is None for chart in charts)
+        assert all(chart.x_axis.tickLblPos == "low" for chart in charts)
+        assert all(chart.x_axis.delete is False for chart in charts)
+        assert all(chart.y_axis.delete is False for chart in charts)
+        assert all(chart.title.overlay is False for chart in charts)
         assert [
             series.tx.v
             for chart in charts
@@ -1634,6 +1649,17 @@ def test_session_trends_export_uses_only_in_memory_history(tmp_path):
             "Pending demand",
             "Congestion",
         ]
+        assert [
+            series.yVal.numRef.f
+            for chart in charts
+            for series in chart.series
+        ] == [
+            "'Session Trends'!$B$2:$B$3",
+            "'Session Trends'!$C$2:$C$3",
+            "'Session Trends'!$D$2:$D$3",
+            "'Session Trends'!$E$2:$E$3",
+            "'Session Trends'!$F$2:$F$3",
+        ]
     finally:
         workbook.close()
     assert dashboard.trends_export_status_lbl.values["fg"] == "#2ECC71"
@@ -1644,14 +1670,20 @@ def test_session_trends_export_uses_only_in_memory_history(tmp_path):
     assert not empty_destination.exists()
 
 
-def test_runtime_paths_are_source_relative():
-    project = Path(main.__file__).resolve().parent
+def test_excel_export_filename_uses_requested_field_order():
+    assert build_excel_export_filename(
+        "gemini2.5", 300, 42, timestamp="20260914_112746"
+    ) == "gemini2.5_5min_42seed_14092026_112746.xlsx"
+
+
+def test_runtime_paths_are_repo_root_relative():
+    repo_root = main.BASE_DIR
     # DASHBOARD_PATH no longer exists: the telemetry dashboard mounts
     # in-process (TelemetryDashboard imported directly) instead of being
     # launched as a separate subprocess script.
     assert not hasattr(main, "DASHBOARD_PATH")
-    assert main.TELEMETRY_PATH == project / "traffic_state_telemetry.json"
-    assert DEFAULT_TELEMETRY_PATH == project / "traffic_state_telemetry.json"
+    assert main.TELEMETRY_PATH == repo_root / "data" / "traffic_state_telemetry.json"
+    assert DEFAULT_TELEMETRY_PATH == repo_root / "data" / "traffic_state_telemetry.json"
 
 
 def test_main_uses_monotonic_elapsed_time_with_bounded_catchup():

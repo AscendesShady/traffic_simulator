@@ -17,8 +17,8 @@ carries a tag saying how much to trust it:
 Display and export only: nothing here feeds back into the simulation.
 """
 
-import canvas_gemini as canvas
-import webster
+from src.ui import canvas_gemini as canvas
+from src.core import webster
 
 # --- Anchor constants (edit these to sensitivity-test the reporting basis) ---
 REAL_SATURATION_FLOW_VEH_HR = 1900   # HCM standard per lane, the anchor

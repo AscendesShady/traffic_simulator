@@ -7,11 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import agent
-import control_panel
-import guard
-import main
-from signal_controller import SignalController
+import src.agents.agent as agent
+import src.ui.control_panel as control_panel
+import src.core.guard as guard
+import src.core.main as main
+from src.core.signal_controller import SignalController
 from tests.helpers import make_bus_for_leg
 
 

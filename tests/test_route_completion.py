@@ -1,9 +1,9 @@
 import pytest
 
-import control_panel
-from canvas_gemini import HEIGHT, H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
-from signal_controller import SignalController
-from vehicle import Bus
+import src.ui.control_panel as control_panel
+from src.ui.canvas_gemini import HEIGHT, H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
+from src.core.signal_controller import SignalController
+from src.core.vehicle import Bus
 
 
 @pytest.mark.parametrize("route_id", list(control_panel.bus_routes_config))

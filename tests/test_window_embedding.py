@@ -8,7 +8,7 @@ resizable() on anything that is not itself a toplevel.
 """
 import tkinter as tk
 
-from telemetry_dashboard import TelemetryDashboard
+from src.ui.telemetry_dashboard import TelemetryDashboard
 
 
 def test_telemetry_dashboard_mounts_into_a_frame_without_owning_it():

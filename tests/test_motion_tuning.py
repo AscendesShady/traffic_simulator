@@ -2,12 +2,12 @@ import inspect
 
 import pytest
 
-import control_panel
-import main
-from canvas_gemini import H_Y, LANE
-from signal_controller import SignalController
+import src.ui.control_panel as control_panel
+import src.core.main as main
+from src.ui.canvas_gemini import H_Y, LANE
+from src.core.signal_controller import SignalController
 from tests.helpers import make_bus_for_leg
-from vehicle import Bus, DBL_LANE_INDEX, Vehicle
+from src.core.vehicle import Bus, DBL_LANE_INDEX, Vehicle
 
 
 def _lane_options():

@@ -39,10 +39,10 @@ cd traffic_simulator
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe main.py
+.\.venv\Scripts\python.exe run.py
 ```
 
-Launching `main.py` opens the simulation canvas and control panel, then starts the telemetry dashboard and LLM agent as separate child processes. The simulator remains usable in manual mode when Ollama is unavailable.
+Launching `run.py` opens the simulation canvas and control panel, then starts the telemetry dashboard and LLM agent as separate child processes. The simulator remains usable in manual mode when Ollama is unavailable.
 
 ## Using the simulator
 
@@ -56,11 +56,11 @@ The control panel can:
 - pause, resume, and reset the simulation; and
 - start automatic or manually selected gridlock discharge.
 
-The telemetry dashboard reads the latest atomic JSON snapshot and maintains bounded time-series history only in memory. It can be resized from any edge; fonts, cards, diagrams, and charts compact automatically to fit the available window instead of exposing dashboard scrollbars. Closing the dashboard clears its history. `traffic_state_telemetry.json`, `ai_control.json`, `decision.json`, log files, and the `runtime/` directory are generated locally and intentionally excluded from Git.
+The telemetry dashboard reads the latest atomic JSON snapshot and maintains bounded time-series history only in memory. It can be resized from any edge; fonts, cards, diagrams, and charts compact automatically to fit the available window instead of exposing dashboard scrollbars. Closing the dashboard clears its history. `data/traffic_state_telemetry.json`, `data/ai_control.json`, `data/decision.json`, log files under `logs/`, and the `runtime/` directory are generated locally and intentionally excluded from Git.
 
 When AI control is armed, its next validated decision owns every route's TSP and DBL flags. Disarm it before making lasting manual flag changes. Missing or malformed model output cannot authorize priority; the agent and sim-side guard fall back to all flags off.
 
-The Local and API selectors are mutually exclusive and write one model ID to `ai_control.json`. Gemini uses the current `google-genai` SDK, the same prompt and guard as Ollama, a low temperature, and a 30-second hard timeout. API failures and timeouts become held all-off turns. During network discharge, the agent skips either backend entirely and writes a fresh all-off stand-down decision.
+The Local and API selectors are mutually exclusive and write one model ID to `data/ai_control.json`. Gemini uses the current `google-genai` SDK, the same prompt and guard as Ollama, a low temperature, and a 30-second hard timeout. API failures and timeouts become held all-off turns. During network discharge, the agent skips either backend entirely and writes a fresh all-off stand-down decision.
 
 The simulator also rejects a decision whose timestamp is missing, invalid, or older than the greater of 12 seconds and three configured AI ticks. This makes an orphaned decision file self-clear its TSP/DBL flags if the agent stops. Accepted grants remain route-locked through both active-green and controller-clearing telemetry states without making clearing buses reappear in the model's approaching-bus summary.
 
@@ -71,20 +71,20 @@ Each AI turn also records a concise model-supplied `reason`, the full raw model 
 Run the complete regression suite:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -c tests\pytest.ini tests -q
 ```
 
 If Windows denies pytest access to its default temporary directory, use a project-local directory:
 
 ```powershell
 New-Item -ItemType Directory -Force .\runtime | Out-Null
-.\.venv\Scripts\python.exe -m pytest -q --basetemp=.\runtime\pytest-temp
+.\.venv\Scripts\python.exe -m pytest -c tests\pytest.ini tests -q --basetemp=.\runtime\pytest-temp
 ```
 
 Compile-check the application modules:
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile agent.py guard.py canvas_gemini.py control_panel.py main.py signal_controller.py telemetry_dashboard.py telemetry_exporter.py vehicle.py
+.\.venv\Scripts\python.exe -m py_compile run.py src\agents\agent.py src\core\guard.py src\ui\canvas_gemini.py src\ui\control_panel.py src\core\main.py src\core\signal_controller.py src\ui\telemetry_dashboard.py src\telemetry\telemetry_exporter.py src\core\vehicle.py
 ```
 
 ## Project structure
@@ -100,8 +100,8 @@ Compile-check the application modules:
 | `vehicle.py` | Vehicle and bus routing, movement, following, and conflict behavior |
 | `telemetry_exporter.py` | Atomic telemetry snapshot generation |
 | `telemetry_dashboard.py` | Live metrics, in-memory trends, and phase visualization |
-| `audits/` | Historical, incident, callback, and step-by-step audit reports |
-| `excel_exports/` | Session Excel exports generated when the simulator closes |
+| `docs/audits/` | Historical, incident, callback, and step-by-step audit reports |
+| `results/` | Session Excel exports generated when the simulator closes |
 | `tests/` | Automated route, safety, callback, priority, discharge, and telemetry checks |
 
 ## Documentation

@@ -3,8 +3,8 @@ pane instead of owning its own top-level window.
 """
 import tkinter as tk
 
-import control_panel
-import main
+import src.ui.control_panel as control_panel
+import src.core.main as main
 
 
 def test_main_mounts_control_panel_into_the_left_pane_not_its_own_window():

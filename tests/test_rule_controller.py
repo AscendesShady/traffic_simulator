@@ -11,14 +11,14 @@ from types import SimpleNamespace
 
 import pytest
 
-import agent
-import control_panel
-import guard
-import main
-import rule_controller as rc
-from bus_event_log import BusEventTracker
-from canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
-from signal_controller import TSP_ACTION_EXTENDING, SignalController
+import src.agents.agent as agent
+import src.ui.control_panel as control_panel
+import src.core.guard as guard
+import src.core.main as main
+import src.agents.rule_controller as rc
+from src.telemetry.bus_event_log import BusEventTracker
+from src.ui.canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
+from src.core.signal_controller import TSP_ACTION_EXTENDING, SignalController
 from tests.helpers import make_bus_for_leg
 
 

@@ -5,11 +5,11 @@ from pathlib import Path
 import re
 import time
 
-import control_panel
+from src.ui import control_panel
 
 
-BASE_DIR = Path(__file__).resolve().parent
-REJECT_LOG_PATH = BASE_DIR / "agent_rejects.log"
+BASE_DIR = Path(__file__).resolve().parents[2]
+REJECT_LOG_PATH = BASE_DIR / "logs" / "agent_rejects.log"
 ROUTE_ORDER = sorted(control_panel.bus_routes_config.keys())
 VALID_ROUTES = set(ROUTE_ORDER)
 FLAG_KEYS = {"tsp", "dbl"}

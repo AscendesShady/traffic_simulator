@@ -4,9 +4,9 @@ the existing single-run path (request_start_test), never reimplemented.
 """
 import copy
 
-import control_panel
-import main
-import batch_runner
+import src.ui.control_panel as control_panel
+import src.core.main as main
+import src.experiments.batch_runner as batch_runner
 
 
 # --------------------------------------------------------------------------

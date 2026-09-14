@@ -7,11 +7,11 @@ on every row, and that the export records the conversion basis.
 """
 import pytest
 
-import canvas_gemini as canvas
-import control_panel
-import main
-import real_world_units as units
-from vehicle import Vehicle
+import src.ui.canvas_gemini as canvas
+import src.ui.control_panel as control_panel
+import src.core.main as main
+import src.telemetry.real_world_units as units
+from src.core.vehicle import Vehicle
 
 
 def test_time_conversion_exact():
@@ -124,7 +124,7 @@ def test_table_values_follow_the_anchor():
 def test_units_vc_agrees_with_webster_by_construction():
     """Both views evaluate the busiest lane: v/c on the units tab equals
     Webster's y / (g/C) for the same approach, independent of the anchor."""
-    import webster
+    import src.core.webster as webster
 
     config = dict(control_panel.global_config)
     config["measured_saturation_flow"] = 1291.0
@@ -188,7 +188,7 @@ def test_conversions_in_export(tmp_path, monkeypatch):
 
 def test_dashboard_has_units_tab_and_updates_it():
     import tkinter as tk
-    from telemetry_dashboard import TelemetryDashboard
+    from src.ui.telemetry_dashboard import TelemetryDashboard
 
     host = tk.Tk()
     try:

@@ -4,12 +4,12 @@ The agent used to enable DBL blind. These tests cover the telemetry and
 minimap fields that tell it whether a route's DBL lane can actually be
 entered, so it can prefer TSP where the lane is blocked.
 """
-import agent
-import control_panel
-from canvas_gemini import H_Y, LANE
-from signal_controller import SignalController
-from telemetry_exporter import TelemetryExporter
-from vehicle import DBL_LANE_INDEX, Vehicle
+import src.agents.agent as agent
+import src.ui.control_panel as control_panel
+from src.ui.canvas_gemini import H_Y, LANE
+from src.core.signal_controller import SignalController
+from src.telemetry.telemetry_exporter import TelemetryExporter
+from src.core.vehicle import DBL_LANE_INDEX, Vehicle
 from tests.helpers import make_bus_for_leg
 
 
@@ -132,7 +132,7 @@ def test_prompt_teaches_dbl_obstruction_policy():
 
 def test_no_hard_coded_dbl_refusal_in_guard():
     """DBL usability stays a model policy call, not a coded veto."""
-    import guard
+    import src.core.guard as guard
 
     guard_source = open(guard.__file__, encoding="utf-8").read()
     assert "dbl_lane_obstructed" not in guard_source

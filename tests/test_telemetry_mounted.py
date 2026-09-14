@@ -3,8 +3,8 @@ right pane in-process, and the separate dashboard subprocess is gone.
 """
 import inspect
 
-import main
-from telemetry_dashboard import TelemetryDashboard
+import src.core.main as main
+from src.ui.telemetry_dashboard import TelemetryDashboard
 
 
 def test_main_mounts_telemetry_dashboard_into_the_right_pane():
@@ -56,7 +56,7 @@ def test_agent_subprocess_is_still_launched_the_same_way():
     source = inspect.getsource(main.main)
 
     assert "agent_proc = subprocess.Popen(" in source
-    assert "[sys.executable, str(AGENT_PATH)]" in source
+    assert '[sys.executable, "-m", "src.agents.agent"]' in source
 
 
 def test_cleanup_no_longer_terminates_a_dashboard_process():

@@ -21,8 +21,8 @@ Nothing here touches the simulation: it only produces a decision.
 
 import sys
 
-import control_panel
-import guard
+from src.ui import control_panel
+from src.core import guard
 
 
 # The rule's name in the same ai_runtime["model"] field the LLMs use, so
@@ -76,7 +76,7 @@ def _agent_module():
     main_module = sys.modules.get("__main__")
     if str(getattr(main_module, "__file__", "")).endswith("agent.py"):
         return main_module
-    import agent
+    from . import agent
 
     return agent
 

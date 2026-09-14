@@ -1,6 +1,6 @@
-import control_panel
-from canvas_gemini import H_Y, LANE, ROAD_W, STOP
-from vehicle import Bus
+import src.ui.control_panel as control_panel
+from src.ui.canvas_gemini import H_Y, LANE, ROAD_W, STOP
+from src.core.vehicle import Bus
 
 
 def make_bus_for_leg(route_id, node_x, bus_id="TEST_BUS"):

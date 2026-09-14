@@ -5,10 +5,10 @@ than an unequipped bus by more than the bounded merge window. If it can reach
 the DBL lane it uses it; if the lane stays blocked it gives the merge up and
 runs in its configured lane instead of holding upstream indefinitely.
 """
-import control_panel
-from canvas_gemini import H_Y, INT_X, LANE
-from signal_controller import SignalController
-from vehicle import DBL_LANE_INDEX, DBL_MERGE_ABANDON_FRAMES, Vehicle
+import src.ui.control_panel as control_panel
+from src.ui.canvas_gemini import H_Y, INT_X, LANE
+from src.core.signal_controller import SignalController
+from src.core.vehicle import DBL_LANE_INDEX, DBL_MERGE_ABANDON_FRAMES, Vehicle
 from tests.helpers import make_bus_for_leg
 
 

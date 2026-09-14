@@ -8,7 +8,7 @@ cached dict on its own clock; the Tk callback only ever reads the cache.
 """
 import time
 
-import telemetry_dashboard as dashboard_module
+import src.ui.telemetry_dashboard as dashboard_module
 
 
 def test_read_cached_gpu_stats_never_calls_subprocess(monkeypatch):

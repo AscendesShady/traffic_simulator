@@ -11,17 +11,17 @@ import time
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
-import canvas_gemini as canvas
-import control_panel
-import guard
-import webster
-import batch_runner
-from vehicle import Vehicle, Bus
-from signal_controller import SignalController
-from telemetry_dashboard import TelemetryDashboard, build_excel_export_filename
-from telemetry_exporter import TelemetryExporter
-from bus_event_log import BusEventTracker, write_bus_events_sheet
-import real_world_units
+from src.ui import canvas_gemini as canvas
+from src.ui import control_panel
+from . import guard
+from . import webster
+from src.experiments import batch_runner
+from .vehicle import Vehicle, Bus
+from .signal_controller import SignalController
+from src.ui.telemetry_dashboard import TelemetryDashboard, build_excel_export_filename
+from src.telemetry.telemetry_exporter import TelemetryExporter
+from src.telemetry.bus_event_log import BusEventTracker, write_bus_events_sheet
+from src.telemetry import real_world_units
 
 # ==========================================================
 # STOCHASTIC SPAWNER ENGINE (COMPOUND POISSON / EXACT RATE)
@@ -111,20 +111,23 @@ def accumulate_frame_metrics(vehicles):
         network_throughput["vehicles_in_network_max"] = len(vehicles)
 
 
-BASE_DIR = Path(__file__).resolve().parent
-TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
-AGENT_PATH = BASE_DIR / "agent.py"
-DECISION_PATH = BASE_DIR / "decision.json"
+BASE_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = BASE_DIR / "data"
+LOGS_DIR = BASE_DIR / "logs"
+RESULTS_DIR = BASE_DIR / "results"
+TELEMETRY_PATH = DATA_DIR / "traffic_state_telemetry.json"
+AGENT_PATH = BASE_DIR / "src" / "agents" / "agent.py"
+DECISION_PATH = DATA_DIR / "decision.json"
 DECISION_STALE_MULTIPLIER = 3
 DECISION_STALE_FLOOR_SEC = 12.0
-AGENT_TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
-TELEMETRY_LOG_PATH = BASE_DIR / "telemetry_log.jsonl"
-BUS_EVENTS_LOG_PATH = BASE_DIR / "bus_events.jsonl"
-EXCEL_EXPORT_DIR = BASE_DIR / "excel_exports"
+AGENT_TURN_LOG_PATH = LOGS_DIR / "agent_turn_log.jsonl"
+TELEMETRY_LOG_PATH = LOGS_DIR / "telemetry_log.jsonl"
+BUS_EVENTS_LOG_PATH = LOGS_DIR / "bus_events.jsonl"
+EXCEL_EXPORT_DIR = RESULTS_DIR
 # The master cross-run comparison dataset: one row per checkpoint of every
 # run, appended forever. Never cleared by RESET -- only the operator deleting
 # the file starts a new dataset. See append_experiment_summary_row.
-EXPERIMENT_SUMMARY_PATH = BASE_DIR / "experiment_summary.csv"
+EXPERIMENT_SUMMARY_PATH = RESULTS_DIR / "experiment_summary.csv"
 TELEMETRY_LOG_INTERVAL = 60
 SESSION_ROUTE_IDS = (
     "R1_EB_A_NB",
@@ -1371,7 +1374,7 @@ def calibrate_saturation_flow(
     behind; the caller re-seeds traffic generation afterwards so the measured
     run itself starts from a clean RNG.
     """
-    from signal_controller import SignalController
+    from .signal_controller import SignalController
 
     approach_cfg = dict(control_panel.approach_configs[CALIBRATION_APPROACH])
     approach_cfg.update(
@@ -2421,7 +2424,7 @@ def main():
 
     print("Launching LLM Control Agent...")
     agent_proc = subprocess.Popen(
-        [sys.executable, str(AGENT_PATH)],
+        [sys.executable, "-m", "src.agents.agent"],
         cwd=str(BASE_DIR),
     )
 

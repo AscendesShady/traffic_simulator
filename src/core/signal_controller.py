@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import control_panel
-from canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
-from vehicle import Bus, DBL_LANE_INDEX
+from src.ui import control_panel
+from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
+from .vehicle import Bus, DBL_LANE_INDEX
 
 RED = "RED"
 YELLOW = "YELLOW"

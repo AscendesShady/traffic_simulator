@@ -13,9 +13,9 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-import control_panel
-import real_world_units
-from guard import ROUTE_ORDER
+from . import control_panel
+from src.telemetry import real_world_units
+from src.core.guard import ROUTE_ORDER
 
 
 COLOR_BG = "#1A1E29"
@@ -40,13 +40,13 @@ SPACE_XS, SPACE_SM, SPACE_MD = 4, 8, 12
 # a 4-wide grid clips its own titles.
 LLM_PORTRAIT_COLUMNS = 2
 
-BASE_DIR = Path(__file__).resolve().parent
-TELEMETRY_FILE = BASE_DIR / "traffic_state_telemetry.json"
-AGENT_TURN_LOG_FILE = BASE_DIR / "agent_turn_log.jsonl"
-TELEMETRY_LOG_FILE = BASE_DIR / "telemetry_log.jsonl"
-BUS_EVENTS_LOG_FILE = BASE_DIR / "bus_events.jsonl"
-AI_CONTROL_FILE = BASE_DIR / "ai_control.json"
-DASHBOARD_EXPORT_DIR = BASE_DIR / "excel_exports"
+BASE_DIR = Path(__file__).resolve().parents[2]
+TELEMETRY_FILE = BASE_DIR / "data" / "traffic_state_telemetry.json"
+AGENT_TURN_LOG_FILE = BASE_DIR / "logs" / "agent_turn_log.jsonl"
+TELEMETRY_LOG_FILE = BASE_DIR / "logs" / "telemetry_log.jsonl"
+BUS_EVENTS_LOG_FILE = BASE_DIR / "logs" / "bus_events.jsonl"
+AI_CONTROL_FILE = BASE_DIR / "data" / "ai_control.json"
+DASHBOARD_EXPORT_DIR = BASE_DIR / "results"
 STALE_AFTER_SECONDS = 2.0
 HISTORY_SAMPLE_SECONDS = 1.0
 HISTORY_MAX_POINTS = 600
@@ -2523,7 +2523,7 @@ class TelemetryDashboard:
             # workbook is self-describing without the control panel.
             inputs_sheet = workbook.create_sheet("Control Panel Inputs")
             try:
-                import main
+                from src.core import main
 
                 main.write_control_panel_inputs_sheet(inputs_sheet)
             except Exception:
@@ -2533,7 +2533,7 @@ class TelemetryDashboard:
             # untreated bus delay can be compared from the same workbook.
             bus_events_sheet = workbook.create_sheet("Bus Events")
             try:
-                from bus_event_log import write_bus_events_sheet
+                from src.telemetry.bus_event_log import write_bus_events_sheet
 
                 write_bus_events_sheet(
                     bus_events_sheet, read_jsonl(BUS_EVENTS_LOG_FILE)

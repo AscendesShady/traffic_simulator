@@ -8,9 +8,9 @@ from tkinter import ttk
 import pygame
 import pytest
 
-import canvas_gemini as canvas
-import control_panel
-import main
+import src.ui.canvas_gemini as canvas
+import src.ui.control_panel as control_panel
+import src.core.main as main
 
 
 def test_fit_canvas_size_keeps_5_3_with_integer_pixels():

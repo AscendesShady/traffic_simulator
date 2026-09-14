@@ -1,9 +1,9 @@
 import random
 
-import control_panel
-import main
-from canvas_gemini import HEIGHT, H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
-from signal_controller import (
+import src.ui.control_panel as control_panel
+import src.core.main as main
+from src.ui.canvas_gemini import HEIGHT, H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
+from src.core.signal_controller import (
     DISCHARGE_ACTIVE,
     DISCHARGE_ALL_RED,
     DISCHARGE_DUE_LEG_GRACE_FRAMES,
@@ -16,10 +16,10 @@ from signal_controller import (
     DischargeStage,
     SignalController,
 )
-from telemetry_dashboard import COLOR_WARNING, TelemetryDashboard
-from telemetry_exporter import TelemetryExporter
+from src.ui.telemetry_dashboard import COLOR_WARNING, TelemetryDashboard
+from src.telemetry.telemetry_exporter import TelemetryExporter
 from tests.helpers import make_bus_for_leg, rectangles_overlap
-from vehicle import Vehicle
+from src.core.vehicle import Vehicle
 
 
 def make_controller(selection=control_panel.DISCHARGE_AUTO):

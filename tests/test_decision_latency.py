@@ -4,7 +4,7 @@ A model needs seconds to answer, and buses keep moving meanwhile. The agent
 carries the previous turn's measured latency forward as a decision horizon and
 shows, per route, where the nearest bus will be when the flags actually land.
 """
-import agent
+import src.agents.agent as agent
 
 
 def telemetry_with_eta(eta_sec, route_id="R1_EB_A_NB"):

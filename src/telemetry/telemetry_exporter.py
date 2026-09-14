@@ -6,13 +6,13 @@ from pathlib import Path
 import tempfile
 import time
 
-import canvas_gemini as canvas
-import control_panel
-from vehicle import Bus, DBL_LANE_INDEX, dbl_lane_is_obstructed
+from src.ui import canvas_gemini as canvas
+from src.ui import control_panel
+from src.core.vehicle import Bus, DBL_LANE_INDEX, dbl_lane_is_obstructed
 
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
+BASE_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_TELEMETRY_PATH = BASE_DIR / "data" / "traffic_state_telemetry.json"
 
 
 class TelemetryExporter:

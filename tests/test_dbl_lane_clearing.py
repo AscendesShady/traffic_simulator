@@ -8,10 +8,10 @@ Every scenario also checks that no two vehicles ever overlap.
 """
 import itertools
 
-import control_panel
-from canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
-from signal_controller import SignalController
-from vehicle import DBL_CLEAR_AHEAD_PX, DBL_LANE_INDEX, Vehicle
+import src.ui.control_panel as control_panel
+from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
+from src.core.signal_controller import SignalController
+from src.core.vehicle import DBL_CLEAR_AHEAD_PX, DBL_LANE_INDEX, Vehicle
 from tests.helpers import make_bus_for_leg, rectangles_overlap
 
 

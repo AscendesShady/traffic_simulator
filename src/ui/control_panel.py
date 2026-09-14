@@ -8,7 +8,7 @@ from tkinter import ttk
 import tempfile
 import sys
 
-import batch_runner
+from src.experiments import batch_runner
 
 # ==========================================================
 # COLOR PALETTE & DESIGN SYSTEM CONSTANTS
@@ -55,8 +55,8 @@ CHIP_PAD_Y = 4               # toggle chips: ~26px tall
 # longest selector label ("Local model").
 LABEL_COLUMN_CHARS = 11
 
-BASE_DIR = Path(__file__).resolve().parent
-AI_CONTROL_PATH = BASE_DIR / "ai_control.json"
+BASE_DIR = Path(__file__).resolve().parents[2]
+AI_CONTROL_PATH = BASE_DIR / "data" / "ai_control.json"
 
 API_MODEL_REGISTRY = {
     "GEMINI_API_KEY": [
@@ -2075,7 +2075,7 @@ def create_dashboard_window(parent=None):
         # source of truth for the checkpoint schedule without a load-time
         # circular import.
         try:
-            import main
+            from src.core import main
             return main.CHECKPOINT_MARKS_SEC
         except Exception:
             return batch_runner.DEFAULT_CHECKPOINT_MARKS_SEC

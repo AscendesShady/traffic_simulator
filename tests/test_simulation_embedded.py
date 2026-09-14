@@ -5,8 +5,8 @@ import inspect
 
 import pygame
 
-import canvas_gemini as canvas
-import main
+import src.ui.canvas_gemini as canvas
+import src.core.main as main
 
 
 def test_build_simulation_canvas_creates_a_fixed_size_canvas():

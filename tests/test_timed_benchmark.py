@@ -12,8 +12,8 @@ import re
 
 import pytest
 
-import control_panel
-import main
+import src.ui.control_panel as control_panel
+import src.core.main as main
 
 
 DURATION_LABELS = ("5 min", "10 min", "15 min", "30 min", "1 hr", "2 hr")

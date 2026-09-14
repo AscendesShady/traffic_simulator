@@ -2,12 +2,12 @@ import random
 
 import pytest
 
-import control_panel
-import main
-from canvas_gemini import HEIGHT, H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
-from signal_controller import SignalController
+import src.ui.control_panel as control_panel
+import src.core.main as main
+from src.ui.canvas_gemini import HEIGHT, H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
+from src.core.signal_controller import SignalController
 from tests.helpers import rectangles_overlap
-from vehicle import Bus, Vehicle
+from src.core.vehicle import Bus, Vehicle
 
 
 LANES = {

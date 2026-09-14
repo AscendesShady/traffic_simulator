@@ -11,8 +11,8 @@ import threading
 import time
 from typing import TypedDict
 
-import guard
-import rule_controller
+from src.core import guard
+from . import rule_controller
 
 try:
     import ollama
@@ -38,12 +38,12 @@ except ImportError:  # Reported as an all-off dependency failure at runtime.
     StateGraph = None
 
 
-BASE_DIR = Path(__file__).resolve().parent
-TELEMETRY_PATH = BASE_DIR / "traffic_state_telemetry.json"
-AI_CONTROL_PATH = BASE_DIR / "ai_control.json"
-DECISION_PATH = BASE_DIR / "decision.json"
+BASE_DIR = Path(__file__).resolve().parents[2]
+TELEMETRY_PATH = BASE_DIR / "data" / "traffic_state_telemetry.json"
+AI_CONTROL_PATH = BASE_DIR / "data" / "ai_control.json"
+DECISION_PATH = BASE_DIR / "data" / "decision.json"
 VERBOSE_LOG = True
-TURN_LOG_PATH = BASE_DIR / "agent_turn_log.jsonl"
+TURN_LOG_PATH = BASE_DIR / "logs" / "agent_turn_log.jsonl"
 STALE_SECONDS = 3.0
 RECENT_DECISION_LIMIT = 5
 DEFAULT_CONTROL = {

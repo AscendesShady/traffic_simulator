@@ -12,13 +12,13 @@ import json
 
 import pytest
 
-import canvas_gemini as canvas
-import control_panel
-import main
-from signal_controller import SignalController
-from telemetry_exporter import TelemetryExporter
-from vehicle import Bus, Vehicle
-from canvas_gemini import H_Y, LANE
+import src.ui.canvas_gemini as canvas
+import src.ui.control_panel as control_panel
+import src.core.main as main
+from src.core.signal_controller import SignalController
+from src.telemetry.telemetry_exporter import TelemetryExporter
+from src.core.vehicle import Bus, Vehicle
+from src.ui.canvas_gemini import H_Y, LANE
 from tests.helpers import make_bus_for_leg
 
 

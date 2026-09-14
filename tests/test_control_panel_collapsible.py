@@ -4,7 +4,7 @@ import inspect
 
 import pytest
 
-import control_panel
+import src.ui.control_panel as control_panel
 
 
 class FakeButton:

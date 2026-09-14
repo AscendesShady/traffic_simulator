@@ -11,12 +11,12 @@ own errors so instrumentation can never crash or alter a run.
 import json
 from pathlib import Path
 
-import canvas_gemini as canvas
-from vehicle import Bus
+from src.ui import canvas_gemini as canvas
+from src.core.vehicle import Bus
 
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_BUS_EVENTS_PATH = BASE_DIR / "bus_events.jsonl"
+BASE_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_BUS_EVENTS_PATH = BASE_DIR / "logs" / "bus_events.jsonl"
 # Same threshold the telemetry queue counter uses to call a vehicle "stopped".
 STOP_SPEED_THRESHOLD = 0.25
 FRAMES_PER_SECOND = 60.0

@@ -7,21 +7,21 @@ from types import SimpleNamespace
 
 import pytest
 
-import control_panel
-import canvas_gemini as canvas
-import main
+import src.ui.control_panel as control_panel
+import src.ui.canvas_gemini as canvas
+import src.core.main as main
 import pygame
-import telemetry_dashboard as telemetry_dashboard_module
-from canvas_gemini import H_Y, LANE
-from signal_controller import SignalController
-from telemetry_dashboard import (
+import src.ui.telemetry_dashboard as telemetry_dashboard_module
+from src.ui.canvas_gemini import H_Y, LANE
+from src.core.signal_controller import SignalController
+from src.ui.telemetry_dashboard import (
     HISTORY_MAX_POINTS,
     TelemetryDashboard,
     _gpu_none,
     build_excel_export_filename,
 )
-from telemetry_exporter import DEFAULT_TELEMETRY_PATH, TelemetryExporter
-from vehicle import Bus, Vehicle
+from src.telemetry.telemetry_exporter import DEFAULT_TELEMETRY_PATH, TelemetryExporter
+from src.core.vehicle import Bus, Vehicle
 from tests.helpers import make_bus_for_leg
 
 

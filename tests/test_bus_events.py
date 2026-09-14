@@ -10,11 +10,11 @@ import json
 
 import pytest
 
-import control_panel
-import main
-from bus_event_log import BUS_EVENT_HEADERS, BusEventTracker, flatten_bus_event
-from canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
-from signal_controller import TSP_ACTION_EXTENDING, TSP_ACTION_NONE, SignalController
+import src.ui.control_panel as control_panel
+import src.core.main as main
+from src.telemetry.bus_event_log import BUS_EVENT_HEADERS, BusEventTracker, flatten_bus_event
+from src.ui.canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
+from src.core.signal_controller import TSP_ACTION_EXTENDING, TSP_ACTION_NONE, SignalController
 from tests.helpers import make_bus_for_leg
 
 

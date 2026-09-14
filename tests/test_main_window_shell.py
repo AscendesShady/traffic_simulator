@@ -7,7 +7,7 @@ pygame canvas) into one Tk process. This covers only the empty shell itself
 import tkinter as tk
 from tkinter import ttk
 
-import main
+import src.core.main as main
 
 
 def test_build_main_window_creates_exactly_one_toplevel():
@@ -61,7 +61,7 @@ def test_window_width_fits_side_panes_and_canvas_without_slack():
     """The window is sized to its content, not the screen: two side panes
     plus the canvas and its gutter, so the network never floats in a wide
     empty center pane on a large monitor."""
-    import canvas_gemini as canvas
+    import src.ui.canvas_gemini as canvas
 
     wide_screen = 3840
     control = main.control_pane_width_for(wide_screen)

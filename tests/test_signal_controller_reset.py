@@ -1,9 +1,9 @@
 import inspect
 
-import control_panel
-import main
-from canvas_gemini import INT_X
-from signal_controller import (
+import src.ui.control_panel as control_panel
+import src.core.main as main
+from src.ui.canvas_gemini import INT_X
+from src.core.signal_controller import (
     DISCHARGE_INACTIVE,
     DISCHARGE_PLAN_STAGES,
     DISCHARGE_RECOVERY_FAILED,

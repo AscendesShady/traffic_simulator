@@ -7,8 +7,8 @@ that only expands when it has something to say, so the whole tab fits in a
 import inspect
 from types import SimpleNamespace
 
-import telemetry_dashboard as telemetry_dashboard_module
-from telemetry_dashboard import TelemetryDashboard
+import src.ui.telemetry_dashboard as telemetry_dashboard_module
+from src.ui.telemetry_dashboard import TelemetryDashboard
 
 
 class FakeWidget:

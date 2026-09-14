@@ -4,11 +4,11 @@ Cycle and green durations are no longer operator inputs: each node's cycle and
 EW/NS split are derived from the configured flows and a saturation flow S
 calibrated fresh at START.
 """
-import control_panel
-import main
-import webster
-from signal_controller import SignalController
-from telemetry_exporter import TelemetryExporter
+import src.ui.control_panel as control_panel
+import src.core.main as main
+import src.core.webster as webster
+from src.core.signal_controller import SignalController
+from src.telemetry.telemetry_exporter import TelemetryExporter
 
 
 # ---------------------------------------------------------------- Part A

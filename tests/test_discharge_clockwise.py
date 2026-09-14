@@ -4,15 +4,15 @@ Each node is served N -> E -> S -> W, with the two corridors acting as the
 shared east and west legs. Legs with nothing queued are skipped so the
 rotation never spends a green on an empty approach.
 """
-import control_panel
-from canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
-from signal_controller import (
+import src.ui.control_panel as control_panel
+from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
+from src.core.signal_controller import (
     DISCHARGE_ACTIVE,
     DISCHARGE_CLOCKWISE_ORDER,
     DISCHARGE_PLAN_STAGES,
     SignalController,
 )
-from vehicle import Vehicle
+from src.core.vehicle import Vehicle
 
 
 def make_controller():

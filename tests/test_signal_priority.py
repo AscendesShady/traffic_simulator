@@ -3,9 +3,9 @@ green (red truncation) that nudge the running Webster cycle, never an
 exclusive single-approach green and never a full cycle restart."""
 import pytest
 
-import control_panel
-from canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
-from signal_controller import (
+import src.ui.control_panel as control_panel
+from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
+from src.core.signal_controller import (
     ARMED,
     CANCELLED,
     COMPLETED,
@@ -19,7 +19,7 @@ from signal_controller import (
     TSP_EXTENDING,
     SignalController,
 )
-from vehicle import DBL_LANE_INDEX, Vehicle
+from src.core.vehicle import DBL_LANE_INDEX, Vehicle
 from tests.helpers import make_bus_for_leg
 
 

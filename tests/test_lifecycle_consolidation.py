@@ -3,7 +3,7 @@ window, and removal of the dead code left over from the three old windows.
 """
 import inspect
 
-import main
+import src.core.main as main
 
 
 def test_main_registers_exactly_one_close_handler():
@@ -16,7 +16,7 @@ def test_close_handler_stops_the_run_and_exits(monkeypatch):
     """It must flip is_running False, then let the already-registered atexit
     cleanup() (agent_proc.terminate() + the combined-export build) run
     exactly once via sys.exit() -- not duplicate that work itself."""
-    import control_panel
+    import src.ui.control_panel as control_panel
 
     source = inspect.getsource(main.main)
     handler_source = source.split(
@@ -38,7 +38,7 @@ def test_close_handler_body_actually_runs(monkeypatch):
     import sys
     import tkinter as tk
 
-    import control_panel
+    import src.ui.control_panel as control_panel
 
     root = tk.Tk()
     try:

@@ -28,14 +28,14 @@ from pathlib import Path
 import statistics
 import sys
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parents[2]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-import canvas_gemini as canvas  # noqa: E402
-import control_panel  # noqa: E402
-import main  # noqa: E402
-from signal_controller import SignalController  # noqa: E402
+from src.ui import canvas_gemini as canvas  # noqa: E402
+from src.ui import control_panel  # noqa: E402
+from src.core import main  # noqa: E402
+from src.core.signal_controller import SignalController  # noqa: E402
 
 FPS = 60
 MEASURED_APPROACH = "EB"

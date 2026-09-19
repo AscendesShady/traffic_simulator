@@ -15,11 +15,14 @@ from src.core.signal_controller import (
     TSP_ACTION_EARLY_GREEN,
     TSP_ACTION_EXTENDING,
     TSP_ACTION_NONE,
+    TSP_DENY_ETA_WINDOW,
+    TSP_DENY_NET_BENEFIT,
     TSP_EARLY_TRUNCATE,
     TSP_EXTENDING,
     SignalController,
 )
 from src.core.vehicle import DBL_LANE_INDEX, Vehicle
+from src.core.signal_controller import PRIORITY_ELIGIBILITY_MAX_PX
 from tests.helpers import make_bus_for_leg
 
 
@@ -363,12 +366,12 @@ def test_early_green_late_arrival_cuts_only_what_is_left():
     green now, and the recorded adjustment is only the remainder."""
     bus = tsp_bus()
     controller = make_controller(min_green_frames=30)
-    start_green(controller, 3, served_frames=GREEN_FRAMES - 5)
+    start_green(controller, 3, served_frames=GREEN_FRAMES - 10)
 
     status = step(controller, [bus])
-    # This frame becomes the last green one; the 4 after it are cut.
+    # This frame becomes the last green one; the 9 after it are cut.
     assert status["tsp_last_action"] == TSP_ACTION_EARLY_GREEN
-    assert status["tsp_last_adjust_frames"] == 4
+    assert status["tsp_last_adjust_frames"] == 9
     assert status["phase_index"] == 4
 
 
@@ -644,3 +647,117 @@ def test_node_status_exposes_tsp_measurement_fields():
     assert extending["tsp_action"] == TSP_ACTION_EXTENDING
     assert extending["tsp_adjust_frames"] == 1
     assert controller.tsp_extension_timer == 1
+
+
+# ---------------------------------------------------------------------------
+# Early-green arrival-time gate (audit: tsp-early-green-mistiming)
+# ---------------------------------------------------------------------------
+
+def place_bus(bus, distance_px, speed):
+    """Put an EB bus ``distance_px`` short of Node A's stop bar at ``speed``."""
+    stop_bar_x = 300 - ROAD_W // 2 - STOP
+    bus.x = stop_bar_x - distance_px - bus.length / 2.0
+    bus.speed = speed
+
+
+def run_conflicting_green(controller, bus, frames=200):
+    """Serve the NS green with the EB bus present; return the states seen and
+    the frame the bus's own green opened (None if it did not)."""
+    states = set()
+    green_opened = None
+    for index in range(frames):
+        status = step(controller, [bus])
+        assert_no_conflicting_green(status["signals"])
+        states.add(status["priority_state"])
+        if status["phase_index"] == 0 and green_opened is None:
+            green_opened = index
+    return states, green_opened
+
+
+def test_t1_far_slow_bus_does_not_trigger_early_green():
+    """A bus ~3000 frames from the bar cannot use a green that ends in
+    ~200 frames: the request stays armed and untreated."""
+    bus = tsp_bus()
+    place_bus(bus, distance_px=390, speed=0.13)
+    controller = make_controller(min_green_frames=30)
+    start_green(controller, 3, served_frames=9)
+
+    states, _ = run_conflicting_green(controller, bus, frames=60)
+
+    assert TSP_EARLY_TRUNCATE not in states
+    request = controller.get_node_status(300)["active_request"]
+    assert request["state"] == ARMED
+    assert request["tsp_action"] == TSP_ACTION_NONE
+    assert request["tsp_gate_reason"] == TSP_DENY_ETA_WINDOW
+
+
+def test_t2_near_bus_gets_early_green_and_crosses_inside_it():
+    """A bus whose ETA lands inside the brought-forward green is served by
+    it: the truncation fires and the bus crosses during that green."""
+    bus = tsp_bus()
+    place_bus(bus, distance_px=120, speed=0.45)  # ETA ~267 frames
+    # 100-frame greens, 20-frame cap: served 60 leaves 20 truncated frames,
+    # then 4 of clearance, so the bus green spans frames [24, 124] from now.
+    controller = make_controller(min_green_frames=30)
+    start_green(controller, 3, served_frames=60)
+
+    cross_frame = None
+    green_window = None
+    for index in range(400):
+        signals = controller.get_all_signals(INT_X)
+        bus.update(signals, INT_X, H_Y, ROAD_W, STOP, LANE, [bus], controller)
+        status = step(controller, [bus])
+        if status["phase_index"] == 0 and green_window is None:
+            green_window = [index, None]
+        if green_window and green_window[1] is None and status["phase_index"] == 1:
+            green_window[1] = index
+        if cross_frame is None and not bus.is_front_bumper_upstream(
+            300, H_Y, ROAD_W, STOP
+        ):
+            cross_frame = index
+        if cross_frame is not None and green_window and green_window[1]:
+            break
+
+    assert controller.get_node_status(300)["tsp_last_action"] == TSP_ACTION_EARLY_GREEN
+    assert green_window[0] <= cross_frame <= green_window[1], (
+        cross_frame, green_window
+    )
+
+
+def test_t3_cut_below_clearance_is_denied_with_reason():
+    """A truncation that cannot pay for its own yellow + all-red never
+    fires; once the bus crosses untreated the request ends DENIED."""
+    bus = tsp_bus()  # at the bar, so it crosses on the ordinary green
+    controller = make_controller(min_green_frames=30)
+    # 3 frames left to cut <= yellow (2) + all-red (2).
+    start_green(controller, 3, served_frames=GREEN_FRAMES - 4)
+
+    for _ in range(400):
+        signals = controller.get_all_signals(INT_X)
+        bus.update(signals, INT_X, H_Y, ROAD_W, STOP, LANE, [bus], controller)
+        status = step(controller, [bus])
+        if 300 in bus.passed_nodes:
+            break
+    assert 300 in bus.passed_nodes
+
+    assert status["tsp_last_action"] == TSP_ACTION_NONE
+    terminal = controller.get_latest_terminal_status_for_bus(bus, 300)
+    assert terminal["state"] == DENIED
+    assert terminal["tsp_action"] == TSP_ACTION_NONE
+    assert terminal["denial_or_cancel_reason"] == TSP_DENY_NET_BENEFIT
+
+
+def test_t4_eligibility_is_clamped_to_link_length(caplog):
+    assert PRIORITY_ELIGIBILITY_MAX_PX == INT_X[1] - INT_X[0] == 400
+    with caplog.at_level("WARNING", logger="src.core.signal_controller"):
+        controller = SignalController(
+            {"green_time": GREEN_FRAMES, "priority_eligibility_px": 800}
+        )
+    assert controller.get_priority_eligibility_px() == 400
+    assert "clamped" in caplog.text
+
+    bus = tsp_bus()
+    place_bus(bus, distance_px=450, speed=0.5)
+    assert not controller.is_bus_tsp_eligible(bus, 300)
+    place_bus(bus, distance_px=390, speed=0.5)
+    assert controller.is_bus_tsp_eligible(bus, 300)

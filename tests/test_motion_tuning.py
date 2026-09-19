@@ -91,7 +91,7 @@ def test_bus_at_400px_uses_configured_eligibility_zone():
     bus.y = H_Y - (DBL_LANE_INDEX + 0.5) * LANE
     _put_bus_at_stop_bar_distance(bus, 400)
 
-    wide = SignalController({"green_time": 100, "priority_eligibility_px": 500})
+    wide = SignalController({"green_time": 100, "priority_eligibility_px": 400})
     narrow = SignalController({"green_time": 100, "priority_eligibility_px": 250})
 
     assert wide.is_bus_tsp_eligible(bus, 300)
@@ -103,11 +103,11 @@ def test_bus_at_400px_uses_configured_eligibility_zone():
 def test_eligibility_slider_value_waits_for_controller_reset():
     config = {"green_time": 100, "priority_eligibility_px": 250}
     controller = SignalController(config)
-    config["priority_eligibility_px"] = 500
+    config["priority_eligibility_px"] = 400
 
     assert controller.get_priority_eligibility_px() == 250
     controller.reset_all_state()
-    assert controller.get_priority_eligibility_px() == 500
+    assert controller.get_priority_eligibility_px() == 400
 
 
 def test_priority_distance_checks_are_not_hardcoded_to_250():
@@ -123,10 +123,11 @@ def test_priority_distance_checks_are_not_hardcoded_to_250():
     assert "get_priority_eligibility_px" in vehicle_source
 
 
-def test_default_priority_window_is_about_sixteen_seconds():
+def test_default_priority_window_is_about_thirteen_seconds():
+    """400 px (the whole link between the nodes) at the 0.5x free-flow speed."""
     seconds = (
         control_panel.global_config["priority_eligibility_px"]
         / (1.0 * control_panel.global_config["vehicle_speed_scale"] * 60.0)
     )
-    assert seconds == pytest.approx(16.6666667)
+    assert seconds == pytest.approx(13.3333333)
 

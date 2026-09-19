@@ -199,7 +199,10 @@ global_config = {
     "sim_speed": 1.0,        # 0.5x to 3.0x speed multiplier
     "green_time": 240,       # Signal green phase duration in frames
     "random_seed": None,     # None = OS entropy; int = reproducible traffic
-    "priority_eligibility_px": 500,  # Applied to SignalController on START/reset
+    # Applied to SignalController on START/reset. Capped at the 400 px link
+    # between the nodes: a bus cannot request priority at a node it has not
+    # been released toward (the controller clamps and logs anything above).
+    "priority_eligibility_px": 400,
     "vehicle_speed_scale": 0.5,      # Pending scale, applied on START/reset
     "_active_vehicle_speed_scale": 0.5,  # Runtime snapshot for this episode
     "reset_triggered": False,# Flag to wipe canvas vehicles
@@ -254,7 +257,7 @@ def set_random_seed(value):
 
 def set_priority_eligibility_px(value):
     """Store the eligibility distance to apply on the next START/reset."""
-    normalized = max(250, min(800, int(round(float(value)))))
+    normalized = max(250, min(400, int(round(float(value)))))
     global_config["priority_eligibility_px"] = normalized
     return normalized
 
@@ -2324,7 +2327,7 @@ def create_dashboard_window(parent=None):
     eligibility_value, eligibility_slider = add_slider_row(
         tuning_body, "Eligibility zone",
         f"{global_config['priority_eligibility_px']} px",
-        250, 800, global_config["priority_eligibility_px"],
+        250, 400, global_config["priority_eligibility_px"],
         update_priority_eligibility, step=10, style="Global.Horizontal.TScale",
     )
 

@@ -13,6 +13,7 @@ from src.core.vehicle import (
     DBL_LANE_INDEX,
     dbl_lane_is_obstructed,
     dbl_lane_queue_ahead,
+    eta_frames_to_stop_bar,
 )
 from src.telemetry import real_world_units as units
 
@@ -317,9 +318,7 @@ class TelemetryExporter:
         )
         free_flow_speed = max(getattr(bus, "max_speed", 1.0), 1e-6)
         eta_frames_freeflow = distance / free_flow_speed if distance > 0 else 0.0
-        live_speed = max(bus.speed, 1e-6)
-        eta_frames_live = distance / live_speed if distance > 0 else 0.0
-        eta_frames_live = min(eta_frames_live, 6000.0)
+        eta_frames_live = eta_frames_to_stop_bar(distance, bus.speed)
         live_cfg = control_panel.bus_routes_config.get(bus.route_id, bus.route_info)
         priority = signal_controller.get_priority_status_for_bus(bus, target_node)
         latest_terminal = signal_controller.get_latest_terminal_status_for_bus(bus)

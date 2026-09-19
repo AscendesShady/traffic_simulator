@@ -113,7 +113,7 @@ def test_car_ahead_of_dbl_bus_moves_out_of_the_lane():
 def test_car_ahead_far_from_bus_is_cleared_without_proximity_gate():
     enable_dbl()
     controller = make_controller()
-    bus = dbl_bus(dist_to_stop_bar=480)
+    bus = dbl_bus(dist_to_stop_bar=390)  # inside the link-length eligibility cap
     far_car = car(bus.x + bus.length / 2 + 9 + 260, DBL_LANE_INDEX)
     vehicles = [bus, far_car]
     controller.update(vehicles)

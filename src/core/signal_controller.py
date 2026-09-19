@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from src.ui import control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
-from src.core.vehicle import Bus, DBL_LANE_INDEX, dbl_lane_is_obstructed
+from src.core.vehicle import (
+    Bus,
+    DBL_LANE_INDEX,
+    dbl_lane_is_obstructed,
+    eta_frames_to_stop_bar,
+)
+
+log = logging.getLogger(__name__)
 
 RED = "RED"
 YELLOW = "YELLOW"
@@ -26,6 +34,16 @@ CANCELLED = "CANCELLED"
 TSP_ACTION_NONE = "none"
 TSP_ACTION_EXTENDING = "extending"
 TSP_ACTION_EARLY_GREEN = "early_green"
+
+# Why an early green was withheld. A request that crosses the stop bar
+# untreated after one of these terminates DENIED carrying the reason.
+TSP_DENY_ETA_WINDOW = "TSP_ETA_OUTSIDE_GREEN_WINDOW"
+TSP_DENY_NET_BENEFIT = "TSP_CUT_BELOW_CLEARANCE"
+
+# A bus may not request priority at a node it has not yet been released
+# toward: the eligibility zone can never exceed the link between the nodes.
+PRIORITY_ELIGIBILITY_MIN_PX = 250.0
+PRIORITY_ELIGIBILITY_MAX_PX = float(INT_X[1] - INT_X[0])
 
 # Conventional TSP bounds: one adjustment may move at most this fraction of
 # the affected phase's Webster green, and a truncated phase always keeps at
@@ -108,6 +126,7 @@ class PriorityRequest:
     attempt_number: int = 1
     tsp_action: str = TSP_ACTION_NONE
     tsp_adjust_frames: int = 0
+    tsp_gate_reason: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +149,7 @@ class PriorityRequest:
             "attempt_number": self.attempt_number,
             "tsp_action": self.tsp_action,
             "tsp_adjust_frames": self.tsp_adjust_frames,
+            "tsp_gate_reason": self.tsp_gate_reason,
         }
 
 
@@ -194,7 +214,16 @@ class SignalController:
             eligibility_px = 500.0
         # This episode snapshot changes only on construction or full reset, so
         # moving the UI slider cannot alter an already-running benchmark.
-        self.priority_eligibility_px = max(250.0, min(800.0, eligibility_px))
+        self.priority_eligibility_px = max(
+            PRIORITY_ELIGIBILITY_MIN_PX,
+            min(PRIORITY_ELIGIBILITY_MAX_PX, eligibility_px),
+        )
+        if self.priority_eligibility_px != eligibility_px:
+            log.warning(
+                "priority_eligibility_px %.0f clamped to %.0f (link length %.0f px)",
+                eligibility_px, self.priority_eligibility_px,
+                PRIORITY_ELIGIBILITY_MAX_PX,
+            )
         self.frame_number = 0
         self.nodes = {node_x: NodeState() for node_x in INT_X}
         self._request_sequence = 0
@@ -1571,11 +1600,26 @@ class SignalController:
             return CANCELLED
         return COMPLETED
 
+    @staticmethod
+    def _finished_state_for(request):
+        """A bus that crossed untreated after its early green was gated out
+        finishes DENIED, carrying the gate's reason; anything else COMPLETED."""
+        if (
+            request.tsp_requested
+            and request.tsp_action == TSP_ACTION_NONE
+            and request.tsp_gate_reason
+        ):
+            request.denial_or_cancel_reason = request.tsp_gate_reason
+            return DENIED
+        return COMPLETED
+
     def _prune_queue(self, node, node_x, vehicles):
         live_queue = []
         for queued_request in node.request_queue:
             if node_x in queued_request.bus.passed_nodes:
-                self._finalize_request(node, queued_request, COMPLETED)
+                self._finalize_request(
+                    node, queued_request, self._finished_state_for(queued_request)
+                )
                 continue
             if self._request_is_live(queued_request, vehicles):
                 live_queue.append(queued_request)
@@ -1600,7 +1644,9 @@ class SignalController:
                 self._finalize_request(
                     node,
                     request,
-                    COMPLETED if finished else self._terminal_state_for(request),
+                    self._finished_state_for(request)
+                    if finished
+                    else self._terminal_state_for(request),
                 )
                 node.active_request = None
                 if node.priority_state == TSP_EXTENDING:
@@ -1651,16 +1697,50 @@ class SignalController:
         node.timer += 1
         request.tsp_adjust_frames = node.priority_timer
 
+    def _early_green_is_feasible(self, node, request, node_x, target_end, cut):
+        """Arrival-time gate on a truncation, evaluated afresh every frame.
+
+        The cut must outweigh the yellow + all-red it runs into, and the bus
+        must be predicted to cross the stop bar inside the green the cut
+        brings forward -- a bus still an ETA away when that green ends would
+        meet the next red and pay for the very cycle it requested. A bus
+        already queued at the bar crosses when the green opens, so its
+        predicted crossing is max(eta, green start). Records the reason on
+        the request when withheld; the request stays armed and is re-checked
+        as the bus closes in.
+        """
+        clearance = self.yellow_time + self.red_clearance_time
+        if cut <= clearance:
+            request.tsp_gate_reason = TSP_DENY_NET_BENEFIT
+            return False
+        bus = request.bus
+        eta = eta_frames_to_stop_bar(
+            self.distance_to_node_stop_bar(bus, node_x), bus.speed
+        )
+        earliest_green = (target_end - node.timer) + clearance
+        latest_useful = earliest_green + self.get_green_time(
+            node_x, self._phase_for_approach(request.originating_approach)
+        )
+        crossing = max(eta, earliest_green)
+        if not earliest_green <= crossing <= latest_useful:
+            request.tsp_gate_reason = TSP_DENY_ETA_WINDOW
+            return False
+        request.tsp_gate_reason = ""
+        return True
+
     def _begin_early_green(self, node, request, node_x):
         """Shorten the running conflicting green, bounded by the cap and the
-        MIN_GREEN floor. Returns False when there is nothing left to cut."""
+        MIN_GREEN floor. Returns False when there is nothing left to cut or
+        the cut fails the arrival-time gate."""
         conflicting = node.phase
         green = self.get_green_time(node_x, conflicting)
         cap = self._tsp_cap_frames(node_x, conflicting)
         shortened = max(self.min_green_frames, green - cap)
         target_end = max(node.timer + 1, shortened)
         cut = green - target_end
-        if cut <= 0:
+        if cut <= 0 or not self._early_green_is_feasible(
+            node, request, node_x, target_end, cut
+        ):
             return False
         node.priority_state = TSP_EARLY_TRUNCATE
         node.tsp_target_end = target_end

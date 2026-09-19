@@ -27,6 +27,24 @@ LANE_CHANGE_STEP_PX = 0.5
 # A car opening a gap for a bus merging into the DBL lane caps its speed at
 # this fraction of its own maximum until the bus's corridor is clear.
 DBL_MERGE_YIELD_SPEED_RATIO = 0.5
+# Slowest speed an arrival estimate may assume. A stopped bus divides by this
+# instead of zero, so one queued a few px from the bar still reads as arriving
+# soon while one stopped far back reads as a long, finite wait.
+# ponytail: 10% of free flow; tune against measured queue-discharge speed.
+ETA_MIN_SPEED_PX_PER_FRAME = 0.05
+ETA_MAX_FRAMES = 6000.0
+
+
+def eta_frames_to_stop_bar(distance_px, speed_px_per_frame):
+    """Frames until a vehicle ``distance_px`` short of a stop bar reaches it
+    at its *current* speed. The one estimator shared by telemetry, the
+    LLM/rule decision path and the signal arbiter, so no two of them can
+    disagree about when a bus arrives."""
+    distance = float(distance_px)
+    if distance <= 0:
+        return 0.0
+    speed = max(float(speed_px_per_frame), ETA_MIN_SPEED_PX_PER_FRAME)
+    return min(ETA_MAX_FRAMES, distance / speed)
 
 
 def corridor_blockers(mover, desired_y, all_vehicles):

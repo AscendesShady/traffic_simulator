@@ -190,6 +190,7 @@ def test_test_autoexports_with_correct_filename(tmp_path, monkeypatch):
     assert workbook.sheetnames == [
         "Decisions",
         "Telemetry",
+        "AI Decision Audit",
         "LLM Performance",
         "LLM Summary",
         "Control Panel Inputs",
@@ -206,6 +207,11 @@ def test_test_autoexports_with_correct_filename(tmp_path, monkeypatch):
     assert ("Global", "random_seed") in recorded
     assert any(key[0].startswith("Approach: ") for key in recorded)
     assert any(key[0].startswith("Route: ") for key in recorded)
+    audit = workbook["AI Decision Audit"]
+    audit_headers = [cell.value for cell in audit[1]]
+    assert audit_headers == main.AI_DECISION_AUDIT_HEADERS
+    assert audit.max_row == 3
+    assert audit.freeze_panes == "A2"
     performance = workbook["LLM Performance"]
     assert performance.max_row == 3  # header plus two logged turns
     summary = workbook["LLM Summary"]
@@ -382,3 +388,41 @@ def test_control_panel_inputs_reflect_live_edits(monkeypatch):
 
     assert recorded[("Global", "random_seed")] == 4242
     assert recorded[("Approach: EB Corridor", "inflow_rate_veh_per_min")] == 27
+
+
+def test_one_workbook_per_run_not_two(tmp_path, monkeypatch):
+    """A run that exported its own workbook skips the session workbook.
+
+    export_session_excel() writes Decisions/Telemetry/AI Decision Audit/
+    Control Panel Inputs from the same JSONL logs a timed test's workbook
+    already carries, alongside its LLM Performance, LLM Summary, Bus Events
+    and Unit Conversions sheets -- so writing both leaves a thinner
+    duplicate beside the full one.
+    """
+    write_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "_run_exported_workbook", False)
+
+    destination = main.export_test_workbook(
+        "model-a", 300, 42, destination=tmp_path / "run.xlsx"
+    )
+
+    assert destination is not None
+    assert main._run_exported_workbook is True
+
+    # A fresh run starts owing a workbook again, so a plain (untimed) run
+    # still gets the session one at exit.
+    class FakeSignals:
+        def reset_all_state(self):
+            pass
+
+    monkeypatch.setattr(main, "reset_traffic_generation", lambda: None)
+    monkeypatch.setattr(main, "calibrate_and_apply_webster", lambda _signals: None)
+    main.perform_full_reset([], FakeSignals())
+
+    assert main._run_exported_workbook is False
+
+    # The exit path is what consumes the flag.
+    cleanup_source = inspect.getsource(main.main).split("def cleanup():", 1)[1]
+    cleanup_source = cleanup_source.split("atexit.register", 1)[0]
+    assert "if not _run_exported_workbook:" in cleanup_source
+    assert "export_session_excel()" in cleanup_source

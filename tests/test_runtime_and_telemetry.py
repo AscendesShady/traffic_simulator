@@ -20,8 +20,13 @@ from src.ui.telemetry_dashboard import (
     _gpu_none,
     build_excel_export_filename,
 )
-from src.telemetry.telemetry_exporter import DEFAULT_TELEMETRY_PATH, TelemetryExporter
-from src.core.vehicle import Bus, Vehicle
+from src.telemetry import real_world_units as units
+from src.telemetry.telemetry_exporter import (
+    DEFAULT_TELEMETRY_PATH,
+    DOWNSTREAM_BLOCKED_PX,
+    TelemetryExporter,
+)
+from src.core.vehicle import Bus, DBL_LANE_INDEX, Vehicle
 from tests.helpers import make_bus_for_leg
 
 
@@ -543,6 +548,31 @@ def test_queue_vehicle_count_unchanged():
     assert exporter.compute_queue_counts(vehicles)["EB"] == 3
 
 
+def test_bus_distribution_by_node_approach_and_route():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    # Mid-route leg (straight lane 1), not the route's natural left-turn/DBL
+    # lane, so the DBL-lane count below isolates the bus explicitly moved in.
+    bus_a = make_bus_for_leg("R2_EB_B_NB", 300, "DIST_BUS_A")
+    bus_b = make_bus_for_leg("R3_EB_ONLY", 700, "DIST_BUS_B")
+    bus_b.lane_index = DBL_LANE_INDEX
+    car = _queued_car(150)
+
+    distribution = exporter.compute_bus_distribution([bus_a, bus_b, car])
+
+    assert distribution["total_buses"] == 2
+    assert distribution["buses_by_node_approach"]["300"]["EB"] == 1
+    assert distribution["buses_by_node_approach"]["700"]["EB"] == 1
+    assert distribution["buses_by_route"] == {
+        "R2_EB_B_NB": 1,
+        "R3_EB_ONLY": 1,
+    }
+    assert distribution["buses_in_dbl_lane"] == 1
+
+    controller = SignalController({"green_time": 20})
+    payload = exporter.build_payload(controller, [bus_a, bus_b, car], 60)
+    assert payload["bus_distribution"] == distribution
+
+
 def test_queue_passengers_per_node():
     exporter = TelemetryExporter(export_interval_frames=1)
     controller = SignalController({"green_time": 20})
@@ -593,6 +623,130 @@ def test_empty_approach_zero():
             assert node["total_waiting_passengers_est"] == 0
 
 
+def _downstream_eb_cars(x_positions, lanes=(0,)):
+    """Stopped EB cars on the road between the two nodes (past Node A)."""
+    cars = []
+    for lane_index in lanes:
+        for x in x_positions:
+            car = Vehicle(
+                x, H_Y - (lane_index + 0.5) * LANE, "EB", lane_index=lane_index
+            )
+            car.passed_nodes.add(canvas.INT_X[0])
+            car.speed = 0.0
+            cars.append(car)
+    return cars
+
+
+def test_queue_length_metres_zero_when_nothing_queued():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    controller = SignalController({"green_time": 20})
+    moving_car = Vehicle(200, H_Y - 0.5 * LANE, "EB", lane_index=0)
+    moving_car.speed = 1.0
+
+    for vehicles in ([], [moving_car]):
+        by_node = exporter.compute_queue_length_by_node(vehicles)
+        assert by_node == {
+            "300": {"EB": 0.0, "WB": 0.0, "NB": 0.0, "SB": 0.0},
+            "700": {"EB": 0.0, "WB": 0.0, "NB": 0.0, "SB": 0.0},
+        }
+        payload = exporter.build_payload(controller, vehicles, 60)
+        assert payload["network_summary"]["queue_length_m_by_node"] == by_node
+        for node in payload["signal_state"]["nodes"].values():
+            assert node["queue_length_m"] == {
+                "EB": 0.0, "WB": 0.0, "NB": 0.0, "SB": 0.0
+            }
+
+
+def test_queue_length_metres_matches_furthest_queued_vehicle():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    controller = SignalController({"green_time": 20})
+    # Three stopped EB cars short of Node A; the one at x=140 is the tail.
+    vehicles = [_queued_car(200), _queued_car(170), _queued_car(140)]
+    tail_px = max(
+        v.distance_to_node_stop_bar(300, H_Y, canvas.ROAD_W, canvas.STOP)
+        for v in vehicles
+    )
+    assert tail_px == vehicles[-1].distance_to_node_stop_bar(
+        300, H_Y, canvas.ROAD_W, canvas.STOP
+    )
+
+    by_node = exporter.compute_queue_length_by_node(vehicles)
+    assert by_node["300"]["EB"] == pytest.approx(units.px_to_m(tail_px), abs=0.1)
+    assert by_node["300"]["EB"] > 0
+    assert by_node["300"]["WB"] == 0.0
+    assert by_node["700"]["EB"] == 0.0
+
+    # A longer queue reports a longer length; the value rides the payload.
+    longer = vehicles + [_queued_car(80)]
+    assert (
+        exporter.compute_queue_length_by_node(longer)["300"]["EB"]
+        > by_node["300"]["EB"]
+    )
+    payload = exporter.build_payload(controller, vehicles, 60)
+    node_a = payload["signal_state"]["nodes"]["300"]
+    assert node_a["queue_length_m"] == by_node["300"]
+    assert payload["network_summary"]["queue_length_m_by_node"] == by_node
+
+
+def test_downstream_space_decreases_as_downstream_road_fills():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    empty_space, empty_blocked = exporter.compute_downstream_space_by_node([])
+    # Empty network: EB at Node A sees the full node-to-node stretch, EB at
+    # Node B sees the stretch to the canvas edge; nothing is blocked.
+    node_gap_px = canvas.INT_X[1] - canvas.INT_X[0] - canvas.ROAD_W
+    edge_px = canvas.WIDTH - canvas.INT_X[1] - canvas.ROAD_W / 2
+    assert empty_space["300"]["EB"] == pytest.approx(
+        units.px_to_m(node_gap_px), abs=0.1
+    )
+    assert empty_space["700"]["EB"] == pytest.approx(
+        units.px_to_m(edge_px), abs=0.1
+    )
+    assert empty_space["300"]["WB"] == empty_space["700"]["EB"]
+    assert empty_space["700"]["WB"] == empty_space["300"]["EB"]
+    assert not any(any(row.values()) for row in empty_blocked.values())
+
+    # Filling the EB road between the nodes lowers Node A's EB downstream
+    # space monotonically, and touches nothing else.
+    previous = empty_space["300"]["EB"]
+    for count in (3, 6, 9):
+        cars = _downstream_eb_cars(range(380, 380 + 30 * count, 30))
+        space, _blocked = exporter.compute_downstream_space_by_node(cars)
+        assert space["300"]["EB"] < previous
+        previous = space["300"]["EB"]
+        assert space["300"]["WB"] == empty_space["300"]["WB"]
+        assert space["700"]["EB"] == empty_space["700"]["EB"]
+        assert space["300"]["NB"] == empty_space["300"]["NB"]
+
+
+def test_downstream_blocked_when_downstream_road_nearly_full():
+    exporter = TelemetryExporter(export_interval_frames=1)
+    controller = SignalController({"green_time": 20})
+    # Every lane of the EB road between the nodes packed nose to tail.
+    jammed = _downstream_eb_cars(range(380, 634, 30), lanes=(0, 1, 2))
+
+    space, blocked = exporter.compute_downstream_space_by_node(jammed)
+    assert space["300"]["EB"] < units.px_to_m(DOWNSTREAM_BLOCKED_PX)
+    assert blocked["300"]["EB"] is True
+    assert blocked["300"]["WB"] is False
+    assert blocked["700"]["EB"] is False
+
+    # One lane's worth of cars is not a blockage.
+    _space, partial = exporter.compute_downstream_space_by_node(
+        _downstream_eb_cars(range(380, 634, 30))
+    )
+    assert partial["300"]["EB"] is False
+
+    payload = exporter.build_payload(controller, jammed, 60)
+    node_a = payload["signal_state"]["nodes"]["300"]
+    assert node_a["downstream_blocked"]["EB"] is True
+    assert node_a["downstream_space_m"] == space["300"]
+    summary = payload["network_summary"]
+    assert summary["downstream_space_m_by_node"] == space
+    assert summary["downstream_blocked_by_node"] == blocked
+    # The downstream signal never touches the queue-based fields.
+    assert node_a["queues"]["EB"] == 0
+
+
 def test_telemetry_includes_congestion_demand_backlog(tmp_path):
     controller = SignalController({"green_time": 20})
     exporter = TelemetryExporter(tmp_path / "state.json", 1)
@@ -634,6 +788,26 @@ def test_telemetry_export_atomically_writes_valid_schema(tmp_path):
     assert not list(tmp_path.glob("tmp*"))
 
 
+def test_session_telemetry_log_preserves_full_audit_snapshot(tmp_path, monkeypatch):
+    destination = tmp_path / "telemetry.jsonl"
+    monkeypatch.setattr(main, "TELEMETRY_LOG_PATH", destination)
+    monkeypatch.setattr(main, "_last_telemetry_log_frame", None)
+    payload = {
+        "timestamp": 123.5,
+        "simulation_time_seconds": 1.0,
+        "network_summary": {"total_vehicles": 1, "queues": {"EB": 1}},
+        "network_throughput": {"passengers_served_total": 0},
+        "vehicle_positions": [
+            {"snapshot_id": "car-1", "x_px": 10.0, "y_px": 20.0}
+        ],
+    }
+
+    assert main.log_telemetry_sample(main.TELEMETRY_LOG_INTERVAL, payload) is True
+    logged = json.loads(destination.read_text(encoding="utf-8"))
+    assert logged["timestamp"] == 123.5
+    assert logged["telemetry_snapshot"] == payload
+
+
 def test_schema_v3_exposes_bus_eta_routes_and_passenger_weighted_queues():
     controller = SignalController({"green_time": 20})
     exporter = TelemetryExporter(export_interval_frames=1)
@@ -662,6 +836,7 @@ def test_schema_v3_exposes_bus_eta_routes_and_passenger_weighted_queues():
         "signal_state",
         "active_buses",
         "approaching_buses",
+        "vehicle_positions",
         "demand_generation",
         "network_discharge",
     } <= payload.keys()
@@ -678,6 +853,15 @@ def test_schema_v3_exposes_bus_eta_routes_and_passenger_weighted_queues():
     assert route["nearest_bus_eta_sec"] == bus_state["eta_to_stop_bar_sec_freeflow"]
     assert bus_state["lane_index"] == bus.lane_index
     assert bus_state["in_dbl_lane"] is True
+    positions = payload["vehicle_positions"]
+    assert len(positions) == 2
+    assert positions[0]["snapshot_id"] == "ETA_BUS"
+    assert positions[0]["vehicle_type"] == "bus"
+    assert positions[0]["route_id"] == "R1_EB_A_NB"
+    assert positions[0]["x_px"] == pytest.approx(bus.x)
+    assert positions[1]["vehicle_type"] == "car"
+    assert positions[1]["lane_index"] == car.lane_index
+    assert positions[1]["speed_px_per_frame"] == 0.0
     summary = payload["network_summary"]
     assert summary["queues_passengers_est"] == exporter._flatten_queue_counts(
         exporter.compute_queue_passengers_by_node([bus, car])
@@ -1197,7 +1381,7 @@ def test_llm_excel_export_writes_samples_and_per_model_summary(tmp_path):
 
     workbook = load_workbook(destination, data_only=True)
     try:
-        assert workbook.sheetnames == ["Samples", "Summary"]
+        assert workbook.sheetnames == ["Samples", "Summary", "AI Decision Audit"]
         samples = workbook["Samples"]
         summary = workbook["Summary"]
         sample_headers = [cell.value for cell in samples[1]]
@@ -1216,6 +1400,9 @@ def test_llm_excel_export_writes_samples_and_per_model_summary(tmp_path):
         assert summary_row["held_pct"] == 50.0
         assert summary_row["avg_latency_ms"] == 23000.0
         assert summary_row["total_output_tokens"] == 20.0
+        audit = workbook["AI Decision Audit"]
+        assert [cell.value for cell in audit[1]] == main.AI_DECISION_AUDIT_HEADERS
+        assert audit.max_row == 3
     finally:
         workbook.close()
     assert dashboard.llm_export_status_lbl.values["fg"] == "#2ECC71"
@@ -1250,6 +1437,36 @@ def test_export_all_creates_core_sheets(tmp_path, monkeypatch):
                 "locked_routes": [route_id],
                 "minimap": "ROUTES:\n1) route one",
                 "raw_output": '{"tsp":[true]}',
+                "telemetry_snapshot": {
+                    "timestamp": 99.5,
+                    "frame_number": 118,
+                    "simulation_time_seconds": 1.967,
+                    "routes": {
+                        route_id: {
+                            "tsp_enabled": True,
+                            "dbl_enabled": False,
+                            "nearest_bus_priority_pending": True,
+                            "dbl_lane_queue_ahead": 0,
+                            "dbl_lane_obstructed": False,
+                            "buses_on_route": 2,
+                            "route_passengers_total": 90,
+                        }
+                    },
+                    "signal_state": {"nodes": {}},
+                    "network_summary": {"total_vehicles": 1},
+                    "network_throughput": {
+                        "passengers_per_minute_recent": 49.0
+                    },
+                    "vehicle_positions": [
+                        {
+                            "snapshot_id": "BUS-1",
+                            "vehicle_type": "bus",
+                            "route_id": route_id,
+                            "x_px": 250.0,
+                            "y_px": 245.0,
+                        }
+                    ],
+                },
             }
         )
         + "\nnot-json\n",
@@ -1321,6 +1538,7 @@ def test_export_all_creates_core_sheets(tmp_path, monkeypatch):
             "LLM Summary",
         ]
         assert workbook.sheetnames == session_sheets + [
+            "AI Decision Audit",
             "Control Panel Inputs",
             "Bus Events",
             "Unit Conversions",
@@ -1345,6 +1563,23 @@ def test_export_all_creates_core_sheets(tmp_path, monkeypatch):
         ).value is True
         assert workbook["LLM Performance"]["C2"].value == "model-a"
         assert workbook["LLM Summary"]["A2"].value == "model-a"
+        audit_row = dict(
+            zip(
+                [cell.value for cell in workbook["AI Decision Audit"][1]],
+                [cell.value for cell in workbook["AI Decision Audit"][2]],
+            )
+        )
+        assert audit_row["model_reason"] == "Serve route one."
+        assert audit_row["requested_tsp_routes"] == route_id
+        assert audit_row["observation_minimap"] == "ROUTES:\n1) route one"
+        assert audit_row["observed_tsp_routes"] == route_id
+        assert audit_row["pending_priority_routes"] == route_id
+        # Per-route load at the decision instant, flattened for reading the
+        # decision against the state it was made from.
+        assert audit_row["route_vehicles_json"] == f'{{"{route_id}":2}}'
+        assert audit_row["route_passengers_json"] == f'{{"{route_id}":90}}'
+        assert audit_row["vehicle_count"] == 1
+        assert '"snapshot_id":"BUS-1"' in audit_row["vehicle_positions_json"]
     finally:
         workbook.close()
     assert dashboard.export_all_status_lbl.values["fg"] == "#2ECC71"
@@ -1545,6 +1780,7 @@ def test_summary_snapshot_export_reconciles_live_telemetry(tmp_path):
             "Queues & Demand",
             "Routes",
             "Signal Nodes",
+            "AI Decision Audit",
         ]
         overview = {
             row[0]: row[1]
@@ -1557,6 +1793,12 @@ def test_summary_snapshot_export_reconciles_live_telemetry(tmp_path):
         assert workbook["Queues & Demand"]["A2"].value == "EB"
         assert workbook["Routes"]["A2"].value == "R1_EB_A_NB"
         assert workbook["Signal Nodes"]["A2"].value == "300"
+        audit = workbook["AI Decision Audit"]
+        audit_row = dict(
+            zip([cell.value for cell in audit[1]], [cell.value for cell in audit[2]])
+        )
+        assert audit_row["observed_tsp_routes"] == "R1_EB_A_NB"
+        assert audit_row["simulation_time_s"] == 2.0
     finally:
         workbook.close()
     assert dashboard.summary_export_status_lbl.values["fg"] == "#2ECC71"
@@ -1594,6 +1836,7 @@ def test_session_trends_export_uses_only_in_memory_history(tmp_path):
             "Session Trends",
             "Session Charts",
             "Summary",
+            "AI Decision Audit",
         ]
         trends = workbook["Session Trends"]
         assert trends.max_row == 3
@@ -1756,6 +1999,35 @@ def test_congestion_backlog_survives_blocked_spawn_and_drains_on_admission(
     main.reset_all_spawner_states()
 
 
+def test_active_dbl_retains_new_general_left_turn_at_source(monkeypatch):
+    config = control_panel.bus_routes_config["R1_EB_A_NB"]
+    monkeypatch.setitem(config, "dbl_enabled", True)
+    bus = make_bus_for_leg("R1_EB_A_NB", 300, "SPAWN_GUARD_BUS")
+    controller = SignalController({"green_time": 999})
+    controller.update([bus])
+    assert controller.is_dbl_active_for_approach(300, "EB")
+
+    monkeypatch.setattr(main, "should_spawn_vehicle", lambda *args: True)
+    monkeypatch.setattr(main.random, "random", lambda: 0.5)
+    spawned = []
+    main.try_spawn_vehicle(
+        spawned,
+        "EB",
+        "EB",
+        -20,
+        lane_options()["EB"],
+        {
+            "model": "Poisson",
+            "rate": 60,
+            "turn_split": 0.0,
+            "heavy_ratio": 0.0,
+        },
+        signal_controller=controller,
+    )
+
+    assert spawned == []
+
+
 def test_congestion_peak_cycles_to_recovery_and_caps_backlog(monkeypatch):
     main.reset_all_spawner_states()
     monkeypatch.setattr(main.random, "random", lambda: 1.0)
@@ -1873,6 +2145,138 @@ def test_dashboard_shows_active_and_pending_priority_separately():
     assert dashboard.vars["tsp"].values["text"] == "1/1"
     assert dashboard.vars["dbl"].values["text"] == "1/1"
     assert dashboard.vars["queued"].values["text"] == "0/4"
+
+
+def test_webster_timing_readout_lives_in_the_dashboard_summary_tab():
+    """Webster timing is reported by the dashboard, not the control panel:
+    measured capacity plus each node's condition/cycle/demand ratio in the
+    timing card, and the green split under each live signal diagram."""
+
+    class FakeLabel:
+        def __init__(self):
+            self.values = {}
+            self.packed = False
+
+        def config(self, **kwargs):
+            self.values.update(kwargs)
+
+        def pack(self, **_kwargs):
+            self.packed = True
+
+        def pack_forget(self):
+            self.packed = False
+
+        def winfo_manager(self):
+            return "pack" if self.packed else ""
+
+    class FakeCanvas:
+        def __init__(self):
+            self.green_time_label = FakeLabel()
+
+        def winfo_width(self):
+            return 170
+
+    class FakeCard:
+        @staticmethod
+        def winfo_width():
+            return 320
+
+    def fake_node_card():
+        return {
+            "card": FakeLabel(), "state": FakeLabel(), "title": FakeLabel(),
+            "cycle": FakeLabel(), "ratio": FakeLabel(), "note": FakeLabel(),
+        }
+
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.node_a_canvas = FakeCanvas()
+    dashboard.node_b_canvas = FakeCanvas()
+    dashboard.webster_status_lbl = FakeLabel()
+    dashboard.webster_status_lbl.master = FakeCard()
+    dashboard.webster_node_cards = {300: fake_node_card(), 700: fake_node_card()}
+
+    control_panel.global_config["calibrating"] = False
+    control_panel.global_config["measured_saturation_flow"] = 1800.0
+    control_panel.global_config["webster_splits"] = {
+        300: {
+            "cycle_time_sec": 60.0, "Y": 0.5, "y_ew": 0.3, "y_ns": 0.2,
+            "EW_green_sec": 26.5, "NS_green_sec": 18.0, "oversaturated": False,
+        },
+    }
+
+    dashboard._refresh_webster_timing_labels()
+
+    assert "1,800" in dashboard.webster_status_lbl.values["text"]
+    node_a = dashboard.webster_node_cards[300]
+    assert node_a["card"].packed
+    assert node_a["state"].values["text"] == "Optimal"
+    assert "60 s" in node_a["cycle"].values["text"]
+    assert "EW 0.30" in node_a["ratio"].values["text"]
+    assert "Total 0.50" in node_a["ratio"].values["text"]
+    assert node_a["note"].values.get("text", "") == ""
+    # Node B has no calibrated split: the card still shows, reporting the
+    # gap explicitly rather than timing that was never measured.
+    node_b = dashboard.webster_node_cards[700]
+    assert node_b["card"].packed
+    assert node_b["state"].values["text"] == "Unavailable"
+    assert "no timing data" in node_b["cycle"].values["text"]
+
+    node_a_green = dashboard.node_a_canvas.green_time_label.values["text"]
+    assert "26.5" in node_a_green
+    assert "18.0" in node_a_green
+    assert dashboard.node_b_canvas.green_time_label.values["text"] == "Green time: --"
+
+
+def test_oversaturated_node_shows_capped_cycle_and_warning_note():
+    class FakeLabel:
+        def __init__(self):
+            self.values = {}
+            self.packed = False
+
+        def config(self, **kwargs):
+            self.values.update(kwargs)
+
+        def pack(self, **_kwargs):
+            self.packed = True
+
+        def pack_forget(self):
+            self.packed = False
+
+        def winfo_manager(self):
+            return "pack" if self.packed else ""
+
+    class FakeCanvas:
+        def __init__(self):
+            self.green_time_label = FakeLabel()
+
+        def winfo_width(self):
+            return 170
+
+    dashboard = TelemetryDashboard.__new__(TelemetryDashboard)
+    dashboard.node_a_canvas = FakeCanvas()
+    dashboard.node_b_canvas = FakeCanvas()
+    dashboard.webster_node_cards = {
+        300: {
+            "card": FakeLabel(), "state": FakeLabel(), "title": FakeLabel(),
+            "cycle": FakeLabel(), "ratio": FakeLabel(), "note": FakeLabel(),
+        }
+    }
+
+    control_panel.global_config["calibrating"] = False
+    control_panel.global_config["measured_saturation_flow"] = 1500.0
+    control_panel.global_config["webster_splits"] = {
+        300: {
+            "cycle_time_sec": 120.0, "Y": 1.2, "y_ew": 0.7, "y_ns": 0.5,
+            "EW_green_sec": 60.0, "NS_green_sec": 40.0, "oversaturated": True,
+        },
+    }
+
+    dashboard._refresh_webster_timing_labels()
+
+    refs = dashboard.webster_node_cards[300]
+    assert refs["state"].values["text"] == "Oversaturated"
+    assert "capped" in refs["cycle"].values["text"]
+    assert refs["note"].packed
+    assert "Reduce demand" in refs["note"].values["text"]
 
 
 def test_dbl_lamp_uses_distinct_pending_active_and_clearing_colors(monkeypatch):

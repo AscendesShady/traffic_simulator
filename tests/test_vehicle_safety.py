@@ -137,6 +137,73 @@ def test_conflict_matrix_allows_same_green_axis_but_blocks_perpendicular_axis():
     assert controller.movements_conflict("EB", "LEFT", "EB", "LEFT")
 
 
+def test_unrestricted_left_turn_crosses_on_red_when_conflict_free():
+    """A general left turn yields for conflicts, not for its approach lamp."""
+    vehicle = Vehicle(
+        210,
+        H_Y - 2.5 * LANE,
+        "EB",
+        target_turn="LEFT",
+        lane_index=DBL_LANE_INDEX,
+    )
+    controller = SignalController({"green_time": 999})
+
+    for _ in range(180):
+        vehicle.update(
+            signals_for("EB", "RED"),
+            INT_X,
+            H_Y,
+            ROAD_W,
+            STOP,
+            LANE,
+            [vehicle],
+            controller,
+        )
+        controller.update([vehicle])
+        if vehicle.direction == "NB":
+            break
+
+    assert vehicle.direction == "NB"
+    assert vehicle.speed > 0.0
+
+
+def test_unrestricted_left_turn_yields_to_conflicting_reserved_movement():
+    left_turner = Vehicle(
+        210,
+        H_Y - 2.5 * LANE,
+        "EB",
+        target_turn="LEFT",
+        lane_index=DBL_LANE_INDEX,
+    )
+    crossing = Vehicle(
+        300 - 1.5 * LANE,
+        H_Y + ROAD_W / 2 + STOP + 9 + 5,
+        "NB",
+        target_turn="STRAIGHT",
+        lane_index=1,
+        assigned_node_x=300,
+    )
+    controller = SignalController({"green_time": 999})
+    vehicles = [crossing, left_turner]
+    assert controller.request_intersection_entry(crossing, 300, vehicles)
+
+    starting_x = left_turner.x
+    left_turner.update(
+        signals_for("EB", "RED"),
+        INT_X,
+        H_Y,
+        ROAD_W,
+        STOP,
+        LANE,
+        vehicles,
+        controller,
+    )
+
+    assert left_turner.x == starting_x
+    assert left_turner.speed == 0.0
+    assert id(left_turner) not in controller.nodes[300].reservations
+
+
 def test_r1_bus_follows_left_turner_before_entire_node_is_empty():
     leader = make_bus_for_leg("R1_EB_A_NB", 300, "R1_LEADER")
     follower = make_bus_for_leg("R1_EB_A_NB", 300, "R1_FOLLOWER")
@@ -237,7 +304,7 @@ def test_left_turn_lane_change_still_works():
     assert bus.y == H_Y - 2.5 * LANE
 
 
-def test_dbl_migration_respects_clear_lane():
+def test_dbl_migration_is_refused_when_lane_obstructed():
     config = control_panel.bus_routes_config["R2_EB_B_NB"]
     config["dbl_enabled"] = True
     bus = make_bus_for_leg("R2_EB_B_NB", 300, "BLOCKED_DBL")
@@ -266,7 +333,8 @@ def test_dbl_migration_respects_clear_lane():
 
     assert bus.y == starting_y
     assert bus.lane_index == 1
-    assert bus.must_hold_for_lane is True
+    assert bus.must_hold_for_lane is False
+    assert bus.dbl_merge_abandoned_for_leg is True
 
 
 def test_dbl_car_ahead_does_not_deadlock_bus():
@@ -337,6 +405,46 @@ def test_multileg_bus_reserves_next_lane_before_crossing_first_node():
     assert bus.x == starting_x
     assert bus.speed == 0.0
     assert 700 not in bus.passed_nodes
+
+
+def test_dbl_bus_already_in_next_lane_ignores_obsolete_merge_storage_gate(
+    monkeypatch,
+):
+    """DBL moved R4 to lane 2, so no post-Node-B lane-2 merge is pending."""
+    config = control_panel.bus_routes_config["R4_WB_A_SB"]
+    monkeypatch.setitem(config, "dbl_enabled", True)
+    bus = make_bus_for_leg("R4_WB_A_SB", 700, "R4_DBL_IN_TARGET_LANE")
+    bus.lane_index = DBL_LANE_INDEX
+    bus.y = H_Y + 2.5 * LANE
+    controller = SignalController({"green_time": 999})
+    merge_x = bus.route_merge_point_x(700, ROAD_W)
+    blocker = Vehicle(
+        merge_x,
+        H_Y + 2.5 * LANE,
+        "WB",
+        max_speed=0.0,
+        lane_index=DBL_LANE_INDEX,
+    )
+    blocker.passed_nodes.add(700)
+    vehicles = [bus, blocker]
+    controller.update(vehicles)
+    starting_x = bus.x
+
+    assert controller.is_dbl_active_for_approach(700, "WB")
+    bus.update(
+        signals_for("WB", "GREEN"),
+        INT_X,
+        H_Y,
+        ROAD_W,
+        STOP,
+        LANE,
+        vehicles,
+        controller,
+    )
+
+    assert bus.route_exit_merge_blocked is False
+    assert bus.x < starting_x
+    assert bus.speed > 0.0
 
 
 def test_r4_moves_to_next_legs_lane_immediately_after_node_b():

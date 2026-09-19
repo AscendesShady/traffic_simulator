@@ -23,6 +23,11 @@ COLOR_WARNING = "#F59E0B"     # Amber / Orange
 COLOR_DANGER = "#EF4444"      # Red / Alert
 COLOR_TEXT_PRIMARY = "#FFFFFF"# Crisp white
 COLOR_TEXT_SECONDARY = "#94A3B8"# Soft light blue-gray
+# An OFF toggle chip's resting fill: distinctly lighter than COLOR_CARD_BORDER
+# (which is a decorative outline/border shade, not meant to double as a fill)
+# so an OFF chip reads as a real, visible control state rather than blending
+# into the card behind it.
+COLOR_TOGGLE_OFF = "#475569"
 
 FONT_FAMILY = "Segoe UI"      # Clean UI font
 
@@ -112,10 +117,8 @@ SECTION_ACCENT_INTERVENTION = COLOR_DANGER
 SECTION_ORDER = (
     "Approach Traffic",
     "Bus Routes",
-    "AI / LLM",
-    "Run Controls",
-    "Benchmark Test",
-    "Batch Benchmark",
+    "Single Run",
+    "Batch Run",
     "Tuning",
     "Gridlock Discharge",
 )
@@ -163,6 +166,11 @@ DEFAULT_BATCH_RUNTIME = {
     "total": 0,
     "current": None,
     "results": [],
+    # Independent of the Single Run card's own "Decision interval" slider:
+    # applies to the single Benchmark Test and to every queued Batch
+    # Benchmark run, so an unattended sweep is never silently governed by
+    # whatever the Single Run panel happens to be set to.
+    "tick_seconds": 5,
 }
 
 # Live widget references used by the periodic repaint poller. The data in
@@ -555,6 +563,23 @@ def add_hover_state(button):
     return button
 
 
+def refresh_hover_rest_bg(button, bg):
+    """Keep a hover-decorated button's cached rest colour in sync with a repaint.
+
+    add_hover_state caches the resting background at <Enter> and restores
+    exactly that value at <Leave>. That is correct for a continuously
+    repainted status button (see add_hover_state's docstring), but a button
+    repainted only on click -- every toggle chip -- is normally still
+    "hovered" at the moment of that click (the pointer has to be over it to
+    click it), so without this the cached pre-click colour survives the
+    repaint and reappears the instant the pointer leaves, i.e. the chip
+    never visibly changes state until the next full hover cycle. Call this
+    right after any such one-shot repaint.
+    """
+    if getattr(button, "_hover_rest_bg", None) is not None:
+        button._hover_rest_bg = bg
+
+
 class OutlinedButton(tk.Button):
     """A flat button inside a 1px frame that draws its outline.
 
@@ -645,21 +670,29 @@ def paint_toggle_chip(button, on, on_color, on_text, off_text):
     depends on colour alone.
     """
     if on:
+        bg = on_color
+        fg = COLOR_BG if on_color in (COLOR_SUCCESS, COLOR_WARNING) else COLOR_TEXT_PRIMARY
         button.config(
             text=on_text,
-            bg=on_color,
-            fg=COLOR_BG if on_color in (COLOR_SUCCESS, COLOR_WARNING) else COLOR_TEXT_PRIMARY,
+            bg=bg,
+            fg=fg,
             activebackground=on_color,
-            activeforeground=COLOR_BG if on_color in (COLOR_SUCCESS, COLOR_WARNING) else COLOR_TEXT_PRIMARY,
+            activeforeground=fg,
         )
     else:
+        bg = COLOR_TOGGLE_OFF
         button.config(
             text=off_text,
-            bg=COLOR_CARD_BORDER,
-            fg=COLOR_TEXT_SECONDARY,
-            activebackground="#475569",
+            bg=bg,
+            fg=COLOR_TEXT_PRIMARY,
+            activebackground=COLOR_CARD_BORDER,
             activeforeground=COLOR_TEXT_PRIMARY,
         )
+    # A toggle chip is repainted only on click, and the pointer has to be
+    # over it to click it -- so without this, add_hover_state's cached
+    # pre-click colour survives the repaint and silently reappears the
+    # instant the pointer leaves the chip.
+    refresh_hover_rest_bg(button, bg)
     return bool(on)
 
 
@@ -835,6 +868,16 @@ def make_section(parent, title, accent=COLOR_TEXT_PRIMARY, expanded=True, on_tog
     control_panel_sections[title] = section
     return section
 
+
+def make_subsection_heading(parent, title, first=False):
+    """Add a compact label that separates tools merged into one run card."""
+    row = tk.Frame(parent, bg=COLOR_CARD)
+    row.pack(fill="x", pady=((0 if first else SPACE_MD), SPACE_SM))
+    make_label(row, title, bold=True, color=COLOR_TEXT_PRIMARY).pack(side="left")
+    rule = tk.Frame(row, bg=COLOR_CARD_BORDER, height=1)
+    rule.pack(side="left", fill="x", expand=True, padx=(SPACE_SM, 0))
+    return row
+
 # ----------------------------------------------------------
 # 6 SIMULTANEOUS BUS ROUTES (NODE B CORRECTED TO X=700)
 # ----------------------------------------------------------
@@ -997,13 +1040,30 @@ def get_api_models():
     return models
 
 
+def _effective_tick_seconds():
+    """The decision interval actually in force for the agent subprocess.
+
+    A Benchmark Test or Batch Benchmark run (``test_running``, set by
+    ``request_start_test()`` for both) uses the Batch Run card's own slider;
+    everything else (manual Single Run control) uses the Single Run card's
+    slider. Reading this instead of always using ``ai_runtime`` keeps the two
+    sliders genuinely independent -- running a batch never overwrites the
+    operator's Single Run setting, and a batch sweep is never silently
+    governed by whatever that slider happens to show.
+    """
+    if global_config.get("test_running", False):
+        batch_runtime = global_config.get("batch_runtime", DEFAULT_BATCH_RUNTIME)
+        return min(15, max(2, int(batch_runtime.get("tick_seconds", 5))))
+    return min(15, max(2, int(global_config["ai_runtime"].get("tick_seconds", 5))))
+
+
 def write_ai_control(path=None):
     """Atomically mirror in-process AI controls for the agent subprocess."""
     runtime = global_config["ai_runtime"]
     payload = {
         "armed": bool(runtime.get("armed", False)),
         "model": str(runtime.get("model", "None")),
-        "tick_seconds": min(15, max(2, int(runtime.get("tick_seconds", 5)))),
+        "tick_seconds": _effective_tick_seconds(),
         "simulation_running": bool(global_config.get("is_running", False)),
     }
     destination = AI_CONTROL_PATH if path is None else Path(path)
@@ -1286,9 +1346,9 @@ def create_dashboard_window(parent=None):
     )
     status_text.pack(side="left", fill="x", expand=True)
 
-    # Cards are built in operator order: the three configuration editors
-    # (white headers) come first, then the three run/benchmark tools (amber),
-    # then the two intervention cards (red). Every card starts collapsed so
+    # Cards are built in operator order: two configuration editors first,
+    # then the merged Single Run and Batch Run workflows (amber), followed
+    # by the two intervention cards (red). Every card starts collapsed so
     # the whole column is visible at launch and the operator opens only the
     # card they are working in.
     # 1. PER-APPROACH TRAFFIC ----------------------------------------------
@@ -1516,12 +1576,16 @@ def create_dashboard_window(parent=None):
         dbl_btn.grid(row=0, column=1, sticky="ew", padx=(SPACE_XS, 0))
         route_flag_buttons[r_id] = {"tsp": tsp_btn, "dbl": dbl_btn}
 
-    # 3. AI / LLM CONTROL --------------------------------------------------
-    ai_section = make_section(
-        root, "AI / LLM", accent=SECTION_ACCENT_CONFIG, expanded=False,
+    # 3. SINGLE RUN: AI / LLM + RUN CONTROLS -------------------------------
+    # These controls operate on the same live episode, so they share one
+    # disclosure card. Subsection headings retain the old visual landmarks
+    # without requiring the operator to coordinate two separate cards.
+    single_run_section = make_section(
+        root, "Single Run", accent=SECTION_ACCENT_RUN, expanded=False,
         on_toggle=schedule_panel_fit,
     )
-    ai_body = ai_section["body"]
+    ai_body = single_run_section["body"]
+    make_subsection_heading(ai_body, "AI / LLM", first=True)
 
     available_models = get_decision_sources()
     available_api_models = get_api_models()
@@ -1669,12 +1733,10 @@ def create_dashboard_window(parent=None):
 
     root.after(250, refresh_route_buttons)
 
-    # 4. RUN CONTROLS ------------------------------------------------------
-    run_section = make_section(
-        root, "Run Controls", accent=SECTION_ACCENT_RUN, expanded=False,
-        on_toggle=schedule_panel_fit,
-    )
-    run_body = run_section["body"]
+    # Run lifecycle, speed, seed, and Webster output belong to this same
+    # single-run workflow. Keep their existing callbacks and state owners.
+    make_subsection_heading(ai_body, "Run Controls")
+    run_body = ai_body
 
     # START/PAUSE share a row, RESET gets its own full-width row below -- a
     # narrow side pane has no room for all three abreast.
@@ -1794,142 +1856,19 @@ def create_dashboard_window(parent=None):
     seed_entry.bind("<Return>", apply_seed_from_entry)
     seed_entry.bind("<FocusOut>", apply_seed_from_entry)
 
-    timing_heading = tk.Frame(run_body, bg=COLOR_CARD)
-    timing_heading.pack(fill="x", pady=(SPACE_SM, SPACE_XS))
-    make_label(
-        timing_heading, "Webster signal timing", bold=True,
-    ).pack(side="left")
-    make_label(
-        timing_heading, "AUTO", bold=True, color=COLOR_TEXT_SECONDARY,
-    ).pack(side="right")
+    # Webster signal timing (measured capacity, per-node condition, cycle
+    # length, green split and demand ratio) is rendered by the telemetry
+    # dashboard's Summary tab instead of here -- it is observed output, not
+    # an operator input, so it belongs next to the live signal state it
+    # describes. get_webster_timing_summary() remains the shared source.
 
-    timing_summary = tk.Frame(
-        run_body, bg=COLOR_CARD_ALT, highlightbackground=COLOR_CARD_BORDER,
-        highlightthickness=1, bd=0,
-    )
-    timing_summary.pack(fill="x")
-
-    webster_status_lbl = make_label(
-        timing_summary,
-        "Timing is calculated automatically when START is pressed.",
-        bold=True, color=COLOR_TEXT_SECONDARY,
-        wraplength=PORTRAIT_WRAP_LENGTH,
-    )
-    webster_status_lbl.pack(fill="x", padx=SPACE_SM, pady=SPACE_SM)
-
-    node_cards = {}
-
-    def add_timing_value_row(parent_widget, label_text):
-        # Label over value: a per-node value like "EW 26.5 s · NS 18.0 s"
-        # needs the full node-card width to stay on one line.
-        row = tk.Frame(parent_widget, bg=COLOR_CARD)
-        row.pack(fill="x", padx=SPACE_SM, pady=(0, SPACE_XS))
-        make_label(row, label_text, color=COLOR_TEXT_SECONDARY).pack(fill="x")
-        value_label = make_label(
-            row, "--", bold=True, color=COLOR_TEXT_PRIMARY,
-            wraplength=PORTRAIT_WRAP_LENGTH - 2 * SPACE_LG,
-        )
-        value_label.pack(fill="x")
-        return value_label
-
-    node_cards_holder = tk.Frame(timing_summary, bg=COLOR_CARD_ALT)
-    node_cards_holder.pack(fill="x", padx=SPACE_SM, pady=(0, SPACE_SM))
-    for node_x, node_name in ((300, "A"), (700, "B")):
-        node_card = tk.Frame(
-            node_cards_holder, bg=COLOR_CARD,
-            highlightbackground=COLOR_CARD_BORDER, highlightthickness=1, bd=0,
-        )
-        node_header = tk.Frame(node_card, bg=COLOR_CARD)
-        node_header.pack(fill="x", padx=SPACE_SM, pady=SPACE_SM)
-        make_label(
-            node_header, f"Node {node_name}  ·  {node_x} px", bold=True,
-        ).pack(side="left")
-        state_label = make_label(
-            node_header, "Waiting", bold=True, color=COLOR_TEXT_SECONDARY,
-        )
-        state_label.pack(side="right")
-        node_cards[node_x] = {
-            "card": node_card,
-            "state": state_label,
-            "cycle": add_timing_value_row(node_card, "Cycle length"),
-            "green": add_timing_value_row(node_card, "Green time"),
-            "ratio": add_timing_value_row(node_card, "Demand ratio"),
-            "note": make_label(
-                node_card, "", bold=True, color=COLOR_DANGER,
-                wraplength=PORTRAIT_WRAP_LENGTH,
-            ),
-        }
-        node_cards[node_x]["note"].pack(
-            fill="x", padx=SPACE_SM, pady=(0, SPACE_SM)
-        )
-        # Cards appear only after calibration has produced node data.
-        node_card.pack_forget()
-
-    def refresh_webster_status():
-        summary = get_webster_timing_summary()
-        state = summary["state"]
-        colour = {
-            "CALIBRATING": COLOR_WARNING,
-            "READY": COLOR_SUCCESS,
-            "OVERSATURATED": COLOR_DANGER,
-        }.get(state, COLOR_TEXT_SECONDARY)
-        webster_status_lbl.config(text=summary["message"], fg=colour)
-
-        visible_positions = set()
-        for node in summary["nodes"]:
-            refs = node_cards[node["position"]]
-            visible_positions.add(node["position"])
-            if not refs["card"].winfo_manager():
-                refs["card"].pack(fill="x", pady=(0, SPACE_SM))
-            if not node["available"]:
-                refs["state"].config(text="Unavailable", fg=COLOR_WARNING)
-                refs["cycle"].config(text="No timing data")
-                refs["green"].config(text="--")
-                refs["ratio"].config(text="--")
-                refs["note"].config(text="")
-                continue
-
-            oversaturated = node["oversaturated"]
-            refs["state"].config(
-                text=node["status"],
-                fg=COLOR_DANGER if oversaturated else COLOR_SUCCESS,
-            )
-            cycle_suffix = "capped" if oversaturated else "optimal"
-            refs["cycle"].config(
-                text=f"{node['cycle_time_sec']:.0f} s  ·  {cycle_suffix}"
-            )
-            refs["green"].config(
-                text=(
-                    f"EW {node['ew_green_sec']:.1f} s  ·  "
-                    f"NS {node['ns_green_sec']:.1f} s"
-                )
-            )
-            refs["ratio"].config(
-                text=(
-                    f"EW {node['ew_ratio']:.2f}  ·  NS {node['ns_ratio']:.2f}  ·  "
-                    f"Total {node['total_ratio']:.2f}"
-                )
-            )
-            refs["note"].config(
-                text=(
-                    "Reduce demand or increase vehicle speed."
-                    if oversaturated else ""
-                )
-            )
-
-        for node_x, refs in node_cards.items():
-            if node_x not in visible_positions and refs["card"].winfo_manager():
-                refs["card"].pack_forget()
-        root.after(150, refresh_webster_status)
-
-    root.after(150, refresh_webster_status)
-
-    # 5. BENCHMARK TEST ----------------------------------------------------
-    test_section = make_section(
-        root, "Benchmark Test", accent=SECTION_ACCENT_RUN, expanded=False,
+    # 4. BATCH RUN: ONE BENCHMARK + BATCH SWEEP ----------------------------
+    batch_run_section = make_section(
+        root, "Batch Run", accent=SECTION_ACCENT_RUN, expanded=False,
         on_toggle=schedule_panel_fit,
     )
-    test_body = test_section["body"]
+    test_body = batch_run_section["body"]
+    make_subsection_heading(test_body, "Benchmark Test", first=True)
 
     # Caption line (label left, countdown right) over the duration selector,
     # the same shape as a slider row.
@@ -1949,6 +1888,29 @@ def create_dashboard_window(parent=None):
         state="readonly", style="Modern.TCombobox", font=FONT_BODY,
     )
     test_duration_box.pack(fill="x", pady=(0, ROW_GAP))
+
+    # Own decision-interval slider, independent of the Single Run card's:
+    # governs the single Benchmark Test below and every queued Batch
+    # Benchmark run, so a batch sweep's cadence never depends on whatever
+    # the Single Run panel happens to be set to.
+    batch_runtime_config = global_config.setdefault(
+        "batch_runtime", dict(DEFAULT_BATCH_RUNTIME)
+    )
+
+    def on_batch_tick_seconds_changed(value):
+        tick_seconds = min(15, max(2, int(float(value))))
+        global_config.setdefault(
+            "batch_runtime", dict(DEFAULT_BATCH_RUNTIME)
+        )["tick_seconds"] = tick_seconds
+        batch_tick_value_lbl.config(text=f"{tick_seconds}s")
+
+    batch_tick_value_lbl, batch_tick_slider = add_slider_row(
+        test_body, "Decision interval",
+        f"{int(batch_runtime_config.get('tick_seconds', 5))}s",
+        2, 15, batch_runtime_config.get("tick_seconds", 5),
+        on_batch_tick_seconds_changed,
+        step=1, style="Global.Horizontal.TScale",
+    )
 
     def refresh_test_countdown():
         if global_config.get("test_running", False):
@@ -1991,18 +1953,13 @@ def create_dashboard_window(parent=None):
     start_test_btn = make_button(test_body, "Start test", "warning", start_test)
     start_test_btn.pack(fill="x", pady=(SPACE_XS, 0))
 
-    # --- Batch Benchmark Runner: its own card ------------------------------
+    # --- Batch Benchmark Runner -------------------------------------------
     # Chains request_start_test() across every (model x seed) combination at
     # this same duration, unattended. Regime (demand/headway/speed) is never
     # touched here -- only seed and model vary between queued runs. Kept as
-    # a separate section (rather than living inside Benchmark Test) since it
-    # is a distinct tool with its own inputs -- Start test still runs the one
-    # model/seed already selected elsewhere in the panel.
-    batch_section = make_section(
-        root, "Batch Benchmark", accent=SECTION_ACCENT_RUN, expanded=False,
-        on_toggle=schedule_panel_fit,
-    )
-    batch_body = batch_section["body"]
+    # one model/seed already selected elsewhere in the panel.
+    make_subsection_heading(test_body, "Batch Benchmark")
+    batch_body = test_body
 
     seed_list_row = add_labeled_row(batch_body, "Seeds")
     batch_seed_entry = tk.Entry(
@@ -2034,16 +1991,58 @@ def create_dashboard_window(parent=None):
         picker.configure(bg=COLOR_CARD)
         picker.transient(root)
 
+        # Keep the chooser a stable size and scroll its checkbox list. Model
+        # registries grow with installed Ollama models and configured API
+        # providers; the operator must never need to resize this dialog just
+        # to reach the last model or the Done button.
+        picker_width = 340
+        list_height = min(320, max(140, len(choices) * 30))
+        picker.geometry(f"{picker_width}x{list_height + 72}")
+
+        list_frame = tk.Frame(picker, bg=COLOR_CARD)
+        list_frame.pack(fill="both", expand=True, padx=SPACE_MD, pady=(SPACE_MD, 0))
+        model_canvas = tk.Canvas(
+            list_frame, bg=COLOR_CARD, highlightthickness=0, bd=0,
+        )
+        model_scrollbar = ttk.Scrollbar(
+            list_frame, orient="vertical", command=model_canvas.yview
+        )
+        model_canvas.configure(yscrollcommand=model_scrollbar.set)
+        model_canvas.pack(side="left", fill="both", expand=True)
+        model_scrollbar.pack(side="right", fill="y")
+        choices_frame = tk.Frame(model_canvas, bg=COLOR_CARD)
+        choices_window = model_canvas.create_window(
+            (0, 0), window=choices_frame, anchor="nw"
+        )
+
+        def update_scroll_region(_event=None):
+            model_canvas.configure(scrollregion=model_canvas.bbox("all"))
+
+        def fit_choices_width(event):
+            model_canvas.itemconfigure(choices_window, width=event.width)
+
+        def scroll_models(event):
+            delta = -1 if event.delta > 0 else 1
+            model_canvas.yview_scroll(delta, "units")
+            return "break"
+
+        choices_frame.bind("<Configure>", update_scroll_region)
+        model_canvas.bind("<Configure>", fit_choices_width)
+        model_canvas.bind("<MouseWheel>", scroll_models)
+        choices_frame.bind("<MouseWheel>", scroll_models)
+
         vars_by_model = {}
         for choice in choices:
             var = tk.BooleanVar(value=choice in batch_selected_models)
             vars_by_model[choice] = var
-            tk.Checkbutton(
-                picker, text=choice, variable=var, anchor="w",
+            checkbox = tk.Checkbutton(
+                choices_frame, text=choice, variable=var, anchor="w",
                 bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY, selectcolor=COLOR_CARD_ALT,
                 activebackground=COLOR_CARD, activeforeground=COLOR_TEXT_PRIMARY,
                 font=FONT_BODY, highlightthickness=0,
-            ).pack(fill="x", anchor="w", padx=SPACE_MD, pady=2)
+            )
+            checkbox.pack(fill="x", anchor="w", pady=2)
+            checkbox.bind("<MouseWheel>", scroll_models)
 
         def apply_and_close():
             batch_selected_models[:] = [
@@ -2311,7 +2310,7 @@ def create_dashboard_window(parent=None):
 
     root.after(100, refresh_simulation_status)
 
-    # 7. MOTION / PRIORITY TUNING -----------------------------------------
+    # 5. MOTION / PRIORITY TUNING -----------------------------------------
     tuning_section = make_section(
         root, "Tuning", accent=SECTION_ACCENT_INTERVENTION, expanded=False,
         on_toggle=schedule_panel_fit,
@@ -2344,7 +2343,7 @@ def create_dashboard_window(parent=None):
         tuning_body, "Applies on next START / RESET", color=COLOR_TEXT_SECONDARY,
     ).pack(fill="x")
 
-    # 8. NETWORK GRIDLOCK RECOVERY ----------------------------------------
+    # 6. NETWORK GRIDLOCK RECOVERY ----------------------------------------
     recovery_section = make_section(
         root, "Gridlock Discharge", accent=SECTION_ACCENT_INTERVENTION, expanded=False,
         on_toggle=schedule_panel_fit,

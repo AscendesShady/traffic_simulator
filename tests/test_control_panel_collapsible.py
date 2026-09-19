@@ -76,10 +76,8 @@ def test_disclosure_state_hides_and_restores_same_body():
 EXPECTED_ORDER = (
     "Approach Traffic",
     "Bus Routes",
-    "AI / LLM",
-    "Run Controls",
-    "Benchmark Test",
-    "Batch Benchmark",
+    "Single Run",
+    "Batch Run",
     "Tuning",
     "Gridlock Discharge",
 )
@@ -88,10 +86,8 @@ EXPECTED_SECTIONS = {title: False for title in EXPECTED_ORDER}
 EXPECTED_HEADER_COLOURS = {
     "Approach Traffic": control_panel.COLOR_TEXT_PRIMARY,
     "Bus Routes": control_panel.COLOR_TEXT_PRIMARY,
-    "AI / LLM": control_panel.COLOR_TEXT_PRIMARY,
-    "Run Controls": control_panel.COLOR_WARNING,
-    "Benchmark Test": control_panel.COLOR_WARNING,
-    "Batch Benchmark": control_panel.COLOR_WARNING,
+    "Single Run": control_panel.COLOR_WARNING,
+    "Batch Run": control_panel.COLOR_WARNING,
     "Tuning": control_panel.COLOR_DANGER,
     "Gridlock Discharge": control_panel.COLOR_DANGER,
 }
@@ -161,7 +157,7 @@ def test_start_button_reads_calibrating_as_soon_as_it_is_pressed():
     saved = {key: config[key] for key in ("is_running", "start_requested")}
     try:
         control_panel.create_dashboard_window(tk.Frame(host))
-        run_body = control_panel.control_panel_sections["Run Controls"]["body"]
+        run_body = control_panel.control_panel_sections["Single Run"]["body"]
         (start_btn,) = find_buttons(run_body, "Start")
         config["is_running"] = False
         start_btn.invoke()
@@ -170,6 +166,52 @@ def test_start_button_reads_calibrating_as_soon_as_it_is_pressed():
         assert start_btn.cget("bg") == control_panel.COLOR_WARNING
     finally:
         config.update(saved)
+        host.destroy()
+
+
+def test_merged_run_sections_keep_all_actions_and_scroll_model_picker(monkeypatch):
+    """The two new cards retain both workflows and bound a long model list."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    monkeypatch.setattr(
+        control_panel,
+        "get_batch_model_choices",
+        lambda: [f"model-{index:02d}" for index in range(40)],
+    )
+    host = tk.Tk()
+    mounted = tk.Frame(host)
+    try:
+        control_panel.create_dashboard_window(mounted)
+        single_body = control_panel.control_panel_sections["Single Run"]["body"]
+        batch_body = control_panel.control_panel_sections["Batch Run"]["body"]
+        assert find_buttons(single_body, "Run LLM")
+        assert find_buttons(single_body, "Start")
+        assert find_buttons(batch_body, "Start test")
+        assert find_buttons(batch_body, "Run batch")
+
+        (picker_button,) = find_buttons(batch_body, "Select models")
+        picker_button.invoke()
+        host.update_idletasks()
+
+        def descendants(widget):
+            result = []
+            for child in widget.winfo_children():
+                result.append(child)
+                result.extend(descendants(child))
+            return result
+
+        widgets = descendants(mounted)
+        pickers = [widget for widget in widgets if isinstance(widget, tk.Toplevel)]
+        assert len(pickers) == 1
+        picker_widgets = descendants(pickers[0])
+        assert any(isinstance(widget, tk.Canvas) for widget in picker_widgets)
+        assert any(isinstance(widget, ttk.Scrollbar) for widget in picker_widgets)
+        assert len(
+            [widget for widget in picker_widgets if isinstance(widget, tk.Checkbutton)]
+        ) == 40
+        pickers[0].destroy()
+    finally:
         host.destroy()
 
 
@@ -376,13 +418,14 @@ def test_scale_click_focuses_and_arrows_make_exact_clamped_steps():
 def test_every_control_panel_scale_enables_keyboard_adjustment():
     source = inspect.getsource(control_panel.create_dashboard_window)
 
-    # Seven slider rows cover simulation speed, eligibility, vehicle speed,
-    # LLM interval, bus headway, straight %, and trucks %. Inflow is an exact
-    # integer and uses a stepper (make_spinbox) instead. Signal cycles and
-    # green splits are derived by Webster and have no UI slider.
+    # Eight slider rows cover simulation speed, eligibility, vehicle speed,
+    # Single Run LLM interval, Batch Run LLM interval, bus headway,
+    # straight %, and trucks %. Inflow is an exact integer and uses a
+    # stepper (make_spinbox) instead. Signal cycles and green splits are
+    # derived by Webster and have no UI slider.
     # add_slider_row is the only slider constructor and always wires
     # enable_scale_keyboard.
-    assert source.count("add_slider_row(") == 7
+    assert source.count("add_slider_row(") == 8
     assert source.count("make_spinbox(") == 1
     assert "ttk.Scale(" not in source
     assert "enable_scale_keyboard(" in inspect.getsource(control_panel.add_slider_row)

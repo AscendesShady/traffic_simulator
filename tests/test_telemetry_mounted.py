@@ -67,5 +67,6 @@ def test_cleanup_no_longer_terminates_a_dashboard_process():
 
     assert "dashboard_proc" not in cleanup_source
     assert "agent_proc.terminate()" in cleanup_source
-    # The combined-export build at process exit is untouched.
+    # The combined-export build still happens at process exit, now only for
+    # a run that did not already write its own, fuller workbook.
     assert "export_session_excel()" in cleanup_source

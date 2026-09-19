@@ -1,21 +1,21 @@
-"""DBL clears the lane AHEAD of the bus and makes room for its merge.
+"""DBL clears every general vehicle from its reserved approach lane.
 
-An active Dynamic Bus Lane must open the lane in front of the bus, not only
-hold traffic behind it: a car ahead in the DBL lane moves to lane 1 or 0
-when either is clear, and simply keeps driving when both are blocked. A car
-blocking a bus's merge into the DBL lane eases off so the bus can pull clear.
-Every scenario also checks that no two vehicles ever overlap.
+An active Dynamic Bus Lane orders vehicles ahead of and behind its target bus
+out of lane 2 immediately, with no bus-proximity threshold. A safe change is
+never forced when both receiving lanes are occupied. Every scenario also
+checks that no two vehicles ever overlap.
 """
 import itertools
 
 import src.ui.control_panel as control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
 from src.core.signal_controller import SignalController
-from src.core.vehicle import DBL_CLEAR_AHEAD_PX, DBL_LANE_INDEX, Vehicle
+from src.core.vehicle import DBL_LANE_INDEX, Vehicle
 from tests.helpers import make_bus_for_leg, rectangles_overlap
 
 
 NODE_A = 300
+NODE_B = 700
 STOP_BAR_X = NODE_A - ROAD_W / 2 - STOP
 ALL_GREEN = {
     node: {direction: "GREEN" for direction in ("EB", "WB", "NB", "SB")}
@@ -51,11 +51,11 @@ def dbl_bus(dist_to_stop_bar, lane_index=DBL_LANE_INDEX, bus_id="DBL_BUS"):
     return bus
 
 
-def car(x, lane_index, max_speed=1.0):
+def car(x, lane_index, max_speed=1.0, direction="EB"):
     vehicle = Vehicle(
         x=x,
-        y=lane_center_y(lane_index),
-        direction="EB",
+        y=lane_center_y(lane_index, direction),
+        direction=direction,
         max_speed=max_speed,
         lane_index=lane_index,
     )
@@ -110,20 +110,46 @@ def test_car_ahead_of_dbl_bus_moves_out_of_the_lane():
     assert blocker in vehicles
 
 
-def test_car_ahead_far_from_bus_is_not_asked_to_move():
+def test_car_ahead_far_from_bus_is_cleared_without_proximity_gate():
     enable_dbl()
     controller = make_controller()
     bus = dbl_bus(dist_to_stop_bar=480)
-    far_car = car(bus.x + bus.length / 2 + 9 + DBL_CLEAR_AHEAD_PX + 60, DBL_LANE_INDEX)
+    far_car = car(bus.x + bus.length / 2 + 9 + 260, DBL_LANE_INDEX)
     vehicles = [bus, far_car]
     controller.update(vehicles)
     assert controller.get_active_dbl_request(NODE_A, "EB")
 
-    # Both drive at the same speed so the gap never closes.
-    run(controller, vehicles, 30, ALL_GREEN)
+    # Both drive at the same speed so the old 200px gate would never have
+    # fired. The unconditional reservation still clears the car.
+    run(controller, vehicles, 120, ALL_GREEN)
 
-    assert far_car.lane_index == DBL_LANE_INDEX
+    assert far_car.lane_index in (0, 1)
+    assert far_car.lane_index != DBL_LANE_INDEX
     assert far_car.lane_vacate_target is None
+
+
+def test_westbound_dbl_clears_vehicle_ahead_symmetrically():
+    enable_dbl("R6_WB_ONLY")
+    controller = make_controller()
+    bus = make_bus_for_leg("R6_WB_ONLY", NODE_B, "WB_DBL_BUS")
+    bus.lane_index = DBL_LANE_INDEX
+    bus.y = lane_center_y(DBL_LANE_INDEX, "WB")
+    wb_stop_bar_x = NODE_B + ROAD_W / 2 + STOP
+    bus.x = wb_stop_bar_x + 300 + bus.length / 2.0
+    blocker = car(
+        bus.x - 80,
+        DBL_LANE_INDEX,
+        direction="WB",
+    )
+    vehicles = [bus, blocker]
+
+    controller.update(vehicles)
+    assert controller.get_active_dbl_request(NODE_B, "WB")
+    run(controller, vehicles, 120, ALL_GREEN)
+
+    assert blocker.lane_index in (0, 1)
+    assert blocker.lane_index != DBL_LANE_INDEX
+    assert blocker.y == lane_center_y(blocker.lane_index, "WB")
 
 
 def test_car_ahead_keeps_driving_when_both_other_lanes_are_blocked():
@@ -152,7 +178,7 @@ def test_car_ahead_keeps_driving_when_both_other_lanes_are_blocked():
     assert blocker in vehicles
 
 
-def test_car_behind_dbl_bus_still_yields():
+def test_car_behind_dbl_bus_vacates_reserved_lane():
     enable_dbl()
     controller = make_controller()
     bus = dbl_bus(dist_to_stop_bar=200)
@@ -161,12 +187,13 @@ def test_car_behind_dbl_bus_still_yields():
     controller.update(vehicles)
     assert controller.get_active_dbl_request(NODE_A, "EB")
 
-    run(controller, vehicles, 5, ALL_GREEN)
+    run(controller, vehicles, 120, ALL_GREEN)
 
-    assert follower.speed == 0.0
-    assert follower.lane_index == DBL_LANE_INDEX
+    assert follower.speed > 0.0
+    assert follower.lane_index in (0, 1)
+    assert follower.lane_index != DBL_LANE_INDEX
     assert follower.lane_vacate_target is None
-    assert follower.y == lane_center_y(DBL_LANE_INDEX)
+    assert follower.y == lane_center_y(follower.lane_index)
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +247,8 @@ def test_only_the_nearest_blocker_is_asked_to_make_room():
     assert far.dbl_merge_yield_slow is False
 
 
-def test_bus_keeps_waiting_when_no_car_can_make_room():
-    """A parked car alongside at the stop bar cannot slow further or change
-    lanes; the bus keeps its existing safe hold rather than forcing the merge."""
+def test_parked_merge_blocker_prevents_dbl_attempt():
+    """A stopped obstruction vetoes DBL before it can hold the bus."""
     enable_dbl()
     controller = make_controller()
     bus = dbl_bus(dist_to_stop_bar=5, lane_index=1)
@@ -232,8 +258,10 @@ def test_bus_keeps_waiting_when_no_car_can_make_room():
     run(controller, vehicles, 60, ALL_GREEN)
 
     assert bus.lane_index == 1
-    assert bus.must_hold_for_lane is True
-    assert bus.dbl_merge_blocker is parked
+    assert bus.must_hold_for_lane is False
+    assert bus.dbl_merge_abandoned_for_leg is True
+    assert bus.dbl_merge_blocker is None
+    assert controller.get_active_dbl_request(NODE_A, "EB") is None
     assert parked.speed == 0.0
     assert parked.lane_index == DBL_LANE_INDEX
     assert parked.y == lane_center_y(DBL_LANE_INDEX)

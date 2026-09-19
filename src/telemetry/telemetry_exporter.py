@@ -8,7 +8,13 @@ import time
 
 from src.ui import canvas_gemini as canvas
 from src.ui import control_panel
-from src.core.vehicle import Bus, DBL_LANE_INDEX, dbl_lane_is_obstructed
+from src.core.vehicle import (
+    Bus,
+    DBL_LANE_INDEX,
+    dbl_lane_is_obstructed,
+    dbl_lane_queue_ahead,
+)
+from src.telemetry import real_world_units as units
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -16,6 +22,14 @@ assert (BASE_DIR / "requirements.txt").exists(), (
     f"BASE_DIR does not resolve to the repo root: {BASE_DIR}"
 )
 DEFAULT_TELEMETRY_PATH = BASE_DIR / "data" / "traffic_state_telemetry.json"
+
+APPROACHES = ("EB", "WB", "NB", "SB")
+# A downstream stretch counts as blocked when the free road left on it is
+# shorter than about two queued vehicles (car length plus standing gap each),
+# i.e. a vehicle released into it has essentially nowhere to go.
+DOWNSTREAM_BLOCKED_PX = 2 * units.SIM_QUEUE_SPACING_PX
+# Standing gap a stopped vehicle keeps to the one ahead (vehicle.py SAFE_GAP).
+VEHICLE_QUEUE_GAP_PX = units.SIM_QUEUE_GAP_PX
 
 
 class TelemetryExporter:
@@ -83,6 +97,129 @@ class TelemetryExporter:
             passengers[node_key][approach] += int(getattr(vehicle, "passengers", 0))
         return passengers
 
+    def compute_bus_distribution(self, vehicles):
+        """Count buses present in the network right now, by location.
+
+        Uses the same node x approach grid as the queue tables (the node a
+        bus is next headed to, and its current direction of travel) so this
+        reads as "how many buses are on each corridor/approach segment" --
+        not just buses queued at a stop bar, but every bus still in transit
+        toward a node. Also reports the DBL-lane occupancy and per-route
+        counts, all as of this same export's timestamp/frame.
+        """
+        by_node_approach = self._empty_queue_table()
+        by_route = {}
+        in_dbl_lane = 0
+        total = 0
+        node_keys = {str(node_x) for node_x in canvas.INT_X}
+        for vehicle in vehicles:
+            if not isinstance(vehicle, Bus):
+                continue
+            total += 1
+            route_id = str(getattr(vehicle, "route_id", "")) or "UNASSIGNED"
+            by_route[route_id] = by_route.get(route_id, 0) + 1
+            if getattr(vehicle, "lane_index", None) == DBL_LANE_INDEX:
+                in_dbl_lane += 1
+            target_node = vehicle.get_next_target_node(canvas.INT_X)
+            node_key = str(target_node)
+            if node_key in node_keys and vehicle.direction in APPROACHES:
+                by_node_approach[node_key][vehicle.direction] += 1
+        return {
+            "total_buses": total,
+            "buses_by_node_approach": by_node_approach,
+            "buses_by_route": by_route,
+            "buses_in_dbl_lane": in_dbl_lane,
+        }
+
+    def compute_queue_length_by_node(self, vehicles):
+        """Report how far back each approach's queue reaches, in metres.
+
+        For every node and approach this is the stop-bar distance of the
+        furthest-back queued vehicle (the same front-bumper-to-stop-bar
+        distance the bus ETA uses), converted with the saturation-anchored
+        metres-per-pixel scale. An approach with nothing queued reports 0.0.
+        """
+        lengths_px = self._empty_queue_table()
+        for node_key, approach, vehicle in self._iter_queued_vehicles(vehicles):
+            distance = vehicle.distance_to_node_stop_bar(
+                int(node_key), canvas.H_Y, canvas.ROAD_W, canvas.STOP
+            )
+            if distance > lengths_px[node_key][approach]:
+                lengths_px[node_key][approach] = distance
+        return {
+            node_key: {
+                approach: round(units.px_to_m(max(0.0, px)), 1)
+                for approach, px in row.items()
+            }
+            for node_key, row in lengths_px.items()
+        }
+
+    @staticmethod
+    def _downstream_stretch(node_x, approach):
+        """Return (axis, low, high) for the road a movement enters after node_x.
+
+        The stretch runs from the far edge of the node's conflict box, in the
+        approach's direction of travel, to the next node's conflict box or the
+        canvas edge, whichever comes first. Straight-through travel only.
+        """
+        half_w = canvas.ROAD_W / 2.0
+        sorted_nodes = sorted(canvas.INT_X)
+        if approach == "EB":
+            nexts = [nx for nx in sorted_nodes if nx > node_x]
+            end = (nexts[0] - half_w) if nexts else float(canvas.WIDTH)
+            return "x", node_x + half_w, end
+        if approach == "WB":
+            prevs = [nx for nx in sorted_nodes if nx < node_x]
+            start = (prevs[-1] + half_w) if prevs else 0.0
+            return "x", start, node_x - half_w
+        if approach == "NB":
+            return "y", 0.0, canvas.H_Y - half_w
+        return "y", canvas.H_Y + half_w, float(canvas.HEIGHT)
+
+    def compute_downstream_space_by_node(self, vehicles):
+        """Estimate the free road on the far side of each node, per approach.
+
+        Returns (space_m, blocked): both are node key -> approach dicts. The
+        free space is the downstream stretch length minus the room taken by
+        vehicles already travelling on it (each vehicle's length plus one
+        standing gap), spread across the approach's lanes so the figure reads
+        as metres of free road per lane. ``blocked`` is True when that free
+        space is under ``DOWNSTREAM_BLOCKED_PX``: a green would only release
+        vehicles into a road that cannot absorb them.
+        """
+        half_w = canvas.ROAD_W / 2.0
+        space_m = self._empty_queue_table()
+        blocked = {
+            node_key: {approach: False for approach in APPROACHES}
+            for node_key in space_m
+        }
+        for node_x in canvas.INT_X:
+            node_key = str(node_x)
+            for approach in APPROACHES:
+                axis, low, high = self._downstream_stretch(node_x, approach)
+                length_px = max(0.0, high - low)
+                occupied_px = 0.0
+                for vehicle in vehicles:
+                    if vehicle.direction != approach:
+                        continue
+                    if axis == "x":
+                        along, across = vehicle.x, vehicle.y
+                        # Same horizontal road; the direction filter already
+                        # picks the EB or WB carriageway.
+                        on_road = abs(across - canvas.H_Y) <= half_w
+                    else:
+                        along, across = vehicle.y, vehicle.x
+                        # Vertical roads are node-specific.
+                        on_road = abs(across - node_x) <= half_w
+                    if on_road and low <= along <= high:
+                        occupied_px += float(vehicle.length) + VEHICLE_QUEUE_GAP_PX
+                free_px = max(
+                    0.0, length_px - occupied_px / max(1, canvas.LANES)
+                )
+                space_m[node_key][approach] = round(units.px_to_m(free_px), 1)
+                blocked[node_key][approach] = free_px < DOWNSTREAM_BLOCKED_PX
+        return space_m, blocked
+
     @staticmethod
     def _flatten_queue_counts(queues_by_node):
         """Preserve the original public aggregate queue contract."""
@@ -101,6 +238,60 @@ class TelemetryExporter:
         return self._flatten_queue_counts(
             self.compute_queue_counts_by_node(vehicles)
         )
+
+    @staticmethod
+    def build_vehicle_position_snapshot(vehicles):
+        """Return a compact, JSON-safe position/state row for every vehicle.
+
+        This is observational telemetry only. It lets an exported AI turn be
+        reconstructed spatially without feeding any new value back into the
+        controller or changing vehicle movement.
+        """
+        snapshot = []
+        for index, vehicle in enumerate(vehicles or [], start=1):
+            is_bus = isinstance(vehicle, Bus)
+            kind = "bus" if is_bus else ("truck" if vehicle.is_heavy else "car")
+            snapshot.append(
+                {
+                    "snapshot_id": (
+                        str(getattr(vehicle, "bus_id", ""))
+                        if is_bus
+                        else f"{kind}-{index}"
+                    ),
+                    "vehicle_type": kind,
+                    "route_id": str(getattr(vehicle, "route_id", "")) or None,
+                    "x_px": round(float(getattr(vehicle, "x", 0.0)), 3),
+                    "y_px": round(float(getattr(vehicle, "y", 0.0)), 3),
+                    "direction": str(getattr(vehicle, "direction", "")),
+                    "lane_index": getattr(vehicle, "lane_index", None),
+                    "target_turn": str(getattr(vehicle, "target_turn", "")),
+                    "leg_state": str(getattr(vehicle, "leg_state", "")),
+                    "speed_px_per_frame": round(
+                        float(getattr(vehicle, "speed", 0.0)), 4
+                    ),
+                    "max_speed_px_per_frame": round(
+                        float(getattr(vehicle, "max_speed", 0.0)), 4
+                    ),
+                    "passengers": int(getattr(vehicle, "passengers", 0)),
+                    "assigned_node_x": getattr(vehicle, "assigned_node_x", None),
+                    "passed_nodes": sorted(
+                        int(node) for node in getattr(vehicle, "passed_nodes", set())
+                    ),
+                    "lane_vacate_target": getattr(
+                        vehicle, "lane_vacate_target", None
+                    ),
+                    "must_hold_for_lane": bool(
+                        getattr(vehicle, "must_hold_for_lane", False)
+                    ),
+                    "route_merge_hold_active": bool(
+                        getattr(vehicle, "route_merge_hold_active", False)
+                    ),
+                    "dbl_merge_yield_slow": bool(
+                        getattr(vehicle, "dbl_merge_yield_slow", False)
+                    ),
+                }
+            )
+        return snapshot
 
     @staticmethod
     def _phase_label(node_status):
@@ -192,6 +383,10 @@ class TelemetryExporter:
         queues = self._flatten_queue_counts(queues_by_node)
         queues_passengers_by_node = self.compute_queue_passengers_by_node(vehicles)
         queues_passengers = self._flatten_queue_counts(queues_passengers_by_node)
+        queue_length_m_by_node = self.compute_queue_length_by_node(vehicles)
+        downstream_space_m_by_node, downstream_blocked_by_node = (
+            self.compute_downstream_space_by_node(vehicles)
+        )
         demand_state = demand_state or {}
         throughput_state = throughput_state or {}
         pending_demand = sum(
@@ -211,6 +406,7 @@ class TelemetryExporter:
         car_pax_served = int(throughput_state.get("passengers_served_car", 0) or 0)
         bus_passenger_delay_sec = round(bus_delay_frames / 60.0, 1)
         car_passenger_delay_sec = round(car_delay_frames / 60.0, 1)
+        vehicle_positions = self.build_vehicle_position_snapshot(vehicles)
         buses = [
             self._bus_state(vehicle, signal_controller)
             for vehicle in vehicles
@@ -236,12 +432,28 @@ class TelemetryExporter:
             nearest_object = (
                 bus_objects.get(nearest["bus_id"]) if nearest else None
             )
+            target_node = nearest["target_node_x"] if nearest else None
+            dbl_queue_ahead = (
+                dbl_lane_queue_ahead(
+                    nearest_object,
+                    vehicles,
+                    canvas.H_Y,
+                    target_node=target_node,
+                    lane_w=canvas.LANE,
+                )
+                if nearest_object is not None and target_node is not None
+                else []
+            )
             dbl_lane_obstructed = bool(
                 nearest is not None
                 and nearest["route_leg"] is not None
                 and nearest_object is not None
                 and dbl_lane_is_obstructed(
-                    nearest_object, vehicles, canvas.H_Y, canvas.LANE
+                    nearest_object,
+                    vehicles,
+                    canvas.H_Y,
+                    canvas.LANE,
+                    target_node=target_node,
                 )
             )
             routes_block[route_id] = {
@@ -269,6 +481,7 @@ class TelemetryExporter:
                 "nearest_bus_in_dbl_lane": (
                     bool(nearest["in_dbl_lane"]) if nearest else False
                 ),
+                "dbl_lane_queue_ahead": len(dbl_queue_ahead),
                 "dbl_lane_obstructed": dbl_lane_obstructed,
             }
         approaching = [
@@ -292,6 +505,9 @@ class TelemetryExporter:
                 "total_waiting_passengers_est": sum(
                     node_queue_passengers.values()
                 ),
+                "queue_length_m": queue_length_m_by_node[node_key],
+                "downstream_space_m": downstream_space_m_by_node[node_key],
+                "downstream_blocked": downstream_blocked_by_node[node_key],
             }
 
         current_phase = phase_labels[0] if len(set(phase_labels)) == 1 else "MIXED"
@@ -379,6 +595,11 @@ class TelemetryExporter:
                 "queues_passengers_est": queues_passengers,
                 "queues_by_node": queues_by_node,
                 "queues_passengers_est_by_node": queues_passengers_by_node,
+                # Physical queue extent and far-side room, in metres (display
+                # scale from real_world_units; never fed back into physics).
+                "queue_length_m_by_node": queue_length_m_by_node,
+                "downstream_space_m_by_node": downstream_space_m_by_node,
+                "downstream_blocked_by_node": downstream_blocked_by_node,
                 "pending_demand": pending_demand,
                 # Live network mean speed (px/frame); the Units tab converts
                 # it to km/h under the saturation-flow anchor.
@@ -442,6 +663,13 @@ class TelemetryExporter:
             "routes": routes_block,
             "active_buses": buses,
             "approaching_buses": approaching,
+            # Network-wide bus counts by node/approach segment, DBL lane, and
+            # route, all as of this same payload's timestamp/frame_number.
+            "bus_distribution": self.compute_bus_distribution(vehicles),
+            # Full-network observational snapshot for decision auditing. The
+            # model still receives the concise minimap; this records the
+            # physical state from which that minimap was derived.
+            "vehicle_positions": vehicle_positions,
         }
 
     def export(

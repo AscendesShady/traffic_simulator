@@ -1,9 +1,9 @@
-"""Bounded DBL merge: a blocked bus lane must never freeze a bus forever.
+"""DBL refusal/fallback must never freeze a bus.
 
-The invariant under test is that a DBL-enabled bus is never left worse off
-than an unequipped bus by more than the bounded merge window. If it can reach
-the DBL lane it uses it; if the lane stays blocked it gives the merge up and
-runs in its configured lane instead of holding upstream indefinitely.
+Stopped obstructions veto the attempt immediately. If a nominally moving
+corridor occupant unexpectedly fails to clear, the older bounded-abandonment
+path remains a second line of defense. In both cases the bus returns to its
+configured lane instead of holding upstream indefinitely.
 """
 import src.ui.control_panel as control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE
@@ -36,16 +36,16 @@ def enable_route(route_id, *, dbl, tsp=False):
     return route
 
 
-def blocker_beside(bus, lane_index=DBL_LANE_INDEX):
-    """A parked vehicle in `lane_index` alongside the bus, blocking a merge."""
+def blocker_beside(bus, lane_index=DBL_LANE_INDEX, speed=0.0):
+    """A vehicle in `lane_index` alongside the bus, blocking a merge."""
     blocker = Vehicle(
         x=bus.x,
         y=lane_center_y(lane_index, bus.direction),
         direction=bus.direction,
-        max_speed=0.0,
+        max_speed=speed,
         lane_index=lane_index,
     )
-    blocker.speed = 0.0
+    blocker.speed = speed
     return blocker
 
 
@@ -69,11 +69,14 @@ def frames_until_node_passed(controller, bus, vehicles, node_x, limit):
     return None
 
 
-def test_dbl_merge_abandoned_when_blocked():
+def test_dbl_merge_abandoned_for_persistent_nonqueue_blocker():
     enable_route("R3_EB_ONLY", dbl=True)
     controller = make_controller()
     bus = make_bus_for_leg("R3_EB_ONLY", NODE_A, "BLOCKED_MERGE_BUS")
-    blocker = blocker_beside(bus)
+    # A moving corridor occupant is not a stopped queue, so DBL may begin.
+    # This harness intentionally holds its position to exercise the bounded
+    # fallback if that nominally moving vehicle never actually clears.
+    blocker = blocker_beside(bus, speed=0.6)
     vehicles = [bus, blocker]
 
     # Before the window expires the bus is still trying, and still holding.
@@ -109,7 +112,7 @@ def test_dbl_merge_succeeds_when_clear():
 
 
 def test_dbl_never_worse_than_no_dbl():
-    """The DBL penalty for a blocked lane is bounded, never unbounded."""
+    """A stopped obstruction vetoes DBL, so it adds no merge hold."""
     def crossing_frames(dbl_enabled):
         enable_route("R3_EB_ONLY", dbl=dbl_enabled)
         controller = make_controller()
@@ -122,13 +125,11 @@ def test_dbl_never_worse_than_no_dbl():
 
     assert without_dbl is not None
     assert with_dbl is not None
-    # DBL may cost at most the bounded merge window; it can never freeze the
-    # bus, which is what the unbounded hold used to do.
-    assert with_dbl <= without_dbl + DBL_MERGE_ABANDON_FRAMES + 60
+    assert with_dbl <= without_dbl + 1
 
 
-def test_left_turn_lane_still_required():
-    """Turn geometry is not DBL, so the abandon logic must not skip it."""
+def test_left_turn_lane_still_required_after_dbl_refusal():
+    """Rejecting DBL cannot waive the route's physical turn-lane need."""
     enable_route("R1_EB_A_NB", dbl=True)
     controller = make_controller()
     bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "LEFT_TURN_BUS")
@@ -140,7 +141,7 @@ def test_left_turn_lane_still_required():
     run(controller, bus, vehicles, DBL_MERGE_ABANDON_FRAMES + 60)
 
     assert bus.target_turn == "LEFT"
-    assert bus.dbl_merge_abandoned_for_leg is False
+    assert bus.dbl_merge_abandoned_for_leg is True
     assert bus.lane_index != DBL_LANE_INDEX
     assert bus.must_hold_for_lane is True
     assert NODE_A not in bus.passed_nodes
@@ -150,7 +151,7 @@ def test_abandon_resets_on_new_leg():
     enable_route("R3_EB_ONLY", dbl=True)
     controller = make_controller()
     bus = make_bus_for_leg("R3_EB_ONLY", NODE_A, "TWO_LEG_BUS")
-    blocker = blocker_beside(bus)
+    blocker = blocker_beside(bus, speed=0.6)
     vehicles = [bus, blocker]
 
     run(controller, bus, vehicles, DBL_MERGE_ABANDON_FRAMES + 20)

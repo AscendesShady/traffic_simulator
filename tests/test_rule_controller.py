@@ -171,7 +171,14 @@ def test_rule_dbl_respects_obstruction():
 
     assert flags["R1_EB_A_NB"]["dbl"] is False
     assert flags["R1_EB_A_NB"]["tsp"] is True  # TSP judged separately
-    assert "DBL R1_EB_A_NB lane obstructed" in decision["reason"]
+    assert "DBL R1_EB_A_NB lane obstructed or queued" in decision["reason"]
+
+    # The explicit queue count is independently fail-safe if a producer ever
+    # emits an inconsistent combined obstruction boolean.
+    snapshot["routes"]["R1_EB_A_NB"]["dbl_lane_obstructed"] = False
+    snapshot["routes"]["R1_EB_A_NB"]["dbl_lane_queue_ahead"] = 1
+    decision = rc.rule_based_decision(snapshot, decision_lag_sec=0.0)
+    assert flags_by_route(decision)["R1_EB_A_NB"]["dbl"] is False
 
 
 def test_rule_uses_the_agents_actionable_definition():
@@ -385,6 +392,7 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
     assert isinstance(logged[0]["latency_ms"], (int, float)) and logged[0]["latency_ms"] < 1000
     assert logged[0]["input_tokens"] is None and logged[0]["tokens_per_sec"] is None
     assert logged[0]["pax_per_min_recent"] == 40.0
+    assert logged[0]["telemetry_snapshot"] == snapshot
 
     # 2. main.py merges it identically to a model decision.
     for route in control_panel.bus_routes_config.values():
@@ -418,7 +426,8 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
     workbook = load_workbook(destination, data_only=True)
     try:
         assert workbook.sheetnames == [
-            "Decisions", "Telemetry", "LLM Performance", "LLM Summary",
+            "Decisions", "Telemetry", "AI Decision Audit",
+            "LLM Performance", "LLM Summary",
             "Control Panel Inputs", "Bus Events", "Unit Conversions",
         ]
         decisions = workbook["Decisions"]
@@ -427,6 +436,15 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
         assert row["model"] == "rule-based" and row["status"] == "OK"
         assert row["R1_EB_A_NB_tsp"] is True and row["R1_EB_A_NB_dbl"] is True
         assert row["reason"].startswith("rule: ")
+
+        audit = workbook["AI Decision Audit"]
+        audit_row = dict(
+            zip([c.value for c in audit[1]], [c.value for c in audit[2]])
+        )
+        assert audit_row["model"] == "rule-based"
+        assert audit_row["requested_tsp_routes"] == "R1_EB_A_NB"
+        assert audit_row["requested_dbl_routes"] == "R1_EB_A_NB"
+        assert audit_row["observation_minimap"] == "minimap text"
 
         perf = workbook["LLM Performance"]
         perf_row = dict(zip([c.value for c in perf[1]], [c.value for c in perf[2]]))

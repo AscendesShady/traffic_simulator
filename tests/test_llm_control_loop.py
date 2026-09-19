@@ -263,6 +263,30 @@ def test_control_panel_writes_atomic_agent_control_and_discovers_models(
     }
     assert list(tmp_path.iterdir()) == [destination]
 
+
+def test_batch_run_has_its_own_decision_interval(tmp_path, monkeypatch):
+    """The Batch Run card's slider governs Benchmark Test/Batch Benchmark
+    runs; the Single Run card's slider is untouched and used otherwise."""
+    monkeypatch.setitem(
+        control_panel.global_config, "ai_runtime",
+        {"armed": True, "model": "local-model:latest", "tick_seconds": 5},
+    )
+    monkeypatch.setitem(
+        control_panel.global_config, "batch_runtime",
+        dict(control_panel.DEFAULT_BATCH_RUNTIME, tick_seconds=12),
+    )
+    destination = tmp_path / "ai_control.json"
+
+    monkeypatch.setitem(control_panel.global_config, "test_running", False)
+    control_panel.write_ai_control(destination)
+    assert json.loads(destination.read_text(encoding="utf-8"))["tick_seconds"] == 5
+
+    monkeypatch.setitem(control_panel.global_config, "test_running", True)
+    control_panel.write_ai_control(destination)
+    assert json.loads(destination.read_text(encoding="utf-8"))["tick_seconds"] == 12
+    # The Single Run slider's own value is never mutated by a batch run.
+    assert control_panel.global_config["ai_runtime"]["tick_seconds"] == 5
+
     monkeypatch.setattr(
         control_panel.subprocess,
         "run",
@@ -405,8 +429,8 @@ def test_route_flag_button_repaint_reflects_external_decision(monkeypatch):
     control_panel.repaint_route_flag_buttons()
     for key in ("tsp", "dbl"):
         assert buttons[key].options["text"] == f"{key.upper()} OFF"
-        assert buttons[key].options["bg"] == control_panel.COLOR_CARD_BORDER
-        assert buttons[key].options["fg"] == control_panel.COLOR_TEXT_SECONDARY
+        assert buttons[key].options["bg"] == control_panel.COLOR_TOGGLE_OFF
+        assert buttons[key].options["fg"] == control_panel.COLOR_TEXT_PRIMARY
 
 
 def test_main_merge_applies_valid_flags_and_rejects_invalid_flags(
@@ -795,6 +819,161 @@ def test_minimap_node_summary_has_approach_queues_and_actionable_bus():
     assert "exclusive GREEN and sets all others RED" in node_300
     assert "waiting_pax: EB=20 WB=60 NB=40 SB=16 (total=136)" in node_700
     assert "actionable_bus: none" in node_700
+
+
+def test_minimap_node_summary_shows_queue_length_and_downstream_space():
+    telemetry = {
+        "simulation_time_seconds": 20.0,
+        "routes": {
+            route_id: {
+                "active": True,
+                "tsp_enabled": False,
+                "dbl_enabled": False,
+            }
+            for route_id in guard.ROUTE_ORDER
+        },
+        "network_summary": {"queues_passengers_est": {}},
+        "signal_state": {
+            "nodes": {
+                "300": {
+                    "phase": "NS_GREEN",
+                    "signals": {
+                        "EB": "RED", "WB": "RED", "NB": "GREEN", "SB": "GREEN"
+                    },
+                    "queues_passengers_est": {
+                        "EB": 48, "WB": 32, "NB": 12, "SB": 8
+                    },
+                    "queue_length_m": {
+                        "EB": 18.8, "WB": 7.5, "NB": 0.0, "SB": 3.75
+                    },
+                    "downstream_space_m": {
+                        "EB": 67.0, "WB": 58.5, "NB": 40.2, "SB": 3.0
+                    },
+                    "downstream_blocked": {
+                        "EB": False, "WB": False, "NB": False, "SB": True
+                    },
+                },
+                "700": {
+                    "phase": "EW_GREEN",
+                    "signals": {
+                        "EB": "GREEN", "WB": "GREEN", "NB": "RED", "SB": "RED"
+                    },
+                    "queues_passengers_est": {
+                        "EB": 20, "WB": 60, "NB": 40, "SB": 16
+                    },
+                    "queue_length_m": {
+                        "EB": 0.0, "WB": 45.0, "NB": 12.0, "SB": 0.0
+                    },
+                    "downstream_space_m": {
+                        "EB": 58.5, "WB": 0.0, "NB": 58.5, "SB": 58.5
+                    },
+                    "downstream_blocked": {
+                        "EB": False, "WB": True, "NB": False, "SB": False
+                    },
+                },
+            }
+        },
+        "active_buses": [],
+    }
+
+    minimap = agent.read_minimap(
+        agent_state(telemetry=telemetry, decision_lag_sec=8.0)
+    )["minimap"]
+    node_lines = {
+        node_x: next(
+            line for line in minimap.splitlines()
+            if line.startswith(f"- NODE {node_x}:")
+        )
+        for node_x in ("300", "700")
+    }
+
+    for line in node_lines.values():
+        assert "queue_len_m:" in line
+        assert "downstream_free_m:" in line
+        # Both new fields follow waiting_pax, so the model reads passengers,
+        # then extent, then room to move, in that order.
+        assert line.index("waiting_pax:") < line.index("queue_len_m:")
+        assert line.index("queue_len_m:") < line.index("downstream_free_m:")
+
+    assert "queue_len_m: EB=18.8 WB=7.5 NB=0.0 SB=3.8" in node_lines["300"]
+    assert (
+        "downstream_free_m: EB=67.0 WB=58.5 NB=40.2 SB=3.0(BLOCKED)"
+        in node_lines["300"]
+    )
+    assert "queue_len_m: EB=0.0 WB=45.0 NB=12.0 SB=0.0" in node_lines["700"]
+    assert (
+        "downstream_free_m: EB=58.5 WB=0.0(BLOCKED) NB=58.5 SB=58.5"
+        in node_lines["700"]
+    )
+    # Unblocked approaches never carry the marker.
+    assert "EB=67.0(BLOCKED)" not in node_lines["300"]
+    # The existing per-node content is untouched.
+    assert "waiting_pax: EB=48 WB=32 NB=12 SB=8 (total=100)" in node_lines["300"]
+    assert "actionable_bus: none" in node_lines["300"]
+
+    # Telemetry written before these fields existed still renders a NODE
+    # line, with the new values marked unknown rather than crashing.
+    for node in telemetry["signal_state"]["nodes"].values():
+        for key in ("queue_length_m", "downstream_space_m", "downstream_blocked"):
+            del node[key]
+    legacy = agent.read_minimap(
+        agent_state(telemetry=telemetry, decision_lag_sec=8.0)
+    )["minimap"]
+    legacy_300 = next(
+        line for line in legacy.splitlines() if line.startswith("- NODE 300:")
+    )
+    assert "queue_len_m: EB=? WB=? NB=? SB=?" in legacy_300
+    assert "downstream_free_m: EB=? WB=? NB=? SB=?" in legacy_300
+    assert "BLOCKED" not in legacy_300
+
+
+def test_prompt_teaches_queue_length_and_downstream_space_rules():
+    prompt = " ".join(agent.SYSTEM_PROMPT.split())
+
+    assert "QUEUE LENGTH tells you how far back traffic is backed up" in prompt
+    assert "DOWNSTREAM FREE SPACE tells you whether there is room" in prompt
+    assert "giving it green will NOT help" in prompt
+    assert (
+        "Never grant priority to a bus whose downstream space is blocked"
+        in prompt
+    )
+    assert "If both sides are congested, grant nothing" in prompt
+    # The rules name the minimap fields the model will actually see.
+    assert "queue_len_m" in prompt
+    assert "downstream_free_m" in prompt
+    assert "BLOCKED" in prompt
+    # They sit after the congestion rules and before the output schema, so
+    # the model reads what to weigh before it reads how to answer.
+    assert prompt.index("CONGESTION IS FAILURE") < prompt.index("QUEUE LENGTH")
+    assert prompt.index("DOWNSTREAM FREE SPACE") < prompt.index(
+        agent.OUTPUT_SCHEMA.split()[0]
+    )
+
+
+def test_output_contract_unchanged_by_spatial_fields():
+    # The prompt still asks for the same positional schema: six booleans per
+    # array, no route keys, and the guard still accepts exactly that.
+    schema = json.loads(agent.OUTPUT_SCHEMA)
+    assert set(schema) == {"reason", "tsp", "dbl"}
+    assert len(guard.ROUTE_ORDER) == 6
+    assert schema["tsp"] == [False] * 6
+    assert schema["dbl"] == [False] * 6
+    assert agent.OUTPUT_SCHEMA in agent.SYSTEM_PROMPT
+
+    output = positional_output(tsp_route="R1_EB_A_NB", dbl_route="R4_WB_A_SB")
+    assert len(output["tsp"]) == 6 and len(output["dbl"]) == 6
+    assert all(isinstance(flag, bool) for flag in output["tsp"] + output["dbl"])
+    mapped = guard.validate_flags_positional(output)
+    assert mapped == valid_flags(tsp_route="R1_EB_A_NB", dbl_route="R4_WB_A_SB")
+
+    decision = guard.safe_decision(json.dumps(output), turn=1, model="test-model")
+    assert decision["flags"] == mapped
+    assert decision["status"] != "HELD_ALL_OFF"
+
+    # Extra spatial keys in the model's output are not part of the contract:
+    # the guard ignores them without weakening the flags.
+    with_extras = dict(output, queue_len_m={"EB": 1.0}, downstream_free_m=5.0)
+    assert guard.validate_flags_positional(with_extras) == mapped
 
 
 def test_prompt_frames_congestion_as_failure_and_restraint_as_default():
@@ -1821,7 +2000,19 @@ def test_excel_export_builds_decisions_and_telemetry_sheets(
 
     workbook = load_workbook(output, read_only=True)
     try:
-        assert workbook.sheetnames == ["Decisions", "Telemetry"]
+        assert workbook.sheetnames == [
+            "Decisions",
+            "Telemetry",
+            "AI Decision Audit",
+            "Control Panel Inputs",
+        ]
+        inputs = workbook["Control Panel Inputs"]
+        assert [cell.value for cell in inputs[1]] == [
+            "section",
+            "parameter",
+            "value",
+        ]
+        assert inputs.max_row > 1
         decisions = workbook["Decisions"]
         decision_headers = [cell.value for cell in decisions[1]]
         decision_row = {
@@ -1850,6 +2041,18 @@ def test_excel_export_builds_decisions_and_telemetry_sheets(
         assert telemetry_row["vehicles_in_network"] == 24
         assert telemetry_row["ai_armed"] is True
         assert json.loads(telemetry_row["queues_vehicles"]) == {"EB": 3}
+
+        audit = workbook["AI Decision Audit"]
+        audit_headers = [cell.value for cell in audit[1]]
+        audit_row = {
+            header: audit.cell(2, index + 1).value
+            for index, header in enumerate(audit_headers)
+        }
+        assert audit_headers == main.AI_DECISION_AUDIT_HEADERS
+        assert audit_row["model_reason"] == decision["reason"]
+        assert audit_row["requested_tsp_routes"] == "R2_EB_B_NB"
+        assert audit_row["requested_dbl_routes"] == "R5_WB_B_SB"
+        assert audit_row["observation_minimap"] == "whole network"
     finally:
         workbook.close()
 

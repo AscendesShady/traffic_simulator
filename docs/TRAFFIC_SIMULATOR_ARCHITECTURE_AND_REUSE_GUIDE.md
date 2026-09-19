@@ -260,7 +260,7 @@ Rendering and telemetry continue while stopped or paused, so the windows remain 
 - `check_and_dispatch_buses(...)` — creates `Bus` objects from route configs.
 - `merge_ai_decision(...)` — validates freshness and internal flag structure before changing live route flags.
 - `calibrate_saturation_flow(...)` and `calibrate_and_apply_webster(...)` — derive the baseline timing at run start.
-- `export_session_excel(...)` / `export_test_workbook(...)` — produce research outputs.
+- `export_session_excel(...)` / `export_test_workbook(...)` — produce research outputs. One workbook per run: `export_test_workbook` (timed tests, batch runs, checkpoint marks) raises `_run_exported_workbook`, `perform_full_reset` clears it, and the `atexit` cleanup writes the session workbook only if it is still false — the session sheet set is a subset of the test workbook's, so emitting both would duplicate it.
 
 **Throughput path:**
 
@@ -408,8 +408,10 @@ if sig_state == "GREEN" and 0.0 <= dist_to_stop <= 25.0:
 - An enabled DBL bus tries to migrate to lane index 2 early.
 - It uses the existing smooth lane-change and obstruction checks.
 - A route-required turn/next-leg lane takes precedence when necessary.
-- A DBL-only merge can be abandoned after a bounded wait so DBL cannot leave the bus worse than baseline.
+- A DBL-only merge can be abandoned after a bounded wait so DBL cannot leave the bus worse than baseline — or immediately and stickily (no waiting out the timer) the instant a live request is vetoed by an obstructed lane (see below), so the bus does not oscillate between requesting and creeping.
 - Route-required merges are not abandoned, because the bus needs the correct lane to complete its route safely.
+
+**DBL obstruction veto (fixes a bus stuck in the DBL lane despite it looking clear):** `vehicle.dbl_lane_queue_ahead(bus, all_vehicles, h_y, target_node)` finds any stopped/crawling vehicle ahead of the bus in the reserved lane; `vehicle.dbl_lane_is_obstructed(...)` treats that as an obstruction **even once the bus is already in the DBL lane**, not only while it is still merging in. Clearing a non-bus vehicle out of the reserved lane is now unconditional across the whole approach — not gated by how close that vehicle is to the bus — so a stopped car far ahead of the bus, or one that entered the lane after the bus did, is still ordered out. `signal_controller.is_dbl_requested_for_bus_leg` gates a live request/grant on this same obstruction check, and `agent.py`'s `anti_cheat` step forces `dbl=False` server-side for any new (non-locked) grant when telemetry reports the obstruction, so neither the rule comparator nor an LLM can bypass this safety property.
 
 **Reuse assessment:**
 
@@ -546,7 +548,9 @@ Top-level payload:
   "demand_generation": {},
   "routes": {},
   "active_buses": [],
-  "approaching_buses": []
+  "approaching_buses": [],
+  "bus_distribution": {},
+  "vehicle_positions": []
 }
 ```
 
@@ -559,6 +563,8 @@ Top-level payload:
 - `network_throughput` contains served passenger and vehicle counts plus cumulative/recent passengers per minute.
 - `routes` summarizes live TSP/DBL flags, approaching buses, nearest ETA, DBL-lane occupancy, and obstruction.
 - `active_buses` exposes per-bus position, speed, passenger count, lane, route leg, ETA, and priority lifecycle.
+- `bus_distribution` (`TelemetryExporter.compute_bus_distribution`) is a network-wide bus count at this same timestamp/frame: `total_buses`, `buses_by_node_approach` (same node x approach grid as the queue tables, counting every bus by the node it is next headed to and its current direction — not just ones queued at a stop bar), `buses_by_route`, and `buses_in_dbl_lane`.
+- `vehicle_positions` is a full per-vehicle position/state snapshot (`TelemetryExporter.build_vehicle_position_snapshot`) for observational decision auditing; it is never fed back into physics.
 
 Queue passenger estimates use four passengers per queued vehicle because the aggregated queue counter no longer retains vehicle type. This can overestimate a queue containing trucks. Completed-trip throughput uses each vehicle's actual `passengers` value and is the more reliable objective metric.
 
@@ -574,7 +580,7 @@ Queue passenger estimates use four passengers per queued vehicle because the agg
 
 **Tabs:**
 
-- **Summary** — uniform KPI strip, node state, queues, phase diagram, and discharge/priority status.
+- **Summary** — uniform KPI strip, node state, queues, phase diagram, and discharge/priority status, plus the complete Webster timing readout that used to live in the control panel. A **WEBSTER SIGNAL TIMING** card (`build_webster_timing_ui`) reports measured lane capacity and, per node, condition (Optimal/Oversaturated/Unavailable), cycle length and demand ratio, with an oversaturation warning note; each per-node phase diagram additionally shows a **Green time** label under its signal-color dots so the signal and its green split stay paired. Everything is refreshed by `_refresh_webster_timing_labels` from `control_panel.get_webster_timing_summary()`, still the single source. The control panel now carries operator inputs only — derived timing is observed output and belongs beside the live signal state.
 - **Session Trends** — bounded in-memory time series for vehicles, buses, queues, pending demand, and congestion.
 - **LLM Performance** — per-turn status, latency, tokens, throughput, and optional GPU telemetry.
 
@@ -588,6 +594,7 @@ The trend history is process-local and intentionally cleared when the dashboard 
 - Telemetry;
 - LLM Performance;
 - LLM Summary;
+- **AI Decision Audit** — one row per logged decision (agent turn or, absent any, the nearest logged/live telemetry), built from the exact telemetry snapshot used at decision time plus an **outcome** snapshot (the state at the next decision, or the nearest later telemetry sample) so a TSP/DBL grant can be judged after the fact. Per-route load is flattened into `route_vehicles_json`/`route_passengers_json` so the decision reads directly against the buses and passengers it was serving. See `main.write_ai_decision_audit_sheet`/`main._outcome_snapshot` and `CLAUDE.md`'s "LLM/rule decision auditing" section;
 - Control Panel Inputs;
 - current Snapshot sheets;
 - Session Trends data;

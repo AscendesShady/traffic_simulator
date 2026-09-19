@@ -12,7 +12,11 @@ venv/
 
 # Runtime-generated simulator data
 runtime/
-data/*.json
+# The whole directory, not just data/*.json: the cross-process writers create
+# extensionless NamedTemporaryFile spool files next to their target and rename
+# them into place, so a run killed mid-write leaves temps that a narrower
+# pattern would happily let someone commit.
+data/
 logs/*.jsonl
 logs/*.log
 results/*.xlsx

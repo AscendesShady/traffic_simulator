@@ -22,7 +22,7 @@ from src.ui import control_panel
 from src.core import guard
 from src.core import webster
 from src.experiments import batch_runner
-from src.core.vehicle import Vehicle, Bus
+from src.core.vehicle import Vehicle, Bus, DBL_LANE_INDEX
 from src.core.signal_controller import SignalController
 from src.ui.telemetry_dashboard import TelemetryDashboard, build_excel_export_filename
 from src.telemetry.telemetry_exporter import TelemetryExporter
@@ -283,6 +283,7 @@ def log_telemetry_sample(frame_number, payload):
         ai_runtime = {}
     record = {
         "frame": frame_number,
+        "timestamp": payload.get("timestamp"),
         "sim_time_s": payload.get("simulation_time_seconds"),
         "passengers_served_total": network_throughput_state.get(
             "passengers_served_total"
@@ -308,6 +309,10 @@ def log_telemetry_sample(frame_number, payload):
         "vehicles_in_network": network_summary_state.get("total_vehicles"),
         "ai_armed": bool(ai_runtime.get("armed", False)),
         "ai_last_status": ai_runtime.get("last_status"),
+        # Preserve the full observational state for baseline runs and for
+        # recovering an audit row when an agent turn was interrupted. The
+        # ordinary Telemetry worksheet remains a compact summary.
+        "telemetry_snapshot": payload,
     }
     try:
         with TELEMETRY_LOG_PATH.open("a", encoding="utf-8") as log_file:
@@ -390,6 +395,325 @@ LLM_SUMMARY_HEADERS = [
     "avg_tokens_per_sec",
     "total_output_tokens",
 ]
+
+AI_DECISION_AUDIT_HEADERS = [
+    "turn",
+    "decision_timestamp",
+    "telemetry_timestamp",
+    "simulation_time_s",
+    "frame_number",
+    "model",
+    "guard_status",
+    "stale_observation",
+    "model_reason",
+    "raw_model_output",
+    "observation_minimap",
+    "action_flags_json",
+    "requested_tsp_routes",
+    "requested_dbl_routes",
+    "observed_tsp_routes",
+    "observed_dbl_routes",
+    "pending_priority_routes",
+    "dbl_queue_ahead_routes",
+    "dbl_obstructed_routes",
+    "locked_routes",
+    "signal_states_json",
+    "route_states_json",
+    # Per-route load at the decision instant, flattened out of route_states
+    # so a decision can be read against it without parsing the full blob.
+    "route_vehicles_json",
+    "route_passengers_json",
+    "network_summary_json",
+    "network_throughput_json",
+    "demand_generation_json",
+    "network_discharge_json",
+    "active_buses_json",
+    "bus_distribution_json",
+    "vehicle_count",
+    "vehicle_positions_json",
+    "latency_ms",
+    "input_tokens",
+    "output_tokens",
+    "tokens_per_sec",
+    # Outcome: the state observed at the NEXT decision (or, for the final
+    # decision, the nearest later telemetry sample) -- lets a reviewer judge
+    # whether this decision's TSP/DBL grants actually helped, without waiting
+    # on a live run to see what happened next.
+    "outcome_available",
+    "outcome_timestamp",
+    "outcome_simulation_time_s",
+    "outcome_queues_vehicles_json",
+    "outcome_queues_passengers_json",
+    "outcome_network_throughput_json",
+    "outcome_observed_tsp_routes",
+    "outcome_observed_dbl_routes",
+]
+
+
+def _excel_text(value, limit=32767):
+    """Return Excel-safe text without allowing one cell to corrupt a save."""
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[: limit - 15] + "...[truncated]"
+
+
+def _compact_json(value):
+    try:
+        return _excel_text(
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+    except (TypeError, ValueError):
+        return _excel_text(value)
+
+
+def _route_list(routes, predicate):
+    if not isinstance(routes, dict):
+        return ""
+    return ",".join(
+        sorted(
+            str(route_id)
+            for route_id, state in routes.items()
+            if isinstance(state, dict) and predicate(state)
+        )
+    )
+
+
+def _route_counts(routes, field):
+    """{route_id: count} for one numeric per-route telemetry field.
+
+    A bus route's "vehicles" are the buses running it, so this reads
+    buses_on_route / route_passengers_total straight from the same routes
+    block the rest of the row reports.
+    """
+    if not isinstance(routes, dict):
+        return {}
+    counts = {}
+    for route_id, state in routes.items():
+        if not isinstance(state, dict):
+            continue
+        try:
+            counts[str(route_id)] = int(state.get(field) or 0)
+        except (TypeError, ValueError):
+            counts[str(route_id)] = 0
+    return counts
+
+
+def _decision_flag_routes(flags, flag_name):
+    if not isinstance(flags, dict):
+        return ""
+    return ",".join(
+        sorted(
+            str(route_id)
+            for route_id, route_flags in flags.items()
+            if isinstance(route_flags, dict) and route_flags.get(flag_name) is True
+        )
+    )
+
+
+def _telemetry_snapshot_from_row(row):
+    if not isinstance(row, dict):
+        return {}
+    snapshot = row.get("telemetry_snapshot")
+    return snapshot if isinstance(snapshot, dict) else row
+
+
+def _nearest_telemetry_snapshot(decision, telemetry_rows):
+    exact = decision.get("telemetry_snapshot") if isinstance(decision, dict) else None
+    if isinstance(exact, dict) and exact:
+        return exact
+    candidates = [
+        _telemetry_snapshot_from_row(row)
+        for row in telemetry_rows or []
+        if isinstance(row, dict)
+    ]
+    candidates = [row for row in candidates if row]
+    if not candidates:
+        return {}
+    target = decision.get("timestamp") if isinstance(decision, dict) else None
+    try:
+        target = float(target)
+    except (TypeError, ValueError, OverflowError):
+        return candidates[-1]
+    timed = []
+    for row in candidates:
+        try:
+            timed.append((float(row.get("timestamp")), row))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    if not timed:
+        return candidates[-1]
+    preceding = [item for item in timed if item[0] <= target]
+    return max(preceding, key=lambda item: item[0])[1] if preceding else min(
+        timed, key=lambda item: abs(item[0] - target)
+    )[1]
+
+
+def _outcome_snapshot(decision, index, decisions, telemetry_rows):
+    """Return the telemetry state that followed this decision, if any.
+
+    The natural "what happened next" checkpoint is the state the following
+    decision was made from (already logged, so no new instrumentation is
+    needed); the final decision in a run instead uses the nearest telemetry
+    sample logged strictly after it. Returns {} when nothing later exists.
+    """
+    if index + 1 < len(decisions):
+        return _nearest_telemetry_snapshot(decisions[index + 1], telemetry_rows)
+    try:
+        target = float(decision.get("timestamp"))
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    later = []
+    for row in telemetry_rows or []:
+        if not isinstance(row, dict):
+            continue
+        snapshot = _telemetry_snapshot_from_row(row)
+        try:
+            timestamp = float(snapshot.get("timestamp"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if timestamp > target:
+            later.append((timestamp, snapshot))
+    return min(later, key=lambda item: item[0])[1] if later else {}
+
+
+def _audit_row(decision, telemetry, outcome=None):
+    decision = decision if isinstance(decision, dict) else {}
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
+    outcome = outcome if isinstance(outcome, dict) else {}
+    flags = decision.get("flags") if isinstance(decision.get("flags"), dict) else {}
+    routes = telemetry.get("routes") if isinstance(telemetry.get("routes"), dict) else {}
+    signals = telemetry.get("signal_state")
+    signal_nodes = signals.get("nodes", {}) if isinstance(signals, dict) else {}
+    pending_routes = set()
+    for node in signal_nodes.values() if isinstance(signal_nodes, dict) else ():
+        if not isinstance(node, dict):
+            continue
+        active = node.get("active_request")
+        if isinstance(active, dict) and active.get("route_id"):
+            pending_routes.add(str(active["route_id"]))
+        for request in node.get("queued_requests", []) or []:
+            if isinstance(request, dict) and request.get("route_id"):
+                pending_routes.add(str(request["route_id"]))
+    pending_routes.update(
+        route_id
+        for route_id in _route_list(
+            routes, lambda state: bool(state.get("nearest_bus_priority_pending"))
+        ).split(",")
+        if route_id
+    )
+    vehicles = telemetry.get("vehicle_positions")
+    if not isinstance(vehicles, list):
+        vehicles = []
+    locked = decision.get("locked_routes", [])
+    if not isinstance(locked, (list, tuple, set, frozenset)):
+        locked = []
+    outcome_summary = outcome.get("network_summary")
+    if not isinstance(outcome_summary, dict):
+        outcome_summary = {}
+    outcome_routes = outcome.get("routes")
+    if not isinstance(outcome_routes, dict):
+        outcome_routes = {}
+    return [
+        decision.get("turn"),
+        decision.get("timestamp"),
+        telemetry.get("timestamp"),
+        telemetry.get("simulation_time_seconds", telemetry.get("sim_time_s")),
+        telemetry.get("frame_number", telemetry.get("frame")),
+        decision.get("model", "None"),
+        decision.get("status", "OBSERVATION_ONLY"),
+        bool(decision.get("stale", False)),
+        _excel_text(decision.get("reason", "")),
+        _excel_text(decision.get("raw_output", "")),
+        _excel_text(decision.get("minimap", "")),
+        _compact_json(flags),
+        _decision_flag_routes(flags, "tsp"),
+        _decision_flag_routes(flags, "dbl"),
+        _route_list(routes, lambda state: bool(state.get("tsp_enabled"))),
+        _route_list(routes, lambda state: bool(state.get("dbl_enabled"))),
+        ",".join(sorted(pending_routes)),
+        _route_list(routes, lambda state: int(state.get("dbl_lane_queue_ahead") or 0) > 0),
+        _route_list(routes, lambda state: bool(state.get("dbl_lane_obstructed"))),
+        ",".join(sorted(str(route_id) for route_id in locked)),
+        _compact_json(signals),
+        _compact_json(routes),
+        _compact_json(_route_counts(routes, "buses_on_route")),
+        _compact_json(_route_counts(routes, "route_passengers_total")),
+        _compact_json(telemetry.get("network_summary", {})),
+        _compact_json(telemetry.get("network_throughput", {})),
+        _compact_json(telemetry.get("demand_generation", {})),
+        _compact_json(telemetry.get("network_discharge", {})),
+        _compact_json(telemetry.get("active_buses", [])),
+        _compact_json(telemetry.get("bus_distribution", {})),
+        len(vehicles),
+        _compact_json(vehicles),
+        decision.get("latency_ms"),
+        decision.get("input_tokens"),
+        decision.get("output_tokens"),
+        decision.get("tokens_per_sec"),
+        bool(outcome),
+        outcome.get("timestamp"),
+        outcome.get("simulation_time_seconds", outcome.get("sim_time_s")),
+        _compact_json(outcome_summary.get("queues", {})),
+        _compact_json(outcome_summary.get("queues_passengers_est", {})),
+        _compact_json(outcome.get("network_throughput", {})),
+        _route_list(outcome_routes, lambda state: bool(state.get("tsp_enabled"))),
+        _route_list(outcome_routes, lambda state: bool(state.get("dbl_enabled"))),
+    ]
+
+
+def write_ai_decision_audit_sheet(
+    sheet, decisions=None, telemetry_rows=None, samples=None, live_telemetry=None
+):
+    """Write one machine-readable row per AI turn or observed baseline frame.
+
+    Agent turns use their exact telemetry snapshot. Legacy/incomplete turns
+    fall back to the nearest logged telemetry frame; when no decisions exist,
+    telemetry and dashboard samples still produce explicit observation-only
+    rows instead of an empty or misleading AI trace.
+    """
+    decisions = [row for row in decisions or [] if isinstance(row, dict)]
+    telemetry_rows = [row for row in telemetry_rows or [] if isinstance(row, dict)]
+    samples = [row for row in samples or [] if isinstance(row, dict)]
+    sheet.append(list(AI_DECISION_AUDIT_HEADERS))
+    if decisions:
+        for index, decision in enumerate(decisions):
+            sheet.append(
+                _audit_row(
+                    decision,
+                    _nearest_telemetry_snapshot(decision, telemetry_rows),
+                    _outcome_snapshot(decision, index, decisions, telemetry_rows),
+                )
+            )
+    elif telemetry_rows:
+        snapshots = [_telemetry_snapshot_from_row(row) for row in telemetry_rows]
+        for index, snapshot in enumerate(snapshots):
+            outcome = snapshots[index + 1] if index + 1 < len(snapshots) else {}
+            sheet.append(_audit_row({}, snapshot, outcome))
+    elif isinstance(live_telemetry, dict) and live_telemetry:
+        sheet.append(_audit_row({}, live_telemetry))
+    else:
+        for index, sample in enumerate(samples):
+            outcome = samples[index + 1] if index + 1 < len(samples) else {}
+            sheet.append(_audit_row(sample, {}, outcome))
+
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    compact_columns = {
+        "A": 8, "B": 20, "C": 20, "D": 16, "E": 13, "F": 20,
+        "G": 19, "H": 17, "AB": 14, "AD": 14, "AE": 14,
+        "AF": 14, "AG": 14,
+    }
+    for letter, width in compact_columns.items():
+        sheet.column_dimensions[letter].width = width
+    for letter in ("I", "J", "K", "L", "T", "U", "V", "W", "X", "Y", "Z", "AA", "AC"):
+        sheet.column_dimensions[letter].width = 42
+    return sheet
 
 
 def _write_decisions_sheet(sheet, decisions):
@@ -553,7 +877,14 @@ def _write_llm_summary_sheet(sheet, decisions):
 
 
 def export_session_excel(output_path=None):
-    """Build a two-sheet workbook from the crash-safe session JSONL logs."""
+    """Build the session summary workbook from the crash-safe session JSONL logs.
+
+    Alongside Decisions/Telemetry, this always records the operator-configured
+    input parameters (seed, speed scale, per-approach demand, per-route
+    TSP/DBL/headway, derived Webster timing) so the summary is self-describing
+    without the control panel still being open -- the same Control Panel
+    Inputs sheet export_test_workbook and the dashboard's Export All write.
+    """
     try:
         from openpyxl import Workbook
     except ImportError:
@@ -572,6 +903,12 @@ def export_session_excel(output_path=None):
         _write_decisions_sheet(decisions_sheet, decisions)
         _write_telemetry_sheet(
             workbook.create_sheet("Telemetry"), telemetry_rows
+        )
+        write_ai_decision_audit_sheet(
+            workbook.create_sheet("AI Decision Audit"), decisions, telemetry_rows
+        )
+        write_control_panel_inputs_sheet(
+            workbook.create_sheet("Control Panel Inputs")
         )
 
         destination = (
@@ -977,6 +1314,9 @@ def export_test_workbook(
         _write_telemetry_sheet(
             workbook.create_sheet("Telemetry"), telemetry_rows
         )
+        write_ai_decision_audit_sheet(
+            workbook.create_sheet("AI Decision Audit"), decisions, telemetry_rows
+        )
         _write_llm_performance_sheet(
             workbook.create_sheet("LLM Performance"), decisions
         )
@@ -998,6 +1338,8 @@ def export_test_workbook(
         destination.parent.mkdir(parents=True, exist_ok=True)
         workbook.save(destination)
         workbook.close()
+        global _run_exported_workbook
+        _run_exported_workbook = True
         print(f"Timed test exported: {destination}")
         return destination
     except Exception as exc:
@@ -1018,6 +1360,12 @@ CHECKPOINT_MARKS_SEC = [300, 600, 900, 1800, 3600, 7200]
 # so a duration that happens to equal a standard mark (e.g. a 5-minute test)
 # fires exactly once instead of twice.
 pending_checkpoints_sec = []
+# True once this run has written a workbook of its own (a timed test's
+# checkpoint or final export). The session workbook built at exit carries a
+# strict subset of that workbook's sheets, all from the same JSONL logs, so
+# writing it too would just leave a second, thinner copy beside the full one.
+# perform_full_reset clears this, so each run decides for itself.
+_run_exported_workbook = False
 
 
 def compute_checkpoint_marks(duration_sim_seconds):
@@ -1530,6 +1878,8 @@ def calibrate_and_apply_webster(signals):
 
 def perform_full_reset(vehicles, signals, telemetry=None):
     """Restore all per-run simulation state and return the frame-zero value."""
+    global _run_exported_workbook
+    _run_exported_workbook = False
     vehicles.clear()
     signals.reset_all_state()
     if telemetry is not None:
@@ -1713,7 +2063,16 @@ def should_spawn_vehicle(approach_key, model_type, rate_v_m):
         return False
 
 
-def try_spawn_vehicle(vehicles, approach_key, direction, spawn_coord, lane_coords, approach_cfg, min_gap=40):
+def try_spawn_vehicle(
+    vehicles,
+    approach_key,
+    direction,
+    spawn_coord,
+    lane_coords,
+    approach_cfg,
+    min_gap=40,
+    signal_controller=None,
+):
     model_type = approach_cfg.get("model", "Poisson")
     rate_v_m = approach_cfg.get("rate", 12)
 
@@ -1726,7 +2085,16 @@ def try_spawn_vehicle(vehicles, approach_key, direction, spawn_coord, lane_coord
         lane_idx = random.choice([0, 1])
     else:
         target_turn = "LEFT"
-        lane_idx = 2
+        lane_idx = DBL_LANE_INDEX
+
+    # The outer horizontal lane is the general left-turn lane and the DBL
+    # lane. Once DBL is active it is reserved for the priority bus: retain a
+    # new left-turn arrival at the source instead of immediately refilling a
+    # lane that the controller is unconditionally clearing.
+    if target_turn == "LEFT" and direction in ("EB", "WB") and signal_controller:
+        target_node_x = canvas.INT_X[0] if direction == "EB" else canvas.INT_X[-1]
+        if signal_controller.is_dbl_active_for_approach(target_node_x, direction):
+            return
 
     target_lane_coord = lane_coords[lane_idx]
 
@@ -2040,6 +2408,7 @@ class WindowShapeController:
         self._after_id = None
         root.bind("<Configure>", self._on_root_configure, add="+")
         simulation_pane.bind("<Configure>", self._on_pane_configure, add="+")
+        root.bind("<Destroy>", self._on_root_destroy, add="+")
 
     # --- operator-facing -------------------------------------------------
     def cycle(self):
@@ -2082,9 +2451,29 @@ class WindowShapeController:
     def _on_pane_configure(self, _event):
         self._schedule_sync()
 
-    def _schedule_sync(self):
-        if self._after_id is not None:
+    def _on_root_destroy(self, event):
+        """Drop the debounced resize timer with the window it describes.
+
+        A queued `after` outlives the widget that registered its callback, so
+        without this the timer fires into a torn-down window and Tcl reports
+        an invalid command name from its background error handler.
+        """
+        if event.widget is not self.root:
+            return
+        self._cancel_pending_sync()
+
+    def _cancel_pending_sync(self):
+        if self._after_id is None:
+            return
+        try:
             self.root.after_cancel(self._after_id)
+        except Exception:
+            # The interpreter is already gone; the timer went with it.
+            pass
+        self._after_id = None
+
+    def _schedule_sync(self):
+        self._cancel_pending_sync()
         self._after_id = self.root.after(self.SYNC_DEBOUNCE_MS, self._sync)
 
     def _sync(self):
@@ -2447,7 +2836,11 @@ def main():
             agent_proc.wait(timeout=2)
         except Exception:
             pass
-        export_session_excel()
+        # One workbook per run: a timed test (and every batch run, which goes
+        # through the same path) already wrote its own, fuller workbook from
+        # these same logs. Only a run that exported nothing needs this one.
+        if not _run_exported_workbook:
+            export_session_excel()
     atexit.register(cleanup)
 
     # One WM_DELETE_WINDOW handler for the one real window in this process
@@ -2534,12 +2927,12 @@ def main():
                 discharge_suspended = is_discharge_demand_suspended(signals)
                 if not discharge_suspended:
                     if post_discharge_admission_allowed():
-                        if cfgs["EB"]["active"]: try_spawn_vehicle(vehicles, "EB", "EB", -20, lane_options["EB"], cfgs["EB"])
-                        if cfgs["WB"]["active"]: try_spawn_vehicle(vehicles, "WB", "WB", canvas.WIDTH + 20, lane_options["WB"], cfgs["WB"])
-                        if cfgs["A_NB"]["active"]: try_spawn_vehicle(vehicles, "A_NB", "NB", canvas.HEIGHT + 20, lane_options["A_NB"], cfgs["A_NB"])
-                        if cfgs["A_SB"]["active"]: try_spawn_vehicle(vehicles, "A_SB", "SB", -20, lane_options["A_SB"], cfgs["A_SB"])
-                        if cfgs["B_NB"]["active"]: try_spawn_vehicle(vehicles, "B_NB", "NB", canvas.HEIGHT + 20, lane_options["B_NB"], cfgs["B_NB"])
-                        if cfgs["B_SB"]["active"]: try_spawn_vehicle(vehicles, "B_SB", "SB", -20, lane_options["B_SB"], cfgs["B_SB"])
+                        if cfgs["EB"]["active"]: try_spawn_vehicle(vehicles, "EB", "EB", -20, lane_options["EB"], cfgs["EB"], signal_controller=signals)
+                        if cfgs["WB"]["active"]: try_spawn_vehicle(vehicles, "WB", "WB", canvas.WIDTH + 20, lane_options["WB"], cfgs["WB"], signal_controller=signals)
+                        if cfgs["A_NB"]["active"]: try_spawn_vehicle(vehicles, "A_NB", "NB", canvas.HEIGHT + 20, lane_options["A_NB"], cfgs["A_NB"], signal_controller=signals)
+                        if cfgs["A_SB"]["active"]: try_spawn_vehicle(vehicles, "A_SB", "SB", -20, lane_options["A_SB"], cfgs["A_SB"], signal_controller=signals)
+                        if cfgs["B_NB"]["active"]: try_spawn_vehicle(vehicles, "B_NB", "NB", canvas.HEIGHT + 20, lane_options["B_NB"], cfgs["B_NB"], signal_controller=signals)
+                        if cfgs["B_SB"]["active"]: try_spawn_vehicle(vehicles, "B_SB", "SB", -20, lane_options["B_SB"], cfgs["B_SB"], signal_controller=signals)
 
                     if post_discharge_meter_frames_remaining <= 0:
                         check_and_dispatch_buses(vehicles, lane_options, dt_step)

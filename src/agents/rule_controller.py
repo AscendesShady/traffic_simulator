@@ -14,7 +14,8 @@ The rule is conditional actuated priority, not naive always-grant:
          queued passenger load is below RULE_CROSS_QUEUE_THRESHOLD_PAX,
          capped at MAX_TSP_GRANTS_PER_NODE per node per decision (the
          highest net passenger benefit wins).
-    DBL  an approaching bus AND its DBL lane is not obstructed.
+    DBL  an approaching bus AND no stopped/crawling queue is ahead in its
+         left-most DBL lane AND its merge corridor is not obstructed.
 
 Nothing here touches the simulation: it only produces a decision.
 """
@@ -204,12 +205,15 @@ def rule_based_decision(
 
     records = _candidates(telemetry, decision_lag_sec)
 
-    # DBL is a lane reservation rather than a signal grant: any approaching
-    # bus benefits, and an obstructed lane makes the merge impossible.
+    # DBL is a lane reservation rather than a signal grant. A queue ahead or
+    # an obstructed merge makes the reservation useless, so telemetry's
+    # authoritative combined obstruction flag vetoes the activation.
     for record in records:
         route_id = record["route_id"]
-        if _route_flag(telemetry, route_id, "dbl_lane_obstructed"):
-            withheld_notes.append(f"DBL {route_id} lane obstructed")
+        if _route_flag(
+            telemetry, route_id, "dbl_lane_obstructed"
+        ) or _route_flag(telemetry, route_id, "dbl_lane_queue_ahead"):
+            withheld_notes.append(f"DBL {route_id} lane obstructed or queued")
             continue
         dbl_routes.add(route_id)
 

@@ -7,7 +7,7 @@ from typing import Any
 
 from src.ui import control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
-from src.core.vehicle import Bus, DBL_LANE_INDEX
+from src.core.vehicle import Bus, DBL_LANE_INDEX, dbl_lane_is_obstructed
 
 RED = "RED"
 YELLOW = "YELLOW"
@@ -1363,8 +1363,8 @@ class SignalController:
         dist = self.distance_to_node_stop_bar(bus, target_node)
         return 0 <= dist <= self.get_priority_eligibility_px()
 
-    def is_dbl_enabled_for_bus_leg(self, bus, target_node):
-        """Return the same live DBL intent used by priority eligibility."""
+    def is_dbl_requested_for_bus_leg(self, bus, target_node):
+        """Return whether live route configuration requests DBL on this leg."""
         if not isinstance(bus, Bus):
             return False
         live_cfg = self._live_route_config(bus)
@@ -1373,8 +1373,24 @@ class SignalController:
         leg = bus.get_active_route_leg(INT_X)
         return bool(leg and leg["node_x"] == target_node)
 
+    def is_dbl_enabled_for_bus_leg(self, bus, target_node, all_vehicles=None):
+        """Return live DBL intent only when the current lane is usable."""
+        if not self.is_dbl_requested_for_bus_leg(bus, target_node):
+            return False
+        if all_vehicles is not None and dbl_lane_is_obstructed(
+            bus,
+            all_vehicles,
+            H_Y,
+            LANE,
+            target_node=target_node,
+        ):
+            return False
+        return True
+
     def is_bus_dbl_eligible(self, bus, target_node, all_vehicles=None):
-        if not self.is_dbl_enabled_for_bus_leg(bus, target_node):
+        if not self.is_dbl_enabled_for_bus_leg(bus, target_node, all_vehicles):
+            return False
+        if getattr(bus, "dbl_merge_abandoned_for_leg", False):
             return False
         leg = bus.get_active_route_leg(INT_X)
         if bus.lane_index != DBL_LANE_INDEX:

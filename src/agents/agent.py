@@ -155,6 +155,22 @@ Prefer granting priority to AT MOST one or two approaches per node per turn.
 Blanket priority across many routes at once congests the whole network. This is
 the most common mistake. Fewer, well-justified grants beat many eager ones.
 
+QUEUE LENGTH tells you how far back traffic is backed up on each approach, in
+metres (queue_len_m in the minimap). A long queue means that approach is
+struggling and needs green time.
+
+DOWNSTREAM FREE SPACE tells you whether there is room on the far side of the
+intersection for vehicles to move into (downstream_free_m in the minimap). If
+an approach shows BLOCKED or very low free space, giving it green will NOT
+help: the vehicles have nowhere to go, and they will stall inside the
+intersection and block everyone. Never grant priority to a bus whose
+downstream space is blocked; it will make the whole network worse.
+
+Use these together: grant priority when the bus's route has room downstream
+AND the cross traffic it would delay is not already backed up with a long
+queue. If both sides are congested, grant nothing and let the normal signal
+timing work.
+
 TSP gives an approaching bus an early or extended green at its target node.
 DBL enables the dynamic bus lane for that route.
 
@@ -195,11 +211,16 @@ bus will be when your decision actually takes effect:
 - You are aiming your decision at the near future, not the present. Think about
   where traffic will BE, not where it IS.
 
-DBL only helps if the bus can actually enter the dynamic bus lane. If a route
-shows dbl_lane_obstructed=true, do NOT enable dbl for that route: the bus
-cannot merge and enabling it wastes the lane. Prefer tsp, which needs no lane
-change, for a bus whose dbl lane is blocked. A route showing dbl=true with
-nearest_bus_in_dbl_lane=false is evidence the dbl you enabled is not working.
+DBL reserves the left-most approach lane exclusively for its target bus. Once
+DBL is activated, ALL other vehicles in that lane must clear it immediately;
+this clearance rule is unconditional. Therefore you MUST NOT enable DBL when
+the lane cannot already be cleared. If dbl_lane_queue_ahead is greater than 0,
+or dbl_lane_obstructed=true, set dbl=false for that route: a stopped/crawling
+vehicle is in front of the bus or its merge is blocked, so the bus would only
+sit in the queue. This remains true when nearest_bus_in_dbl_lane=true; being in
+the lane does not make a queue ahead disappear. Prefer tsp, which needs no
+lane change, for that bus. A route showing dbl=true with
+nearest_bus_in_dbl_lane=false is evidence the DBL you enabled is not working.
 
 Example: if only route 1 has an approaching bus, the correct output is
 tsp=[true,false,false,false,false,false] and
@@ -285,6 +306,10 @@ def log_turn(state: AgentState, decision: dict) -> None:
             "model": decision.get("model"),
             "status": decision.get("status"),
             "minimap": state.get("minimap", ""),
+            # Exact telemetry snapshot used to derive this turn's minimap.
+            # This is an audit record only; the concise minimap remains the
+            # actual user message sent to an LLM.
+            "telemetry_snapshot": telemetry,
             "raw_output": state.get("raw_output", ""),
             "flags": decision.get("flags", {}),
             "reason": decision.get("reason", ""),
@@ -491,6 +516,14 @@ def _route_after_discharge(state: AgentState) -> str:
     return "standdown" if state.get("discharge_active") else "continue"
 
 
+def _approach_metres(table, approach):
+    """Format a per-approach metre value; '?' when telemetry lacks the field."""
+    if not isinstance(table, dict):
+        return "?"
+    value = _finite_nonnegative(table.get(approach))
+    return "?" if value is None else f"{value:.1f}"
+
+
 def read_minimap(state: AgentState) -> dict:
     telemetry = state.get("telemetry", {})
     routes = telemetry.get("routes", {})
@@ -563,12 +596,27 @@ def read_minimap(state: AgentState) -> dict:
             f"{approach}({details['passengers']}pax/{details['buses']}bus)"
             for approach, details in sorted(bus_groups.items())
         ) or "none"
+        queue_len_text = " ".join(
+            f"{approach}={_approach_metres(node.get('queue_length_m'), approach)}"
+            for approach in ("EB", "WB", "NB", "SB")
+        )
+        downstream_blocked = node.get("downstream_blocked")
+        if not isinstance(downstream_blocked, dict):
+            downstream_blocked = {}
+        downstream_text = " ".join(
+            f"{approach}="
+            f"{_approach_metres(node.get('downstream_space_m'), approach)}"
+            + ("(BLOCKED)" if downstream_blocked.get(approach) else "")
+            for approach in ("EB", "WB", "NB", "SB")
+        )
         lines.append(
             f"- NODE {node_x}: phase={node.get('phase', 'UNKNOWN')} "
             f"signals: {signal_text} "
             f"waiting_pax: EB={waiting['EB']} WB={waiting['WB']} "
             f"NB={waiting['NB']} SB={waiting['SB']} "
             f"(total={sum(waiting.values())}) "
+            f"queue_len_m: {queue_len_text} "
+            f"downstream_free_m: {downstream_text} "
             f"actionable_bus: {actionable_text} "
             "conflicts: EW(EB/WB) blocks NS(NB/SB); priority for one "
             "approach gives it exclusive GREEN and sets all others RED"
@@ -592,6 +640,8 @@ def read_minimap(state: AgentState) -> dict:
                 f"dbl={bool(route.get('dbl_enabled', False))} "
                 f"dbl_lane_obstructed="
                 f"{bool(route.get('dbl_lane_obstructed', False))} "
+                f"dbl_lane_queue_ahead="
+                f"{int(_finite_nonnegative(route.get('dbl_lane_queue_ahead'), 0) or 0)} "
                 f"nearest_bus_in_dbl_lane="
                 f"{bool(route.get('nearest_bus_in_dbl_lane', False))} "
                 f"approaching_buses={len(candidates)} "
@@ -610,6 +660,8 @@ def read_minimap(state: AgentState) -> dict:
                 f"dbl={bool(route.get('dbl_enabled', False))} "
                 f"dbl_lane_obstructed="
                 f"{bool(route.get('dbl_lane_obstructed', False))} "
+                f"dbl_lane_queue_ahead="
+                f"{int(_finite_nonnegative(route.get('dbl_lane_queue_ahead'), 0) or 0)} "
                 f"nearest_bus_in_dbl_lane="
                 f"{bool(route.get('nearest_bus_in_dbl_lane', False))} "
                 "approaching_buses=0 none approaching"
@@ -1018,7 +1070,27 @@ def anti_cheat(state: AgentState) -> dict:
     )
     routes = state.get("telemetry", {}).get("routes", {})
     if decision["status"] == "OK":
-        for route_id in state.get("locked_routes", set()):
+        raw_locked_routes = state.get("locked_routes", set())
+        locked_routes = (
+            set(raw_locked_routes)
+            if isinstance(raw_locked_routes, (set, frozenset, list, tuple))
+            else set()
+        )
+        for route_id, route_flags in decision["flags"].items():
+            current = routes.get(route_id, {}) if isinstance(routes, dict) else {}
+            # A model instruction is not a safety boundary. Refuse a new DBL
+            # activation deterministically when current telemetry says the
+            # bus would sit behind a queue or cannot complete its merge. An
+            # already-active locked grant is preserved until it safely clears.
+            queue_ahead = _finite_nonnegative(
+                current.get("dbl_lane_queue_ahead"), 0
+            )
+            if route_id not in locked_routes and (
+                bool(current.get("dbl_lane_obstructed", False))
+                or bool(queue_ahead)
+            ):
+                route_flags["dbl"] = False
+        for route_id in locked_routes:
             current = routes.get(route_id, {}) if isinstance(routes, dict) else {}
             decision["flags"][route_id] = {
                 "tsp": bool(current.get("tsp_enabled", False)),

@@ -1,6 +1,7 @@
 import copy
 import os
 import sys
+import tkinter
 
 import pytest
 
@@ -23,6 +24,28 @@ def signal_system():
         yellow_time=3,
         red_clearance_time=3,
     )
+
+
+@pytest.fixture(autouse=True)
+def destroy_leftover_tk_root():
+    """Tear down a Tk root a test leaves behind.
+
+    A root is process-global state: left alive it keeps its interpreter and
+    its pending `after` callbacks around for every later test, so one GUI
+    test's window state can reach the next one. Tests that destroy their own
+    root are unaffected -- this only sweeps up what they miss.
+    """
+    yield
+    root = getattr(tkinter, "_default_root", None)
+    if root is None:
+        return
+    try:
+        root.destroy()
+    except Exception:
+        # Already destroyed, or its interpreter is gone: nothing left to do
+        # but drop the reference so the next test starts clean.
+        pass
+    tkinter._default_root = None
 
 
 @pytest.fixture(autouse=True)

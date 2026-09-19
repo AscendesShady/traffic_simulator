@@ -759,6 +759,7 @@ class TelemetryDashboard:
         self.set_discharge_expanded(False)
 
         self.build_phase_cycle_ui()
+        self.build_webster_timing_ui()
 
         self.intersection_title_lbl = tk.Label(
             self.summary_content,
@@ -1168,6 +1169,19 @@ class TelemetryDashboard:
             pady=(3, 2) if compact else (10, 3),
         )
 
+        self.webster_title_lbl.config(
+            font=(FONT_FAMILY, max(8, profile["section_font"] - 1), "bold")
+        )
+        self.webster_auto_lbl.config(font=detail_bold_font)
+        self.webster_status_lbl.config(font=detail_bold_font)
+        self.webster_card.pack_configure(padx=10 if compact else 25)
+        for refs in self.webster_node_cards.values():
+            refs["title"].config(font=detail_bold_font)
+            refs["state"].config(font=detail_bold_font)
+            refs["cycle"].config(font=detail_font)
+            refs["ratio"].config(font=detail_font)
+            refs["note"].config(font=detail_bold_font)
+
         self.intersection_title_lbl.config(
             font=(FONT_FAMILY, profile["section_font"], "bold")
         )
@@ -1331,6 +1345,118 @@ class TelemetryDashboard:
             "<Configure>",
             lambda _event: self.draw_phase_cycle(self.latest_telemetry),
         )
+
+    def build_webster_timing_ui(self):
+        """Webster's measured capacity and each node's derived timing.
+
+        This is observed output of the run's calibration, not an operator
+        input, so it lives here beside the live signal state rather than in
+        the control panel. control_panel.get_webster_timing_summary() stays
+        the single source both would have read.
+        """
+        card = tk.Frame(
+            self.summary_content,
+            bg=COLOR_CARD,
+            highlightbackground=COLOR_CARD_BORDER,
+            highlightthickness=1,
+        )
+        card.pack(fill="x", padx=25, pady=(3, 3))
+        self.webster_card = card
+        heading = tk.Frame(card, bg=COLOR_CARD)
+        heading.pack(fill="x", padx=10, pady=(7, 0))
+        self.webster_title_lbl = tk.Label(
+            heading,
+            text="WEBSTER SIGNAL TIMING",
+            font=(FONT_FAMILY, 10, "bold"),
+            bg=COLOR_CARD,
+            fg=COLOR_TEXT_PRIMARY,
+        )
+        self.webster_title_lbl.pack(side="left")
+        self.webster_auto_lbl = tk.Label(
+            heading,
+            text="AUTO",
+            font=(FONT_FAMILY, 8, "bold"),
+            bg=COLOR_CARD,
+            fg=COLOR_TEXT_SECONDARY,
+        )
+        self.webster_auto_lbl.pack(side="right")
+        self.webster_status_lbl = tk.Label(
+            card,
+            text="Timing is calculated automatically when START is pressed.",
+            font=(FONT_FAMILY, 8, "bold"),
+            bg=COLOR_CARD,
+            fg=COLOR_TEXT_SECONDARY,
+            anchor="w",
+            justify="left",
+        )
+        self.webster_status_lbl.pack(fill="x", padx=10, pady=(2, 4))
+
+        # One stacked sub-card per node: side-by-side columns would force
+        # "EW 0.30 · NS 0.20 · Total 0.50" to wrap in this narrow pane.
+        self.webster_node_cards = {}
+        for node_x, node_name in ((300, "A"), (700, "B")):
+            node_card = tk.Frame(
+                card,
+                bg=COLOR_CARD_ALT,
+                highlightbackground=COLOR_CARD_BORDER,
+                highlightthickness=1,
+            )
+            node_heading = tk.Frame(node_card, bg=COLOR_CARD_ALT)
+            node_heading.pack(fill="x", padx=8, pady=(4, 0))
+            title_lbl = tk.Label(
+                node_heading,
+                text=f"NODE {node_name}  ·  {node_x} px",
+                font=(FONT_FAMILY, 8, "bold"),
+                bg=COLOR_CARD_ALT,
+                fg=COLOR_TEXT_PRIMARY,
+            )
+            title_lbl.pack(side="left")
+            state_lbl = tk.Label(
+                node_heading,
+                text="Waiting",
+                font=(FONT_FAMILY, 8, "bold"),
+                bg=COLOR_CARD_ALT,
+                fg=COLOR_TEXT_SECONDARY,
+            )
+            state_lbl.pack(side="right")
+            cycle_lbl = tk.Label(
+                node_card,
+                text="Cycle length: --",
+                font=(FONT_FAMILY, 8),
+                bg=COLOR_CARD_ALT,
+                fg=COLOR_TEXT_PRIMARY,
+                anchor="w",
+                justify="left",
+            )
+            cycle_lbl.pack(fill="x", padx=8)
+            ratio_lbl = tk.Label(
+                node_card,
+                text="Demand ratio: --",
+                font=(FONT_FAMILY, 8),
+                bg=COLOR_CARD_ALT,
+                fg=COLOR_TEXT_PRIMARY,
+                anchor="w",
+                justify="left",
+            )
+            ratio_lbl.pack(fill="x", padx=8, pady=(0, 4))
+            note_lbl = tk.Label(
+                node_card,
+                text="",
+                font=(FONT_FAMILY, 8, "bold"),
+                bg=COLOR_CARD_ALT,
+                fg=COLOR_DANGER,
+                anchor="w",
+                justify="left",
+            )
+            self.webster_node_cards[node_x] = {
+                "card": node_card,
+                "state": state_lbl,
+                "title": title_lbl,
+                "cycle": cycle_lbl,
+                "ratio": ratio_lbl,
+                "note": note_lbl,
+            }
+            # Sub-cards appear only once calibration has produced node data.
 
     def build_trends_ui(self):
         # Caption on top, the single action under it: the caption wraps to
@@ -1748,6 +1874,19 @@ class TelemetryDashboard:
             height=135,
         )
         canvas.pack(fill="both", expand=True)
+        # Webster's calculated green split lives here, directly under this
+        # node's signal-color indicator, instead of in the control panel --
+        # keeping the live signal state and its green time visually paired.
+        green_time_label = tk.Label(
+            card,
+            text="Green time: --",
+            font=(FONT_FAMILY, 9, "bold"),
+            bg=COLOR_CARD,
+            fg=COLOR_TEXT_SECONDARY,
+            justify="center",
+        )
+        green_time_label.pack(pady=(0, 8), fill="x", padx=4)
+        canvas.green_time_label = green_time_label
         return canvas
 
     @staticmethod
@@ -2014,6 +2153,97 @@ class TelemetryDashboard:
             node_b.get("phase", fallback),
             node_b.get("signals"),
         )
+        self._refresh_webster_timing_labels()
+
+    def _refresh_webster_timing_labels(self):
+        """Populate the Webster timing card and the per-node green splits.
+
+        Everything here comes from control_panel.get_webster_timing_summary(),
+        the same source the control panel used before this readout moved into
+        the Summary tab: measured capacity, each node's condition, cycle
+        length and demand ratio in the card; the green split under each live
+        node diagram, so the signal and its green time stay paired.
+        """
+        summary = control_panel.get_webster_timing_summary()
+        nodes_by_position = {node["position"]: node for node in summary["nodes"]}
+
+        if hasattr(self, "webster_status_lbl"):
+            colour = {
+                "CALIBRATING": COLOR_WARNING,
+                "READY": COLOR_SUCCESS,
+                "OVERSATURATED": COLOR_DANGER,
+            }.get(summary["state"], COLOR_TEXT_SECONDARY)
+            # wraplength is a fixed pixel budget Tk wraps to once; it does not
+            # shrink to fit if the card is later packed narrower than that,
+            # so it must track the card's own live width instead of a guess.
+            card_width = self.webster_status_lbl.master.winfo_width()
+            if card_width > 1:
+                self.webster_status_lbl.config(wraplength=max(160, card_width - 20))
+            self.webster_status_lbl.config(text=summary["message"], fg=colour)
+
+        for node_x, refs in getattr(self, "webster_node_cards", {}).items():
+            node = nodes_by_position.get(node_x)
+            if node is None:
+                # No calibration data yet: the sub-card stays hidden rather
+                # than showing placeholder timing that was never measured.
+                if refs["card"].winfo_manager():
+                    refs["card"].pack_forget()
+                continue
+            if not refs["card"].winfo_manager():
+                refs["card"].pack(fill="x", padx=10, pady=(0, 6))
+            if not node.get("available"):
+                refs["state"].config(text="Unavailable", fg=COLOR_WARNING)
+                refs["cycle"].config(text="Cycle length: no timing data")
+                refs["ratio"].config(text="Demand ratio: --")
+                refs["note"].config(text="")
+                refs["note"].pack_forget()
+                continue
+            oversaturated = bool(node.get("oversaturated"))
+            refs["state"].config(
+                text=node["status"],
+                fg=COLOR_DANGER if oversaturated else COLOR_SUCCESS,
+            )
+            refs["cycle"].config(
+                text=(
+                    f"Cycle length: {node['cycle_time_sec']:.0f} s  ·  "
+                    f"{'capped' if oversaturated else 'optimal'}"
+                )
+            )
+            refs["ratio"].config(
+                text=(
+                    f"Demand ratio: EW {node['ew_ratio']:.2f}  ·  "
+                    f"NS {node['ns_ratio']:.2f}  ·  "
+                    f"Total {node['total_ratio']:.2f}"
+                )
+            )
+            if oversaturated:
+                refs["note"].config(
+                    text="Reduce demand or increase vehicle speed."
+                )
+                if not refs["note"].winfo_manager():
+                    refs["note"].pack(fill="x", padx=8, pady=(0, 4))
+            else:
+                refs["note"].config(text="")
+                refs["note"].pack_forget()
+
+        for node_x, canvas in ((300, self.node_a_canvas), (700, self.node_b_canvas)):
+            label = getattr(canvas, "green_time_label", None)
+            if label is None:
+                continue
+            # The card is narrow (two per row), so wrap to the card's own
+            # width instead of letting the text overflow past its edge.
+            label.config(wraplength=max(70, canvas.winfo_width() - 6))
+            node = nodes_by_position.get(node_x)
+            if not node or not node.get("available"):
+                label.config(text="Green time: --", fg=COLOR_TEXT_SECONDARY)
+                continue
+            label.config(
+                text=(
+                    f"Green time\nEW {node['ew_green_sec']:.1f}s"
+                    f"  ·  NS {node['ns_green_sec']:.1f}s"
+                ),
+                fg=COLOR_DANGER if node.get("oversaturated") else COLOR_TEXT_SECONDARY,
+            )
 
     def draw_intersection(self, canvas, node_key, phase, signals=None):
         canvas.delete("all")
@@ -2491,6 +2721,45 @@ class TelemetryDashboard:
             config.get("random_seed"),
         )
 
+    def _add_ai_decision_audit_sheet(
+        self,
+        workbook,
+        decisions=None,
+        telemetry_rows=None,
+        samples=None,
+        live_telemetry=None,
+    ):
+        """Add the shared decision/observation trace to one dashboard export.
+
+        ``decisions``/``telemetry_rows`` are used exactly as given -- a caller
+        that wants the on-disk session logs (like ``export_all``) must read
+        and pass them explicitly. Silently falling back to disk here would
+        let stale logs from an earlier run leak into an export that was only
+        given in-memory samples or a live snapshot.
+        """
+        if "AI Decision Audit" in workbook.sheetnames:
+            return workbook["AI Decision Audit"]
+        if decisions is None:
+            decisions = []
+        if telemetry_rows is None:
+            telemetry_rows = []
+        if samples is None:
+            samples = getattr(self, "llm_samples", [])
+        if live_telemetry is None:
+            live_telemetry = getattr(self, "latest_telemetry", None)
+        # Lazy import avoids the module-load cycle: main imports this class as
+        # the composition root, while exports run only after startup finishes.
+        from src.core import main
+
+        sheet = workbook.create_sheet("AI Decision Audit")
+        return main.write_ai_decision_audit_sheet(
+            sheet,
+            decisions=decisions,
+            telemetry_rows=telemetry_rows,
+            samples=samples,
+            live_telemetry=live_telemetry,
+        )
+
     def export_all(self, destination=None):
         """Export session logs and dashboard LLM samples into one workbook."""
         decisions = read_jsonl(AGENT_TURN_LOG_FILE)
@@ -2528,6 +2797,12 @@ class TelemetryDashboard:
             self._write_telemetry_rows(telemetry_sheet, telemetry_rows)
             self._write_llm_performance_rows(performance_sheet, samples)
             self._write_llm_summary_rows(summary_sheet, samples)
+            self._add_ai_decision_audit_sheet(
+                workbook,
+                decisions=decisions,
+                telemetry_rows=telemetry_rows,
+                samples=samples,
+            )
 
             # Record the operator inputs that produced this session, so the
             # workbook is self-describing without the control panel.
@@ -2628,6 +2903,9 @@ class TelemetryDashboard:
             self._write_llm_performance_rows(samples_sheet, self.llm_samples)
             self._write_llm_summary_rows(summary_sheet, self.llm_samples)
             self._style_excel_sheets((samples_sheet, summary_sheet))
+            self._add_ai_decision_audit_sheet(
+                workbook, samples=self.llm_samples
+            )
 
             workbook.save(destination)
             workbook.close()
@@ -2965,6 +3243,9 @@ class TelemetryDashboard:
             self._style_excel_sheets(sheets)
             if shared:
                 return sheets
+            self._add_ai_decision_audit_sheet(
+                workbook, live_telemetry=data
+            )
             workbook.save(destination)
             workbook.close()
             self.summary_export_status_lbl.config(
@@ -3094,6 +3375,7 @@ class TelemetryDashboard:
             self._style_excel_sheets((trends_sheet, summary_sheet))
             if shared:
                 return (trends_sheet, charts_sheet, summary_sheet)
+            self._add_ai_decision_audit_sheet(workbook)
             workbook.save(destination)
             workbook.close()
             self.trends_export_status_lbl.config(

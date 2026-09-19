@@ -157,17 +157,24 @@ def test_wait_frames_accumulate(tmp_path):
     tracker = BusEventTracker(tmp_path / "bus_events.jsonl")
 
     # Free-flowing: EW green for the whole approach, nothing ahead.
-    free_controller = make_controller()
+    free_controller = SignalController(
+        {"green_time": 3000},
+        yellow_time=2,
+        red_clearance_time=2,
+        min_green_frames=30,
+    )
     free_controller.phase = 0
     free_controller.timer = 0
-    free_bus = make_bus_for_leg("R1_EB_A_NB", 300, "FREE_BUS")
+    # Use the signal-controlled straight route; permissive left turns are no
+    # longer a valid fixture for red-signal waiting telemetry.
+    free_bus = make_bus_for_leg("R3_EB_ONLY", 300, "FREE_BUS")
     free_record, _ = run_bus_to_completion(free_bus, free_controller, tracker)
 
     # Held: NS green has just started, so the EB bus must wait at the bar.
     held_controller = make_controller()
     held_controller.phase = 3
     held_controller.timer = 0
-    held_bus = make_bus_for_leg("R1_EB_A_NB", 300, "HELD_BUS")
+    held_bus = make_bus_for_leg("R3_EB_ONLY", 300, "HELD_BUS")
     held_record, _ = run_bus_to_completion(held_bus, held_controller, tracker)
 
     assert free_record["first_stop_frame"] is None

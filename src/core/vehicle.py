@@ -18,9 +18,8 @@ SLOW_VEHICLE_SPEED = 0.5
 ROUTE_MERGE_AREA_PX = 80.0
 ROUTE_MERGE_SAFE_GAP_PX = 15.0
 ROUTE_MERGE_YIELD_DISTANCE_PX = 100.0
-# A car ahead of a DBL-eligible bus in the bus lane vacates that lane once the
-# bus is within this bumper gap, so an active DBL actually opens the lane in
-# front of the bus rather than only holding traffic behind it.
+# Retained as a public compatibility constant. DBL lane clearing is now
+# unconditional across the reserved approach; it is no longer proximity-gated.
 DBL_CLEAR_AHEAD_PX = 200.0
 # Lateral step per frame for any cooperative lane change; matches the bus's
 # own merge step so no vehicle ever jumps between lanes.
@@ -57,14 +56,65 @@ def dbl_lane_center_y(direction, h_y, lane_w=22):
     return h_y - offset if direction == "EB" else h_y + offset
 
 
-def dbl_lane_is_obstructed(bus, all_vehicles, h_y, lane_w=22):
-    """Whether `bus` currently could not complete a merge into the DBL lane.
+def _is_ahead_on_approach(bus, other):
+    if bus.direction == "EB":
+        return other.x > bus.x
+    if bus.direction == "WB":
+        return other.x < bus.x
+    return False
 
-    Only stopped or crawling traffic counts: a vehicle moving through the
-    corridor at speed clears on its own and should not be reported to the
-    model as an obstruction. A bus already in the DBL lane is never
-    obstructed, since it no longer needs the merge.
+
+def dbl_lane_queue_ahead(bus, all_vehicles, h_y, target_node=None, lane_w=22):
+    """Stopped/crawling vehicles ahead of ``bus`` in the reserved DBL lane.
+
+    When ``target_node`` is supplied, only the current approach between the
+    bus and that node's stop bar is inspected. This is the queue that would
+    make a DBL activation useless: reserving a lane cannot remove a standing
+    vehicle already in front of the priority bus.
     """
+    desired_y = dbl_lane_center_y(bus.direction, h_y, lane_w)
+    bus_distance = None
+    if target_node is not None:
+        bus_distance = bus.distance_to_node_stop_bar(target_node, h_y)
+
+    queued = []
+    for other in all_vehicles or []:
+        if other is bus or other.direction != bus.direction:
+            continue
+        if not _is_ahead_on_approach(bus, other):
+            continue
+        other_half_width = getattr(other, "width", 0.0) / 2.0
+        if not (
+            other.y - other_half_width
+            < desired_y
+            < other.y + other_half_width
+        ):
+            continue
+        if getattr(other, "speed", 0.0) > SLOW_VEHICLE_SPEED:
+            continue
+        if target_node is not None:
+            other_distance = other.distance_to_node_stop_bar(target_node, h_y)
+            if not (0.0 <= other_distance < bus_distance):
+                continue
+        queued.append(other)
+    return queued
+
+
+def dbl_lane_is_obstructed(
+    bus, all_vehicles, h_y, lane_w=22, target_node=None
+):
+    """Whether DBL would strand ``bus`` behind traffic or block its merge.
+
+    A stopped/crawling vehicle ahead is always an obstruction, including when
+    the bus is already in the DBL lane. Otherwise, a bus outside that lane is
+    obstructed when stopped/crawling traffic occupies its merge corridor.
+    Moving traffic is not a queue: once DBL is active it is ordered to vacate
+    the reserved lane immediately and can also clear longitudinally.
+    """
+    if dbl_lane_queue_ahead(
+        bus, all_vehicles, h_y, target_node=target_node, lane_w=lane_w
+    ):
+        return True
     if getattr(bus, "lane_index", None) == DBL_LANE_INDEX:
         return False
     desired_y = dbl_lane_center_y(bus.direction, h_y, lane_w)
@@ -342,10 +392,11 @@ class Vehicle:
         elif self.leg_state == "APPROACHING" and target_node_x not in self.passed_nodes:
             self.leg_state = "TURNING" if self.target_turn == "LEFT" else "IN_INTERSECTION"
 
-        # 1. UPSTREAM DBL YIELDING. A car BEHIND the priority bus in its lane
-        #    yields (F-01). A car AHEAD of the bus in the DBL lane vacates it
-        #    into lane 1 or 0 so the bus has an open lane; if neither lane is
-        #    clear it simply keeps driving and is retried next frame.
+        # 1. UPSTREAM DBL YIELDING. Once DBL is armed, every non-bus vehicle
+        #    in the reserved approach lane is ordered out immediately, ahead
+        #    of or behind the priority bus. A safe lane change is never forced:
+        #    a vehicle that cannot vacate keeps moving when ahead of the bus,
+        #    or holds behind it, and retries every frame.
         self.dbl_merge_yield_slow = False
         if not isinstance(self, Bus) and signal_controller:
             dbl_request = signal_controller.get_active_dbl_request(
@@ -355,25 +406,17 @@ class Vehicle:
                 dist_to_stop = self.distance_to_node_stop_bar(target_node_x, h_y, road_w, stop_offset)
                 eligibility_px = signal_controller.get_priority_eligibility_px()
                 if 0.0 <= dist_to_stop <= eligibility_px:
-                    # Nearest DBL bus behind us (bumper gap), if any.
-                    bus_behind_gap = None
-                    for other in all_vehicles:
-                        if not isinstance(other, Bus) or other.direction != self.direction:
-                            continue
-                        if not signal_controller.is_bus_dbl_eligible(other, target_node_x):
-                            continue
-                        if (self.direction == "EB" and other.x < self.x) or (
-                            self.direction == "WB" and other.x > self.x
-                        ):
-                            gap = abs(self.x - other.x) - (self.length + other.length) / 2.0
-                            if bus_behind_gap is None or gap < bus_behind_gap:
-                                bus_behind_gap = gap
-
-                    if bus_behind_gap is None:
-                        should_stop = True
-                    elif (
-                        bus_behind_gap <= DBL_CLEAR_AHEAD_PX
-                        and self.lane_vacate_target is None
+                    priority_bus = next(
+                        (
+                            other
+                            for other in all_vehicles
+                            if isinstance(other, Bus)
+                            and other.bus_id == dbl_request["bus_id"]
+                        ),
+                        None,
+                    )
+                    if (
+                        self.lane_vacate_target is None
                         and self.lane_index == DBL_LANE_INDEX
                     ):
                         # Only start a change that can finish before the stop
@@ -383,6 +426,11 @@ class Vehicle:
                             self.lane_vacate_target = self.choose_vacate_lane(
                                 (1, 0), h_y, lane_w, all_vehicles
                             )
+                    if self.lane_vacate_target is None and (
+                        priority_bus is None
+                        or not _is_ahead_on_approach(priority_bus, self)
+                    ):
+                        should_stop = True
 
         # 1b. DBL MERGE GAP. A bus moving into the DBL lane names the one car
         #     blocking its corridor. Ahead of the bus, that car tries to leave
@@ -425,17 +473,35 @@ class Vehicle:
             else:
                 sig_state = sig_state.upper()
 
-            if sig_state != "GREEN" and signal_controller:
+            # Left turns are permissive/yield-controlled movements in this
+            # network.  They do not wait for a green indication, but they do
+            # still need an intersection reservation so an occupied or
+            # conflicting movement can stop them safely.
+            unrestricted_left = self.target_turn == "LEFT"
+
+            if sig_state != "GREEN" and signal_controller and not unrestricted_left:
                 signal_controller.cancel_intersection_entry(self, target_node_x)
             
-            if sig_state in ("RED", "YELLOW") and dist_to_stop <= 15.0:
+            if (
+                not unrestricted_left
+                and sig_state in ("RED", "YELLOW")
+                and dist_to_stop <= 15.0
+            ):
                 should_stop = True
                 
-            if sig_state == "GREEN" and 0.0 <= dist_to_stop <= 25.0:
+            if (
+                (sig_state == "GREEN" or unrestricted_left)
+                and 0.0 <= dist_to_stop <= 25.0
+            ):
                 if self.route_exit_merge_blocked:
                     should_stop = True
                 elif self.is_spillback_blocked(target_node_x, h_y, road_w, all_vehicles):
                     should_stop = True
+                elif unrestricted_left and not signal_controller:
+                    # A permissive turn may ignore the lamp, never the
+                    # conflict arbiter. Legacy/controller-less callers fail
+                    # closed when attempting the turn against red/yellow.
+                    should_stop = sig_state != "GREEN"
                 elif signal_controller and not signal_controller.request_intersection_entry(
                     self, target_node_x, all_vehicles
                 ):
@@ -688,6 +754,7 @@ class Bus(Vehicle):
             leg
             and following_leg
             and following_leg["entry_lane"] != leg["entry_lane"]
+            and self.lane_index != following_leg["entry_lane"]
         ):
             self.route_exit_merge_blocked = not self.target_lane_has_merge_storage(
                 leg["node_x"],
@@ -711,10 +778,16 @@ class Bus(Vehicle):
             if self.direction in ("EB", "WB")
             else abs(self.y - h_y)
         )
-        dbl_enabled_for_leg = bool(
+        dbl_requested_for_leg = bool(
             leg
             and signal_controller
-            and signal_controller.is_dbl_enabled_for_bus_leg(self, target_node_x)
+            and signal_controller.is_dbl_requested_for_bus_leg(self, target_node_x)
+        )
+        dbl_enabled_for_leg = bool(
+            dbl_requested_for_leg
+            and signal_controller.is_dbl_enabled_for_bus_leg(
+                self, target_node_x, all_vehicles
+            )
         )
         turn_lane_change_due = (
             self.target_turn == "LEFT" and dist_to_intersection < 250.0
@@ -729,9 +802,16 @@ class Bus(Vehicle):
         # A merge that stays blocked past DBL_MERGE_ABANDON_FRAMES is given up
         # for this leg, and the bus runs in its configured lane exactly as an
         # unequipped bus would, rather than holding upstream indefinitely.
-        if not dbl_enabled_for_leg:
+        if not dbl_requested_for_leg:
             self.dbl_merge_hold_frames = 0
             self.dbl_merge_abandoned_for_leg = False
+        elif not dbl_enabled_for_leg:
+            # A stopped queue or blocked merge vetoes this activation before
+            # the bus is made to hold. Keep that refusal sticky for this leg
+            # while the same route flag remains on; otherwise a bus could
+            # creep past the observed blocker and retry DBL at the stop bar.
+            self.dbl_merge_hold_frames = 0
+            self.dbl_merge_abandoned_for_leg = True
         dbl_merge_due = dbl_enabled_for_leg and not self.dbl_merge_abandoned_for_leg
 
         # A DBL-enabled bus occupies the continuous outer lane as early as

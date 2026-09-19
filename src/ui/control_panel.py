@@ -209,7 +209,11 @@ global_config = {
     "start_requested": False,# START requests a fresh run from frame zero
     "is_running": False,     # Sim launches idle; START begins a fresh run
     "run_has_started": False,# Distinguishes launch-idle from a completed STOP
-    "test_duration_sim_seconds": None,  # None = free run; int = auto-stop sim-time
+    # Timed-benchmark length. Defaults to an hour: a 2-minute warm-up plus a
+    # steady window long enough for the cumulative DV to converge. None = free run.
+    "test_duration_sim_seconds": 3600,
+    # Frames discarded from the front of every steady-state DV (main.py).
+    "warmup_discard_frames": 7200,
     "test_running": False,   # True while a timed benchmark run is active
     "test_model": "None",    # Model captured when the test started
     "test_seed": None,       # Seed captured when the test started
@@ -1891,6 +1895,9 @@ def create_dashboard_window(parent=None):
         state="readonly", style="Modern.TCombobox", font=FONT_BODY,
     )
     test_duration_box.pack(fill="x", pady=(0, ROW_GAP))
+    for label, seconds in TEST_DURATIONS.items():
+        if seconds == global_config.get("test_duration_sim_seconds"):
+            test_duration_box.set(label)
 
     # Own decision-interval slider, independent of the Single Run card's:
     # governs the single Benchmark Test below and every queued Batch

@@ -472,3 +472,126 @@ def test_fifteen_minute_run_produces_three_checkpoints_and_rows(monkeypatch, tmp
     rows = read_summary_rows()
     assert len(rows) == 3
     assert [float(row["checkpoint_min"]) for row in rows] == [5.0, 10.0, 15.0]
+
+
+# --------------------------------------------------------------------------
+# Part D -- steady-state DVs (warm-up discard)
+# --------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def clear_warmup_snapshot():
+    main.network_throughput_at_warmup.clear()
+    yield
+    main.network_throughput_at_warmup.clear()
+
+
+def _write_telemetry_rows(rows):
+    with main.TELEMETRY_LOG_PATH.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+
+def test_warmup_snapshot_taken_once_at_the_discard_frame():
+    control_panel.global_config["warmup_discard_frames"] = 7200
+    main.network_throughput["passengers_served_total"] = 40
+    main.snapshot_warmup_baseline(7199)
+    assert not main.network_throughput_at_warmup
+    main.snapshot_warmup_baseline(7200)
+    assert main.network_throughput_at_warmup["passengers_served_total"] == 40
+    assert main.network_throughput_at_warmup["frame"] == 7200
+    main.network_throughput["passengers_served_total"] = 90
+    main.snapshot_warmup_baseline(7201)  # never re-taken within a run
+    assert main.network_throughput_at_warmup["passengers_served_total"] == 40
+    main.perform_full_reset([], SignalController({"green_time": 100}))
+    assert not main.network_throughput_at_warmup
+
+
+def test_steady_columns_use_only_the_post_warmup_window():
+    """Cumulative columns are untouched; *_steady divide the post-warm-up
+    delta by the steady window, so fill traffic cannot drag the DV."""
+    _seed_regime()
+    control_panel.global_config["warmup_discard_frames"] = 7200  # 120 s
+    main.network_throughput.update({
+        "passengers_served_total": 100, "passengers_served_bus": 45,
+        "passengers_served_car": 55,
+        "bus_passenger_delay_frames": 45 * 60, "car_passenger_delay_frames": 55 * 60,
+    })
+    main.snapshot_warmup_baseline(7200)
+    main.network_throughput.update({
+        "passengers_served_total": 580, "passengers_served_bus": 225,
+        "passengers_served_car": 355,
+        "bus_passenger_delay_frames": 45 * 60 + 180 * 60,
+        "car_passenger_delay_frames": 55 * 60 + 300 * 60,
+    })
+
+    row = main.build_experiment_summary_row(600)  # T = 10 min
+
+    assert row["pax_per_min"] == pytest.approx(58.0)          # 580 / 10, unchanged
+    assert row["warmup_discard_sec"] == 120.0
+    assert row["steady_window_sec"] == 480.0
+    assert row["pax_per_min_steady"] == pytest.approx(60.0)   # 480 / 8
+    assert row["bus_person_hours_delay_steady"] == pytest.approx(180 / 3600, abs=1e-4)
+    assert row["car_person_hours_delay_steady"] == pytest.approx(300 / 3600, abs=1e-4)
+    assert row["total_person_hours_delay_steady"] == pytest.approx(480 / 3600, abs=1e-4)
+    assert row["mean_bus_passenger_delay_sec_steady"] == pytest.approx(180 / 180)
+    assert row["mean_car_passenger_delay_sec_steady"] == pytest.approx(300 / 300)
+    for column in main.EXPERIMENT_SUMMARY_HEADERS:
+        assert column in row
+
+
+def test_steady_columns_are_none_before_warmup_ends():
+    _seed_regime()
+    control_panel.global_config["warmup_discard_frames"] = 7200
+    main.network_throughput["passengers_served_total"] = 50
+    row = main.build_experiment_summary_row(60)
+    assert row["pax_per_min_steady"] is None
+    assert row["steady_window_sec"] == 0.0
+    assert row["pax_per_min"] == pytest.approx(50.0)
+
+
+def test_converged_flag_compares_cumulative_rate_at_0_8T():
+    _seed_regime()
+    main.network_throughput["passengers_served_total"] = 600  # 60/min at T=600
+    _write_telemetry_rows([
+        {"sim_time_s": 300, "pax_per_min_cumulative": 40.0},
+        {"sim_time_s": 480, "pax_per_min_cumulative": 58.0},  # within 5% of 60
+        {"sim_time_s": 540, "pax_per_min_cumulative": 30.0},  # after 0.8T: ignored
+    ])
+    assert main.build_experiment_summary_row(600)["converged"] is True
+    _write_telemetry_rows([{"sim_time_s": 480, "pax_per_min_cumulative": 50.0}])
+    assert main.build_experiment_summary_row(600)["converged"] is False
+    _write_telemetry_rows([])
+    assert main.build_experiment_summary_row(600)["converged"] is None
+
+
+def test_old_summary_csv_is_rotated_not_misaligned():
+    """A dataset written with an older header is set aside intact and a
+    fresh file starts with the current header."""
+    _seed_regime()
+    old_header = "timestamp,model,seed\n"
+    main.EXPERIMENT_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    main.EXPERIMENT_SUMMARY_PATH.write_text(old_header + "1,rule-based,1\n", encoding="utf-8")
+
+    assert main.append_experiment_summary_row(300) is True
+
+    rows = read_summary_rows()
+    assert len(rows) == 1 and "pax_per_min_steady" in rows[0]
+    rotated = [
+        path for path in main.EXPERIMENT_SUMMARY_PATH.parent.glob("experiment_summary_*.csv")
+    ]
+    assert len(rotated) == 1
+    assert rotated[0].read_text(encoding="utf-8") == old_header + "1,rule-based,1\n"
+
+
+def test_default_benchmark_is_an_hour_with_two_minute_warmup():
+    assert control_panel.TEST_DURATIONS["1 hr"] == 3600
+    assert main.WARMUP_DISCARD_FRAMES == 7200
+    fresh = {
+        key: value for key, value in control_panel.global_config.items()
+        if key in ("warmup_discard_frames",)
+    }
+    assert fresh == {"warmup_discard_frames": 7200}
+    assert any(
+        param == "warmup_discard_frames" and value == 7200
+        for _section, param, value in main.control_panel_input_rows()
+    )

@@ -84,6 +84,29 @@ network_throughput = {
     "vehicles_in_network_sample_count": 0,
     "vehicles_in_network_max": 0,
 }
+# network_throughput as it stood when the warm-up window ended, so a
+# steady-state DV is "current counter minus this". Empty until that frame.
+network_throughput_at_warmup = {}
+# 120 s at 60 fps: the network takes ~90 s to fill from empty, so a
+# cumulative DV over a short run is mostly fill. Operator-configurable.
+WARMUP_DISCARD_FRAMES = 7200
+
+
+def warmup_discard_frames():
+    try:
+        return max(0, int(control_panel.global_config.get(
+            "warmup_discard_frames", WARMUP_DISCARD_FRAMES
+        )))
+    except (TypeError, ValueError, OverflowError):
+        return WARMUP_DISCARD_FRAMES
+
+
+def snapshot_warmup_baseline(master_frame_count):
+    """Freeze the cumulative counters at the end of warm-up, once per run."""
+    if network_throughput_at_warmup or master_frame_count < warmup_discard_frames():
+        return
+    network_throughput_at_warmup.update(network_throughput)
+    network_throughput_at_warmup["frame"] = int(master_frame_count)
 
 
 def accumulate_frame_metrics(vehicles):
@@ -962,6 +985,7 @@ def control_panel_input_rows():
         ("Global", "sim_speed", config.get("sim_speed")),
         ("Global", "test_duration_sim_seconds",
          config.get("test_duration_sim_seconds")),
+        ("Global", "warmup_discard_frames", warmup_discard_frames()),
         ("Global", "discharge_selection", config.get("discharge_selection")),
         ("Global", "llm_model", ai_runtime.get("model", "None")),
         ("Global", "llm_tick_seconds", ai_runtime.get("tick_seconds")),
@@ -1077,7 +1101,69 @@ EXPERIMENT_SUMMARY_HEADERS = (
     "decision_lag_sec_used",
     # LOS
     "level_of_service",
+    # Steady-state DVs: the same quantities over the post-warm-up window only.
+    # The cumulative columns above are kept untouched so old rows stay readable.
+    "warmup_discard_sec", "steady_window_sec", "converged",
+    "pax_per_min_steady",
+    "total_person_hours_delay_steady", "bus_person_hours_delay_steady",
+    "car_person_hours_delay_steady",
+    "mean_bus_passenger_delay_sec_steady", "mean_car_passenger_delay_sec_steady",
 )
+
+
+def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
+    """Post-warm-up DVs from the warm-up snapshot, plus a convergence flag
+    on the cumulative pax/min (within 5% between 0.8T and T)."""
+    warm = network_throughput_at_warmup
+    warmup_sec = warmup_discard_frames() / 60.0
+    steady_sec = checkpoint_seconds - warmup_sec
+    out = {
+        "warmup_discard_sec": round(warmup_sec, 1),
+        "steady_window_sec": round(max(0.0, steady_sec), 1),
+        "converged": None,
+        "pax_per_min_steady": None,
+        "total_person_hours_delay_steady": None,
+        "bus_person_hours_delay_steady": None,
+        "car_person_hours_delay_steady": None,
+        "mean_bus_passenger_delay_sec_steady": None,
+        "mean_car_passenger_delay_sec_steady": None,
+    }
+    if warm and steady_sec > 0:
+        def delta(key):
+            return int(network_throughput.get(key, 0) or 0) - int(warm.get(key, 0) or 0)
+        bus_pax = delta("passengers_served_bus")
+        car_pax = delta("passengers_served_car")
+        bus_delay_sec = delta("bus_passenger_delay_frames") / 60.0
+        car_delay_sec = delta("car_passenger_delay_frames") / 60.0
+        out.update({
+            "pax_per_min_steady": round(
+                delta("passengers_served_total") / (steady_sec / 60.0), 2
+            ),
+            "total_person_hours_delay_steady": round(
+                (bus_delay_sec + car_delay_sec) / 3600.0, 4
+            ),
+            "bus_person_hours_delay_steady": round(bus_delay_sec / 3600.0, 4),
+            "car_person_hours_delay_steady": round(car_delay_sec / 3600.0, 4),
+            "mean_bus_passenger_delay_sec_steady": (
+                round(bus_delay_sec / bus_pax, 2) if bus_pax else None
+            ),
+            "mean_car_passenger_delay_sec_steady": (
+                round(car_delay_sec / car_pax, 2) if car_pax else None
+            ),
+        })
+    served_total = int(network_throughput.get("passengers_served_total", 0) or 0)
+    ppm_now = served_total / max(checkpoint_seconds / 60.0, 1e-9)
+    earlier = [
+        row for row in telemetry_rows
+        if isinstance(row, dict)
+        and isinstance(row.get("sim_time_s"), (int, float))
+        and row["sim_time_s"] <= 0.8 * checkpoint_seconds
+        and isinstance(row.get("pax_per_min_cumulative"), (int, float))
+    ]
+    if earlier and ppm_now > 0:
+        ppm_then = max(earlier, key=lambda row: row["sim_time_s"])["pax_per_min_cumulative"]
+        out["converged"] = abs(ppm_now - ppm_then) / ppm_now < 0.05
+    return out
 
 
 def _approach_demand_rates():
@@ -1161,6 +1247,9 @@ def build_experiment_summary_row(checkpoint_sim_seconds):
     decision_rollup = summarize_turn_log(decisions)
     bus_events = _read_jsonl_rows(BUS_EVENTS_LOG_PATH)
     mechanism = _bus_event_mechanism_summary(bus_events)
+    steady = _steady_state_metrics(
+        checkpoint_seconds, _read_jsonl_rows(TELEMETRY_LOG_PATH)
+    )
 
     rates = _approach_demand_rates()
     cycle_splits = config.get("cycle_time_sec") or {}
@@ -1236,6 +1325,7 @@ def build_experiment_summary_row(checkpoint_sim_seconds):
         "level_of_service": real_world_units.hcm_level_of_service(
             mean_stopped_delay_sec_per_vehicle
         ),
+        **steady,
     }
     return row
 
@@ -1249,8 +1339,23 @@ def append_experiment_summary_row(checkpoint_sim_seconds):
     """
     try:
         row = build_experiment_summary_row(checkpoint_sim_seconds)
-        is_new = not EXPERIMENT_SUMMARY_PATH.exists()
         EXPERIMENT_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not EXPERIMENT_SUMMARY_PATH.exists()
+        if not is_new:
+            with EXPERIMENT_SUMMARY_PATH.open("r", encoding="utf-8") as handle:
+                header = handle.readline().strip().split(",")
+            if header != list(EXPERIMENT_SUMMARY_HEADERS):
+                # A schema change never rewrites or misaligns old rows: the
+                # old dataset is set aside under a dated name and a new one
+                # begins with the current header.
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                EXPERIMENT_SUMMARY_PATH.rename(
+                    EXPERIMENT_SUMMARY_PATH.with_name(
+                        f"{EXPERIMENT_SUMMARY_PATH.stem}_{stamp}"
+                        f"{EXPERIMENT_SUMMARY_PATH.suffix}"
+                    )
+                )
+                is_new = True
         with EXPERIMENT_SUMMARY_PATH.open(
             "a", newline="", encoding="utf-8"
         ) as handle:
@@ -1886,6 +1991,7 @@ def perform_full_reset(vehicles, signals, telemetry=None):
         telemetry.reset_session()
     reset_session_logs()
     network_throughput.update({key: 0 for key in network_throughput})
+    network_throughput_at_warmup.clear()
     # A fresh run gets a fresh checkpoint schedule -- only when this reset is
     # starting a timed test; a plain START or a mid-test manual RESET both
     # restart the sim clock at frame zero, so the marks must restart too.
@@ -2978,6 +3084,7 @@ def main():
                 # controller's live priority requests for this frame.
                 bus_event_tracker.observe(vehicles, master_frame_count, signals)
                 accumulate_frame_metrics(vehicles)
+                snapshot_warmup_baseline(master_frame_count)
                 
                 time_accumulator -= dt_step
                 steps_this_callback += 1

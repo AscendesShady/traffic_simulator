@@ -1217,6 +1217,15 @@ def _bus_event_mechanism_summary(bus_events):
     }
 
 
+class BaselineContaminationError(RuntimeError):
+    """The no-controller baseline arm shows decisions or TSP treatment."""
+
+
+def is_baseline_run(config=None):
+    config = control_panel.global_config if config is None else config
+    return str(config.get("test_model", "None")) == "None"
+
+
 def build_experiment_summary_row(checkpoint_sim_seconds):
     """One cumulative-to-date row for the cross-run comparison dataset.
 
@@ -1243,10 +1252,23 @@ def build_experiment_summary_row(checkpoint_sim_seconds):
     frame_sum = int(throughput.get("vehicles_in_network_frame_sum", 0) or 0)
     total_served = int(throughput.get("passengers_served_total", 0) or 0)
 
-    decisions = _read_jsonl_rows(AGENT_TURN_LOG_PATH)
+    # Observation-only turns are the agent watching a baseline, not decisions.
+    decisions = [
+        row for row in _read_jsonl_rows(AGENT_TURN_LOG_PATH)
+        if row.get("status") != "OBSERVATION_ONLY"
+    ]
     decision_rollup = summarize_turn_log(decisions)
     bus_events = _read_jsonl_rows(BUS_EVENTS_LOG_PATH)
     mechanism = _bus_event_mechanism_summary(bus_events)
+    if is_baseline_run(config) and (
+        decision_rollup.get("turns", 0) or mechanism["buses_tsp_treated"]
+    ):
+        # A reference row with a controller's fingerprints on it is worse
+        # than no row: refuse to export it.
+        raise BaselineContaminationError(
+            f"baseline run logged {decision_rollup.get('turns', 0)} decision(s) "
+            f"and {mechanism['buses_tsp_treated']} TSP-treated bus(es)"
+        )
     steady = _steady_state_metrics(
         checkpoint_seconds, _read_jsonl_rows(TELEMETRY_LOG_PATH)
     )
@@ -1339,6 +1361,11 @@ def append_experiment_summary_row(checkpoint_sim_seconds):
     """
     try:
         row = build_experiment_summary_row(checkpoint_sim_seconds)
+    except BaselineContaminationError as exc:
+        control_panel.global_config["test_failed_reason"] = f"baseline_contaminated: {exc}"
+        print(f"\n!!! BASELINE CONTAMINATED -- summary row NOT written: {exc}\n")
+        return False
+    try:
         EXPERIMENT_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
         is_new = not EXPERIMENT_SUMMARY_PATH.exists()
         if not is_new:
@@ -1682,7 +1709,10 @@ def poll_batch_runner():
         else:
             is_api_model = _is_batch_api_model(model)
             rate_limited = is_api_model and _batch_run_hit_rate_limit(model)
-            if timed_out:
+            failed_reason = config.get("test_failed_reason")
+            if failed_reason:
+                runner.report_run_outcome("FAILED", reason=str(failed_reason))
+            elif timed_out:
                 runner.report_run_outcome(
                     "FAILED", reason="timeout",
                     rate_limited=rate_limited, is_api_model=is_api_model,
@@ -1992,6 +2022,11 @@ def perform_full_reset(vehicles, signals, telemetry=None):
     reset_session_logs()
     network_throughput.update({key: 0 for key in network_throughput})
     network_throughput_at_warmup.clear()
+    control_panel.global_config["test_failed_reason"] = ""
+    if control_panel.global_config.get("test_running", False) and is_baseline_run():
+        # The baseline arm has no controller: route flags left on by the
+        # previous run's last decision must not carry into it.
+        _set_ai_flags(guard.all_off_flags())
     # A fresh run gets a fresh checkpoint schedule -- only when this reset is
     # starting a timed test; a plain START or a mid-test manual RESET both
     # restart the sim clock at frame zero, so the marks must restart too.

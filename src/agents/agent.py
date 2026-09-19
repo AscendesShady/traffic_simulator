@@ -242,6 +242,7 @@ class AgentState(TypedDict):
     turn: int
     model: str
     decision_lag_sec: float
+    control_path: str
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -1004,12 +1005,58 @@ def _call_rule(state: AgentState) -> tuple[str, dict]:
     }
 
 
+OBSERVATION_ONLY = "OBSERVATION_ONLY"
+
+
+def is_baseline_model(model) -> bool:
+    """The no-controller baseline: nothing decides, the agent only observes."""
+    return not model or str(model) == "None"
+
+
+def observation_only_decision(turn, model) -> dict:
+    return {
+        "schema_version": 1,
+        "turn": int(turn or 0),
+        "timestamp": round(time.time(), 3),
+        "model": str(model or "None"),
+        "status": OBSERVATION_ONLY,
+        "flags": guard.all_off_flags(),
+        "reason": "no-controller baseline: observing only",
+    }
+
+
+def guard_baseline(decision: dict, state: AgentState) -> dict:
+    """Last check before anything reaches disk: a baseline turn, or a turn
+    whose arm/model changed underneath it (a straggler from the run that
+    just ended, landing in the next run's fresh log), is observation only.
+    An OK decision can never be attributed to the baseline arm. The live
+    loop passes ``control_path`` so the control file is re-read here; a
+    state without it (tests driving one turn) skips the straggler check.
+    """
+    model = str(state.get("model", "None"))
+    control_path = state.get("control_path")
+    stale_arm = False
+    if control_path:
+        control = read_ai_control(Path(control_path))
+        stale_arm = not control["armed"] or str(control["model"]) != model
+    if is_baseline_model(model) or stale_arm:
+        decision = observation_only_decision(state.get("turn", 0), model)
+    assert not (is_baseline_model(decision.get("model")) and decision.get("status") == "OK")
+    return decision
+
+
 def ai_turn(state: AgentState) -> dict:
     model = state.get("model", "None")
     started = time.time()
+    if is_baseline_model(model):
+        return {
+            "raw_output": "",
+            "status": OBSERVATION_ONLY,
+            "call_metrics": {"latency_ms": 0.0, "input_tokens": None,
+                             "output_tokens": None, "eval_duration_ns": None,
+                             "total_duration_ns": None},
+        }
     try:
-        if not model or model == "None":
-            raise RuntimeError("no model selected")
         if rule_controller.is_rule_model(model):
             raw_output, call_metrics = _call_rule(state)
         elif _is_gemini(model):
@@ -1106,10 +1153,10 @@ def _remember_decision(state: AgentState, decision: dict) -> list:
 
 
 def write_decision(state: AgentState) -> dict:
-    decision = state["decision"]
+    decision = guard_baseline(state["decision"], state)
     atomic_write_json(DECISION_PATH, decision)
     log_turn(state, decision)
-    return {"recent_decisions": _remember_decision(state, decision)}
+    return {"decision": decision, "recent_decisions": _remember_decision(state, decision)}
 
 
 def hold(state: AgentState) -> dict:
@@ -1123,6 +1170,7 @@ def hold(state: AgentState) -> dict:
         "flags": guard.all_off_flags(),
         "reason": "",
     }
+    decision = guard_baseline(decision, state)
     atomic_write_json(DECISION_PATH, decision)
     log_turn(state, decision)
     return {
@@ -1165,7 +1213,9 @@ def build_graph():
 
 
 def _dependency_hold(turn: int, model: str, message: str) -> dict:
-    decision = guard.safe_decision(message, turn, model)
+    decision = guard_baseline(
+        guard.safe_decision(message, turn, model), {"turn": turn, "model": model}
+    )
     atomic_write_json(DECISION_PATH, decision)
     log_turn(
         {
@@ -1233,6 +1283,7 @@ def run_forever() -> None:
                         "decision_lag_sec": turn_decision_lag(
                             model, decision_lag_sec
                         ),
+                        "control_path": str(AI_CONTROL_PATH),
                     }
                 )
                 recent_decisions = result.get("recent_decisions", recent_decisions)

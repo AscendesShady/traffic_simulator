@@ -10,10 +10,13 @@ comparison of decision quality rather than of mechanism.
 
 The rule is conditional actuated priority, not naive always-grant:
 
-    TSP  an actionable approaching bus AND the conflicting cross-street's
-         queued passenger load is below RULE_CROSS_QUEUE_THRESHOLD_PAX,
-         capped at MAX_TSP_GRANTS_PER_NODE per node per decision (the
-         highest net passenger benefit wins).
+    TSP  an actionable approaching bus that WOULD STOP without help
+         (telemetry's would_have_stopped: red ahead, or its ETA is past the
+         residual green) AND the conflicting cross-street's queued passenger
+         load is below RULE_CROSS_QUEUE_THRESHOLD_PAX, capped at
+         MAX_TSP_GRANTS_PER_NODE per node per decision (the highest net
+         passenger benefit wins). A bus arriving inside the green gains
+         nothing from priority, so granting it only spends cross-street time.
     DBL  an approaching bus AND no stopped/crawling queue is ahead in its
          left-most DBL lane AND its merge corridor is not obstructed.
 
@@ -170,6 +173,9 @@ def _candidates(telemetry, decision_lag_sec):
                 "landed_eta_sec": landed_eta,
                 "actionable": bool(agent.is_actionable(landed_eta)),
                 "cross_pax": cross_street_passengers(telemetry, node_key, approach),
+                # Older telemetry without the field: assume it would stop, the
+                # pre-existing behaviour.
+                "would_stop": bool(nearest.get("would_have_stopped", True)),
             }
         )
     return records
@@ -221,6 +227,11 @@ def rule_based_decision(
     by_node = {}
     for record in records:
         if not record["actionable"]:
+            continue
+        if not record["would_stop"]:
+            withheld_notes.append(
+                f"TSP {record['route_id']}@{record['node_key']} arrives on green"
+            )
             continue
         if record["cross_pax"] >= cross_queue_threshold_pax:
             withheld_notes.append(

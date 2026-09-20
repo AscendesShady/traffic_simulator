@@ -4,6 +4,11 @@ import pygame
 
 CAR_PASSENGERS = 4
 TRUCK_PASSENGERS = 1
+# Fixed, not stochastic: a declared simplification (every bus carries exactly
+# this many passengers), not a measurement. Person-delay for buses is
+# therefore a pure multiple of bus count with no load variation -- keep this
+# in mind when reading bus_person_hours_delay across runs.
+BUS_PASSENGERS = 45
 DBL_LANE_INDEX = 2
 # How long a bus may hold for a blocked DBL merge before giving the merge up
 # for the current leg. 300 frames is about five seconds at 60 Hz.
@@ -653,7 +658,7 @@ class Bus(Vehicle):
         self.bus_id = bus_id
         self.route_info = route_info
         self.route_id = route_info.get("route_id", "")
-        self.length, self.width, self.passengers = 42, 14, 45
+        self.length, self.width, self.passengers = 42, 14, BUS_PASSENGERS
         self.route_nodes = sorted(
             route_info.get("waypoints", {}).keys(),
             reverse=(direction == "WB"),

@@ -104,6 +104,8 @@ A DBL request/grant is additionally vetoed whenever `vehicle.dbl_lane_is_obstruc
 
 Every steady-state DV in `experiment_summary.csv` (`pax_per_min_steady`, `*_delay_steady`, `converged`) discards `global_config["warmup_discard_frames"]` (default 7200 = 120 s) via the snapshot `main.snapshot_warmup_baseline` takes once per run; the cumulative columns stay as they were. Default benchmark duration is 60 min. A summary CSV whose header no longer matches is rotated, never appended to ragged.
 
+**Primary DV** is `total_person_hours_travel_delay_steady` (passenger-weighted time below each vehicle's own `max_speed`, so crawl counts, not just stops) compared as a paired per-seed difference against the baseline arm: `main.pair_against_baseline` writes `paired_dv_<campaign_id>.csv` (`net_person_hours_saved = baseline − arm`, with bus/car split and the stopped-delay variant) at batch end. No per-run column may claim "net saved" — the baseline is another run — which is why the earlier `net_person_hours_saved` column (TSP adjust seconds × 45 pax minus TSP-window cross-street delay, zero for baseline by construction) was removed; `tsp_window_cross_street_person_hours` remains as a descriptive mechanism column only.
+
 The baseline arm (`test_model == "None"`) must show zero decisions and zero TSP treatment: `agent.guard_baseline` turns any baseline or stale-arm turn into `OBSERVATION_ONLY`, `perform_full_reset` clears route flags for a baseline test, and `build_experiment_summary_row` raises `BaselineContaminationError` (the row is refused and the batch run marked `FAILED`) rather than export a contaminated reference row.
 
 ### Rule-based comparator (`rule_controller.py`)

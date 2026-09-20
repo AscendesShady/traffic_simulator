@@ -2345,16 +2345,36 @@ class TelemetryDashboard:
             return {"armed": False, "model": "None"}
 
     def safe_read_agent_turns(self, path=None):
-        """Read valid JSONL turns and skip malformed or partially-written lines."""
+        """Read valid JSONL turns and skip malformed or partially-written lines.
+
+        The live log (``path`` omitted) is read incrementally: only bytes
+        past the last consumed offset are parsed, and a trailing line without
+        its newline is left for the next poll. Every row carries a ~100 KB
+        telemetry snapshot, so re-parsing the whole file once a second on
+        the Tk thread grows linearly with run length and stalled the app
+        outright on a 1 GB log (2026-09-20 audit). A truncated/reset log
+        starts over from byte 0. An explicit ``path`` is always read whole.
+        """
         source = AGENT_TURN_LOG_FILE if path is None else Path(path)
+        incremental = path is None
         try:
             size = source.stat().st_size
+            offset = getattr(self, "_agent_log_offset", 0) if incremental else 0
+            if size < offset:
+                offset = 0
             records = []
-            with source.open("r", encoding="utf-8") as turn_log:
-                for line in turn_log:
+            with source.open("rb") as turn_log:
+                turn_log.seek(offset)
+                while True:
+                    raw = turn_log.readline()
+                    if not raw:
+                        break
+                    if not raw.endswith(b"\n"):
+                        break  # still being written; re-read next poll
+                    offset += len(raw)
                     try:
-                        record = json.loads(line)
-                    except (json.JSONDecodeError, TypeError, ValueError):
+                        record = json.loads(raw.decode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
                         continue
                     turn = record.get("turn") if isinstance(record, dict) else None
                     if (
@@ -2364,6 +2384,8 @@ class TelemetryDashboard:
                     ):
                         continue
                     records.append(record)
+            if incremental:
+                self._agent_log_offset = offset
             return records, size
         except (OSError, TypeError, ValueError):
             return [], None

@@ -86,6 +86,22 @@ def test_rule_grants_tsp_for_uncontested_bus():
     assert "TSP R1_EB_A_NB@300 45pax vs cross 12<45" in decision["reason"]
 
 
+def test_rule_withholds_tsp_for_bus_arriving_on_green():
+    """A bus that reaches the bar inside the residual green gains nothing
+    from priority; the rule spends no cross-street time on it. DBL is a
+    lane reservation, not a signal grant, so it is unaffected."""
+    snapshot = telemetry(
+        [bus("R1_EB_A_NB", 300, "EB", 20)],
+        node_queues={"300": {"NB": 8, "SB": 4}},
+    )
+    snapshot["active_buses"][0]["would_have_stopped"] = False
+    flags = flags_by_route(rc.rule_based_decision(snapshot, decision_lag_sec=0.0))
+
+    assert flags["R1_EB_A_NB"] == {"tsp": False, "dbl": True}
+    reason = rc.rule_based_decision(snapshot, decision_lag_sec=0.0)["reason"]
+    assert "TSP R1_EB_A_NB@300 arrives on green" in reason
+
+
 def test_rule_withholds_tsp_for_contested_bus():
     """The conditional part: cross-street load at/above the threshold blocks
     TSP even for an otherwise actionable bus. DBL is unaffected."""
@@ -429,6 +445,7 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
             "Decisions", "Telemetry", "AI Decision Audit",
             "LLM Performance", "LLM Summary",
             "Control Panel Inputs", "Bus Events", "Unit Conversions",
+            "Experiment Summary",
         ]
         decisions = workbook["Decisions"]
         header = [c.value for c in decisions[1]]

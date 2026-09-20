@@ -930,24 +930,19 @@ def test_minimap_node_summary_shows_queue_length_and_downstream_space():
 def test_prompt_teaches_queue_length_and_downstream_space_rules():
     prompt = " ".join(agent.SYSTEM_PROMPT.split())
 
-    assert "QUEUE LENGTH tells you how far back traffic is backed up" in prompt
-    assert "DOWNSTREAM FREE SPACE tells you whether there is room" in prompt
-    assert "giving it green will NOT help" in prompt
-    assert (
-        "Never grant priority to a bus whose downstream space is blocked"
-        in prompt
-    )
-    assert "If both sides are congested, grant nothing" in prompt
+    assert "queue_len_m is how far back each approach is backed up" in prompt
+    assert "downstream_free_m is the room beyond the node" in prompt
+    assert "giving that approach green will NOT help" in prompt
+    assert "never grant priority into it" in prompt
+    assert "grant nothing there and let the Webster timing work" in prompt
     # The rules name the minimap fields the model will actually see.
     assert "queue_len_m" in prompt
     assert "downstream_free_m" in prompt
     assert "BLOCKED" in prompt
-    # They sit after the congestion rules and before the output schema, so
-    # the model reads what to weigh before it reads how to answer.
-    assert prompt.index("CONGESTION IS FAILURE") < prompt.index("QUEUE LENGTH")
-    assert prompt.index("DOWNSTREAM FREE SPACE") < prompt.index(
-        agent.OUTPUT_SCHEMA.split()[0]
-    )
+    # The decision tests come before the output schema, so the model reads
+    # what to weigh before it reads how to answer.
+    assert prompt.index("THE TSP TEST") < prompt.index("NETWORK:")
+    assert prompt.index("NETWORK:") < prompt.index(agent.OUTPUT_SCHEMA.split()[0])
 
 
 def test_output_contract_unchanged_by_spatial_fields():
@@ -976,20 +971,25 @@ def test_output_contract_unchanged_by_spatial_fields():
     assert guard.validate_flags_positional(with_extras) == mapped
 
 
-def test_prompt_frames_congestion_as_failure_and_restraint_as_default():
+def test_prompt_frames_objective_and_arrival_test():
+    """The prompt states the DV (person-hours of delay for everyone) and a
+    computable grant test on fields the ROUTES line carries, instead of a
+    restraint slogan the model cannot check against anything."""
     prompt = " ".join(agent.SYSTEM_PROMPT.split())
 
     assert "already running Webster-optimal timing" in prompt
-    assert "CONGESTION IS FAILURE" in prompt
-    assert "DEFAULT TO RESTRAINT" in prompt
-    assert "all flags false is a good, safe decision" in prompt
-    assert "Granting priority to every approaching bus is WRONG" in (
-        prompt
-    )
-    assert "clearly exceed the cross-traffic passengers" in prompt
-    assert "AT MOST one or two approaches per node per turn" in (
-        prompt
-    )
+    assert "fewest person-hours of delay" in prompt
+    assert "bus riders and cross-street drivers alike" in prompt
+    # The TSP test names its three inputs and the arrival fact that decides
+    # whether priority can help at all.
+    assert "would_stop=true AND passengers > cross_pax AND actionable=true" in prompt
+    assert "would_stop=false: the bus reaches the stop bar inside the residual green" in prompt
+    assert "residual_green_s" in prompt
+    assert "If cross_pax >= passengers, set tsp=false" in prompt
+    assert "Grant at most ONE route per node per turn" in prompt
+    assert "approaching_buses=0 must have tsp=false and dbl=false" in prompt
+    # DBL has a positive trigger, not only vetoes.
+    assert "grant dbl when dbl_lane_queue_ahead=0 AND dbl_lane_obstructed=false" in prompt
     # The positional schema is untouched by the reframing: same keys, same
     # array lengths, same types.
     schema = json.loads(agent.OUTPUT_SCHEMA)
@@ -998,9 +998,8 @@ def test_prompt_frames_congestion_as_failure_and_restraint_as_default():
     assert schema["dbl"] == [False] * len(guard.ROUTE_ORDER)
     assert isinstance(schema["reason"], str)
 
-    # Throughput-maximising language licenses the over-granting this prompt
-    # exists to stop, so it must not survive anywhere the model reads --
-    # including the schema placeholder, which is interpolated into the prompt.
+    # Throughput-maximising language licenses over-granting, so it must not
+    # survive anywhere the model reads -- including the interpolated schema.
     assert "maximize" not in agent.SYSTEM_PROMPT
     assert "maximize" not in agent.OUTPUT_SCHEMA
     assert agent.OUTPUT_SCHEMA in agent.SYSTEM_PROMPT
@@ -1009,6 +1008,27 @@ def test_prompt_frames_congestion_as_failure_and_restraint_as_default():
     assert "eta_at_decision_land_sec" in prompt
     assert "dbl_lane_obstructed=true" in prompt
     assert "DECISION_LAG_SEC" in prompt
+
+
+def test_minimap_route_line_carries_arrival_test_fields():
+    telemetry = {
+        "simulation_time_seconds": 10.0,
+        "routes": {"R1_EB_A_NB": {"active": True, "tsp_enabled": True}},
+        "signal_state": {"nodes": {"300": {"phase": "EW_GREEN", "signals": {}}}},
+        "active_buses": [{
+            "bus_id": "B1", "route_id": "R1_EB_A_NB", "leg_state": "APPROACHING",
+            "route_leg": {"node_x": 300, "approach": "EB"},
+            "distance_to_stop_bar_px": 120.0, "eta_to_stop_bar_sec_freeflow": 12.0,
+            "passengers": 45, "signal_colour_ahead": "GREEN", "residual_green_sec": 4.5,
+            "would_have_stopped": True, "cross_traffic_pax": 17,
+        }],
+    }
+    minimap = agent.read_minimap(agent_state(telemetry=telemetry, decision_lag_sec=1.0))["minimap"]
+    line = next(l for l in minimap.splitlines() if l.startswith("1) R1_EB_A_NB"))
+    assert "signal_ahead=GREEN" in line
+    assert "residual_green_s=4.5" in line
+    assert "would_stop=True" in line
+    assert "cross_pax=17" in line
 
 
 def test_granted_route_stays_locked_through_clearing():
@@ -1485,6 +1505,7 @@ def test_openai_call_uses_key_prompt_and_low_temperature(monkeypatch):
     assert metrics == {
         "input_tokens": 42,
         "output_tokens": 12,
+        "cost_usd": None,
         "eval_duration_ns": None,
         "total_duration_ns": None,
     }

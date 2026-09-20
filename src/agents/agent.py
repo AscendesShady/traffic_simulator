@@ -122,57 +122,56 @@ ROUTE_ORDER_TEXT = "\n".join(
     f"{position}) {route_id}"
     for position, route_id in enumerate(guard.ROUTE_ORDER, start=1)
 )
-SYSTEM_PROMPT = f"""The signals are already running Webster-optimal timing,
-which handles normal traffic well. Your job is NOT to take over. Make
-occasional, surgical priority grants ONLY when a bus clearly carries enough
-passengers to justify the delay it imposes on cross-traffic. Most turns, the
-right answer is little or no priority. You are a light touch on top of a
-competent baseline, not the primary controller.
+SYSTEM_PROMPT = f"""You add transit signal priority on top of two signalized
+nodes that are already running Webster-optimal timing. Each turn you decide
+only which bus routes get TSP (an early or extended green at the bus's target
+node) and DBL (the left-most approach lane reserved for that bus).
 
-CONGESTION IS FAILURE. The worst outcome is a network filling with stopped
-vehicles. Watch total waiting passengers and vehicles across the network. If
-you grant priority and the network gets MORE congested, you made it worse.
-Every priority grant to a bus takes green from cross-traffic and risks backing
-it up. A grant is only correct if the passengers it serves clearly outweigh
-the cross-traffic passengers it delays.
+OBJECTIVE: the fewest person-hours of delay across everyone in the network,
+bus riders and cross-street drivers alike, at the same passenger throughput.
+A grant helps only when the bus riders it saves outnumber the cross-street
+passengers it holds.
 
-DEFAULT TO RESTRAINT. When you are not confident a grant clearly improves
-passenger flow, grant nothing. A turn with all flags false is a good, safe
-decision whenever no bus decisively outweighs its cross-traffic cost. Granting
-priority to every approaching bus is WRONG: it starves cross-traffic and
-congests the network. Grant priority only to the single most valuable
-bus-approach when its benefit is clear, and often to none.
+THE TSP TEST, for each route with an approaching bus (every number is on that
+route's ROUTES line):
+  grant tsp when would_stop=true AND passengers > cross_pax AND
+  actionable=true AND the bus's downstream is not BLOCKED.
+- would_stop=false: the bus reaches the stop bar inside the residual green
+  (residual_green_s). Priority gains it nothing and only holds cross traffic.
+  Set tsp=false.
+- cross_pax is the passengers queued on the approaches a grant would hold at
+  red. If cross_pax >= passengers, set tsp=false: you would delay more people
+  than you help.
+- actionable=false: the bus arrives before your decision lands
+  (eta_at_decision_land_sec <= 0) or is too far out to plan for. Set tsp=false.
+- Grant at most ONE route per node per turn. If two qualify at one node, take
+  the larger passengers - cross_pax.
+- A route with approaching_buses=0 must have tsp=false and dbl=false.
 
-Do not treat routes independently. Each node is a shared resource, and giving
-one route priority takes green from its cross-traffic. Compare directly: a bus
-carries about 45 passengers. Cross-traffic on the approach you would red
-carries queues_passengers_est passengers. Only grant priority if the bus's 45
-passengers clearly exceed the cross-traffic passengers you would delay. If the
-cross-traffic queue is already large, do NOT add priority: you would deepen a
-queue already costing more passenger-time than the bus saves.
+THE DBL TEST, for each route with an approaching bus:
+  grant dbl when dbl_lane_queue_ahead=0 AND dbl_lane_obstructed=false.
+DBL reserves the left-most approach lane exclusively for its target bus. Once
+DBL is activated, ALL other vehicles in that lane must clear it immediately;
+this clearance rule is unconditional. Therefore you MUST NOT enable DBL when
+the lane cannot already be cleared. If dbl_lane_queue_ahead is greater than 0,
+or dbl_lane_obstructed=true, set dbl=false: a stopped/crawling vehicle is in
+front of the bus or its merge is blocked, so the bus would only sit in the
+queue. This remains true when nearest_bus_in_dbl_lane=true. A route showing
+dbl=true with nearest_bus_in_dbl_lane=false is evidence the DBL you enabled is
+not working.
 
-Prefer granting priority to AT MOST one or two approaches per node per turn.
-Blanket priority across many routes at once congests the whole network. This is
-the most common mistake. Fewer, well-justified grants beat many eager ones.
+TIMING: DECISION_LAG_SEC is how long your decision takes to apply;
+eta_at_decision_land_sec is where each bus will be when it does. Decide for
+where traffic will BE, not where it is. Decide each turn from the current
+state only; never carry flags forward from a previous turn.
 
-QUEUE LENGTH tells you how far back traffic is backed up on each approach, in
-metres (queue_len_m in the minimap). A long queue means that approach is
-struggling and needs green time.
-
-DOWNSTREAM FREE SPACE tells you whether there is room on the far side of the
-intersection for vehicles to move into (downstream_free_m in the minimap). If
-an approach shows BLOCKED or very low free space, giving it green will NOT
-help: the vehicles have nowhere to go, and they will stall inside the
-intersection and block everyone. Never grant priority to a bus whose
-downstream space is blocked; it will make the whole network worse.
-
-Use these together: grant priority when the bus's route has room downstream
-AND the cross traffic it would delay is not already backed up with a long
-queue. If both sides are congested, grant nothing and let the normal signal
+NETWORK: queue_len_m is how far back each approach is backed up;
+downstream_free_m is the room beyond the node for vehicles to move into.
+BLOCKED means none: giving that approach green will NOT help, the vehicles
+would stall inside the intersection, so never grant priority into it.
+LOCKED_ROUTES are grants already in progress; leave them as shown. If both
+sides of a node are long-queued, grant nothing there and let the Webster
 timing work.
-
-TSP gives an approaching bus an early or extended green at its target node.
-DBL enables the dynamic bus lane for that route.
 
 The route positions are fixed in this exact order:
 {ROUTE_ORDER_TEXT}
@@ -183,49 +182,14 @@ on. Never write route IDs as JSON keys. Use strict JSON booleans and do not add
 markdown, analysis, or extra keys:
 {OUTPUT_SCHEMA}
 
-"reason" must be one sentence under about 40 words weighing the passengers
-served against the cross-traffic delayed by this turn's flag choices. Keep it on one line, with no line
-breaks and no quotation marks inside it if avoidable. The "tsp" and "dbl"
-arrays matter most: each must contain exactly {len(guard.ROUTE_ORDER)} booleans.
+"reason" must be one sentence under about 40 words naming the passengers vs
+cross_pax comparison behind this turn's grants, or why none qualified. Keep it
+on one line, with no line breaks and no quotation marks. Each array must
+contain exactly {len(guard.ROUTE_ORDER)} booleans.
 
-DECIDE EACH TURN FROM THE CURRENT STATE ONLY. Do not carry flags forward from
-previous turns. For every route, look at its approaching_buses count in the
-minimap THIS turn:
-
-- If a route shows "approaching_buses=0" or "none approaching", you MUST set
-  BOTH its tsp and dbl to false, even if it had priority before. A route with no
-  approaching bus gains nothing from priority and only delays cross traffic.
-- Only set tsp or dbl true for a route that has an approaching bus this turn
-  AND where priority improves passenger throughput.
-
-Your decision does not take effect instantly. DECISION_LAG_SEC tells you how
-many seconds pass between this snapshot and when your flags apply. During that
-time buses keep moving. For each route, eta_at_decision_land_sec is where the
-bus will be when your decision actually takes effect:
-
-- If eta_at_decision_land_sec <= 0 the bus will already be at or past the node
-  before your flag applies, so enabling priority for it is WASTED: the green
-  fires for empty space. Set it false.
-- Prefer routes showing actionable=true: that bus arrives AFTER your decision
-  lands and soon enough to benefit from it.
-- You are aiming your decision at the near future, not the present. Think about
-  where traffic will BE, not where it IS.
-
-DBL reserves the left-most approach lane exclusively for its target bus. Once
-DBL is activated, ALL other vehicles in that lane must clear it immediately;
-this clearance rule is unconditional. Therefore you MUST NOT enable DBL when
-the lane cannot already be cleared. If dbl_lane_queue_ahead is greater than 0,
-or dbl_lane_obstructed=true, set dbl=false for that route: a stopped/crawling
-vehicle is in front of the bus or its merge is blocked, so the bus would only
-sit in the queue. This remains true when nearest_bus_in_dbl_lane=true; being in
-the lane does not make a queue ahead disappear. Prefer tsp, which needs no
-lane change, for that bus. A route showing dbl=true with
-nearest_bus_in_dbl_lane=false is evidence the DBL you enabled is not working.
-
-Example: if only route 1 has an approaching bus, the correct output is
+Example: only route 1 has a qualifying bus, so the correct output is
 tsp=[true,false,false,false,false,false] and
-dbl=[false,false,false,false,false,false]. Every other position is false
-because those routes have no bus.
+dbl=[false,false,false,false,false,false].
 """
 
 
@@ -243,6 +207,13 @@ class AgentState(TypedDict):
     model: str
     decision_lag_sec: float
     control_path: str
+    # Fixed decision-schedule bookkeeping (every arm decides on the same
+    # sim-time grid; see run_forever): which grid point this turn answers,
+    # in sim-seconds, and the nominal spacing of that grid.
+    tick_index: int
+    scheduled_sim_time: float
+    decision_interval_sec: float
+    requested_flags: dict
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -306,6 +277,14 @@ def log_turn(state: AgentState, decision: dict) -> None:
             "timestamp": decision.get("timestamp"),
             "model": decision.get("model"),
             "status": decision.get("status"),
+            # Fixed decision-schedule provenance (section 0): which sim-time
+            # grid point this was and how wide the grid is, so a summary
+            # export can tell offered opportunities from issued decisions
+            # without recomputing the schedule from timestamps.
+            "tick_index": state.get("tick_index"),
+            "scheduled_sim_time": state.get("scheduled_sim_time"),
+            "decision_interval_sec": state.get("decision_interval_sec"),
+            "sim_time_s": telemetry.get("simulation_time_seconds"),
             "minimap": state.get("minimap", ""),
             # Exact telemetry snapshot used to derive this turn's minimap.
             # This is an audit record only; the concise minimap remains the
@@ -313,6 +292,7 @@ def log_turn(state: AgentState, decision: dict) -> None:
             "telemetry_snapshot": telemetry,
             "raw_output": state.get("raw_output", ""),
             "flags": decision.get("flags", {}),
+            "requested_flags": state.get("requested_flags", {}),
             "reason": decision.get("reason", ""),
             "pax_per_min_recent": throughput.get(
                 "passengers_per_minute_recent"
@@ -321,8 +301,38 @@ def log_turn(state: AgentState, decision: dict) -> None:
             "input_tokens": call_metrics.get("input_tokens"),
             "output_tokens": output_tokens,
             "tokens_per_sec": tokens_per_sec,
+            "cost_usd": call_metrics.get("cost_usd"),
             "locked_routes": sorted(locked_routes),
             "stale": state.get("status") in ("STALE", "HELD"),
+        }
+        with TURN_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(record) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def log_skipped_tick(
+    tick_index: int, scheduled_sim_time: float, model: str, decision_interval_sec: float
+) -> None:
+    """Record a fixed-schedule grid point that came due while the previous
+    turn's model call was still running (section 0's "skipped and counted",
+    not deferred): decision.json is left exactly as it was, only the missed
+    opportunity is logged, so a slow model's real utilisation is visible
+    instead of silently stretching its effective decision interval."""
+    if not VERBOSE_LOG:
+        return
+    try:
+        record = {
+            "turn": None,
+            "timestamp": round(time.time(), 3),
+            "model": str(model or "None"),
+            "status": "SKIPPED_SLOW",
+            "tick_index": tick_index,
+            "scheduled_sim_time": scheduled_sim_time,
+            "sim_time_s": scheduled_sim_time,
+            "decision_interval_sec": decision_interval_sec,
+            "flags": {},
+            "reason": "previous turn's model call was still running at this tick",
         }
         with TURN_LOG_PATH.open("a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(record) + "\n")
@@ -651,6 +661,10 @@ def read_minimap(state: AgentState) -> dict:
                 f"actionable={is_actionable(landed_eta)} "
                 f"target_node={route_leg.get('node_x')} "
                 f"passengers={int(nearest.get('passengers', 0))} "
+                f"signal_ahead={nearest.get('signal_colour_ahead', '?')} "
+                f"residual_green_s={nearest.get('residual_green_sec', '?')} "
+                f"would_stop={bool(nearest.get('would_have_stopped', True))} "
+                f"cross_pax={int(_finite_nonnegative(nearest.get('cross_traffic_pax'), 0) or 0)} "
                 f"priority={'GRANTED - do not change' if granted else 'not granted'}"
             )
         else:
@@ -883,6 +897,11 @@ def _call_openai_compatible(
     metrics = {
         "input_tokens": getattr(usage, "prompt_tokens", None),
         "output_tokens": getattr(usage, "completion_tokens", None),
+        "cost_usd": (
+            getattr(usage, "cost_in_usd_ticks", None) / 10_000_000_000.0
+            if isinstance(getattr(usage, "cost_in_usd_ticks", None), (int, float))
+            else None
+        ),
         "eval_duration_ns": None,
         "total_duration_ns": None,
     }
@@ -1115,6 +1134,11 @@ def anti_cheat(state: AgentState) -> dict:
         state.get("turn", 0),
         state.get("model", "None"),
     )
+    requested_flags = {
+        route_id: dict(route_flags)
+        for route_id, route_flags in (decision.get("flags") or {}).items()
+        if isinstance(route_flags, dict)
+    }
     routes = state.get("telemetry", {}).get("routes", {})
     if decision["status"] == "OK":
         raw_locked_routes = state.get("locked_routes", set())
@@ -1143,7 +1167,11 @@ def anti_cheat(state: AgentState) -> dict:
                 "tsp": bool(current.get("tsp_enabled", False)),
                 "dbl": bool(current.get("dbl_enabled", False)),
             }
-    return {"decision": decision, "status": decision["status"]}
+    return {
+        "decision": decision,
+        "requested_flags": requested_flags,
+        "status": decision["status"],
+    }
 
 
 def _remember_decision(state: AgentState, decision: dict) -> list:
@@ -1229,6 +1257,13 @@ def _dependency_hold(turn: int, model: str, message: str) -> dict:
     return decision
 
 
+# Wall-clock poll while waiting for the next sim-time grid point. Independent
+# of decision_interval_sec (typically 2-15s): fine-grained enough that a
+# fixed-schedule tick is noticed promptly at any sim_speed, cheap enough that
+# polling two small JSON files this often is a non-issue.
+TICK_POLL_SEC = 0.2
+
+
 def run_forever() -> None:
     try:
         graph = build_graph()
@@ -1242,12 +1277,23 @@ def run_forever() -> None:
     last_frame = None
     # First turn has no measurement yet, so start from the conservative default.
     decision_lag_sec = DEFAULT_DECISION_LAG_SEC
+    # Fixed decision schedule (section 0): every arm decides on the same
+    # sim-time grid instead of "sleep tick_seconds after the previous turn
+    # finishes", which let decision frequency drift with model latency and
+    # confounded model comparisons with decision-opportunity counts. A grid
+    # point due while the previous turn is still running is skipped and
+    # counted (log_skipped_tick), never deferred/caught-up.
+    next_scheduled_sim_time = None
+    tick_index = 0
     while True:
         control = read_ai_control()
         telemetry = _read_telemetry()
-        turn, recent_decisions, last_frame, _reset_detected = _track_run_boundary(
+        turn, recent_decisions, last_frame, reset_detected = _track_run_boundary(
             turn, recent_decisions, last_frame, telemetry
         )
+        if reset_detected:
+            next_scheduled_sim_time = None
+            tick_index = 0
         telemetry_says_stopped = bool(
             isinstance(telemetry, dict)
             and telemetry.get("simulation_running") is False
@@ -1257,9 +1303,25 @@ def run_forever() -> None:
             or not control["simulation_running"]
             or telemetry_says_stopped
         ):
+            next_scheduled_sim_time = None
+            tick_index = 0
             time.sleep(1.0)
             continue
 
+        interval = float(control["tick_seconds"])
+        if next_scheduled_sim_time is None:
+            next_scheduled_sim_time = interval
+
+        sim_time = (
+            telemetry.get("simulation_time_seconds")
+            if isinstance(telemetry, dict) else None
+        )
+        if not isinstance(sim_time, (int, float)) or sim_time < next_scheduled_sim_time:
+            time.sleep(TICK_POLL_SEC)
+            continue
+
+        scheduled_time = next_scheduled_sim_time
+        tick_index += 1
         turn += 1
         model = control["model"]
         try:
@@ -1284,6 +1346,9 @@ def run_forever() -> None:
                             model, decision_lag_sec
                         ),
                         "control_path": str(AI_CONTROL_PATH),
+                        "tick_index": tick_index,
+                        "scheduled_sim_time": scheduled_time,
+                        "decision_interval_sec": interval,
                     }
                 )
                 recent_decisions = result.get("recent_decisions", recent_decisions)
@@ -1304,10 +1369,43 @@ def run_forever() -> None:
                 f"Agent turn error: {type(exc).__name__}: {str(exc)[:500]}",
             )
             recent_decisions = (recent_decisions + [decision])[-RECENT_DECISION_LIMIT:]
-        time.sleep(control["tick_seconds"])
+
+        # The call above blocked in sim-time too: any further grid point that
+        # came due while it ran is a skipped-and-counted opportunity, not a
+        # backlog to catch up on.
+        telemetry_after = _read_telemetry()
+        sim_time_after = (
+            telemetry_after.get("simulation_time_seconds")
+            if isinstance(telemetry_after, dict) else None
+        )
+        probe = scheduled_time + interval
+        while isinstance(sim_time_after, (int, float)) and probe <= sim_time_after:
+            tick_index += 1
+            log_skipped_tick(tick_index, probe, model, interval)
+            probe += interval
+        next_scheduled_sim_time = probe
+
+
+def exit_when_parent_dies() -> None:
+    """Die with the simulator. main.py hands this process a stdin pipe it
+    never writes to; the read returns EOF the instant the parent process is
+    gone (however it went), and this process exits before it can re-arm off
+    the next session's ai_control.json and double-drive that sim. Started
+    only from __main__ so importing the module (tests) starts no thread.
+    """
+    def watch():
+        try:
+            sys.stdin.buffer.read()
+        except Exception:
+            pass
+        os._exit(0)
+
+    if sys.stdin is not None and not sys.stdin.isatty():
+        threading.Thread(target=watch, name="parent-watchdog", daemon=True).start()
 
 
 if __name__ == "__main__":
+    exit_when_parent_dies()
     try:
         run_forever()
     except KeyboardInterrupt:

@@ -127,6 +127,10 @@ class PriorityRequest:
     tsp_action: str = TSP_ACTION_NONE
     tsp_adjust_frames: int = 0
     tsp_gate_reason: str = ""
+    # Instrumentation only: DBL becomes an actual grant when this request is
+    # promoted to the node's active request and owns the reserved lane.
+    dbl_granted: bool = False
+    metrics_finalized: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +176,20 @@ class NodeState:
     # telemetry sample cannot miss a short truncation.
     last_tsp_action: str = TSP_ACTION_NONE
     last_tsp_adjust_frames: int = 0
+    # approach -> (vehicle, first denied frame) for a left-turner held at the
+    # bar by same-approach through traffic in the corner sweep. See
+    # LEFT_TURN_STARVATION_FRAMES.
+    left_turn_waiting: dict[str, tuple[Any, int]] = field(default_factory=dict)
+
+
+# A same-approach left turn yields to through traffic in the corner sweep
+# (movements_conflict). Under a crawling box that stream never leaves a gap
+# and the left-turner -- every R1/R2/R4/R5 bus at its first node -- sat at
+# green for up to 40 s while TSP held cross traffic for nothing. After this
+# many frames of denial, NEW through entries from that approach are held at
+# the bar so the corner drains and the left turn goes; vehicles already in
+# the box are untouched.
+LEFT_TURN_STARVATION_FRAMES = 60
 
 
 class SignalController:
@@ -228,6 +246,25 @@ class SignalController:
         self.nodes = {node_x: NodeState() for node_x in INT_X}
         self._request_sequence = 0
         self._attempt_counts: dict[tuple[str, int, int], int] = {}
+        self.experiment_metrics = {
+            "tsp_requests_raised": 0,
+            "tsp_requests_granted": 0,
+            "tsp_requests_denied": 0,
+            "tsp_denial_reasons": {},
+            "tsp_actions_early_green": 0,
+            "tsp_actions_extending": 0,
+            "tsp_total_adjust_frames": 0,
+            "dbl_requests_raised": 0,
+            "dbl_requests_granted": 0,
+            "dbl_requests_denied": 0,
+            "dbl_denial_reasons": {},
+            "dbl_actions_activated": 0,
+            "dbl_total_active_frames": 0,
+            "discharge_activations": 0,
+            "discharge_total_frames": 0,
+            "discharge_recovery_failed": False,
+            "node_tsp_grants": {str(node_x): 0 for node_x in INT_X},
+        }
         self.discharge_active = False
         self.discharge_mode = control_panel.DISCHARGE_AUTO
         self.discharge_state = DISCHARGE_INACTIVE
@@ -653,6 +690,7 @@ class SignalController:
         self._capture_discharge_transition()
         self._cancel_priority_for_discharge()
         self.discharge_active = True
+        self.experiment_metrics["discharge_activations"] += 1
         self.discharge_mode = mode
         self.discharge_state = DISCHARGE_TRANSITION_YELLOW
         self.discharge_timer = 0
@@ -733,6 +771,7 @@ class SignalController:
         )
 
     def _enter_recovery_failed(self, vehicles):
+        self.experiment_metrics["discharge_recovery_failed"] = True
         self.discharge_state = DISCHARGE_RECOVERY_FAILED
         self.discharge_reason = self._recovery_failure_reason(vehicles)
         self.discharge_recommendation = (
@@ -1322,6 +1361,8 @@ class SignalController:
                 or self._discharge_green_map.get(node_x) != approach
             ):
                 return False
+        if movement == "STRAIGHT" and self._left_turn_starved(node, approach, node_x, vehicles):
+            return False
         for reservation in node.reservations.values():
             if self._vehicle_blocks_entry(
                 approach,
@@ -1331,6 +1372,8 @@ class SignalController:
                 reservation["movement"],
                 node_x,
             ):
+                if movement == "LEFT" and reservation["approach"] == approach:
+                    node.left_turn_waiting.setdefault(approach, (vehicle, self.frame_number))
                 return False
 
         # Protect against an unregistered vehicle placed inside the box by a
@@ -1348,8 +1391,12 @@ class SignalController:
                 other_movement,
                 node_x,
             ):
+                if movement == "LEFT" and other_approach == approach:
+                    node.left_turn_waiting.setdefault(approach, (vehicle, self.frame_number))
                 return False
 
+        if movement == "LEFT":
+            node.left_turn_waiting.pop(approach, None)
         node.reservations[vehicle_key] = {
             "vehicle": vehicle,
             "approach": approach,
@@ -1360,9 +1407,27 @@ class SignalController:
         vehicle.intersection_entry_movements[node_x] = movement
         return True
 
+    def _left_turn_starved(self, node, approach, node_x, vehicles):
+        """True while a left-turner from ``approach`` has been denied the
+        corner for LEFT_TURN_STARVATION_FRAMES and is still waiting at the
+        bar; a stale entry (vehicle gone, or through the node) is dropped."""
+        waiting = node.left_turn_waiting.get(approach)
+        if waiting is None:
+            return False
+        left_vehicle, since = waiting
+        alive = any(other is left_vehicle for other in vehicles or [])
+        if not alive or node_x in getattr(left_vehicle, "passed_nodes", set()):
+            node.left_turn_waiting.pop(approach, None)
+            return False
+        return self.frame_number - since >= LEFT_TURN_STARVATION_FRAMES
+
     def cancel_intersection_entry(self, vehicle, node_x):
         """Release a reservation while the vehicle is still upstream."""
         node = self.nodes.get(node_x)
+        # Deliberately leaves left_turn_waiting alone: a denied vehicle
+        # cancels every frame it sits stopped, which would erase the wait it
+        # just registered. The entry clears itself when the turn is granted,
+        # or in _left_turn_starved once the vehicle is gone or through.
         if node is not None:
             node.reservations.pop(id(vehicle), None)
 
@@ -1445,6 +1510,10 @@ class SignalController:
         conflicts = tuple(
             item for item in ("EB", "WB", "NB", "SB") if item != approach
         )
+        if tsp_requested:
+            self.experiment_metrics["tsp_requests_raised"] += 1
+        if dbl_requested:
+            self.experiment_metrics["dbl_requests_raised"] += 1
         return PriorityRequest(
             request_id=f"PRIORITY_{self._request_sequence:06d}",
             bus=bus,
@@ -1505,6 +1574,43 @@ class SignalController:
         return snapshot
 
     def _finalize_request(self, node, request, terminal_state):
+        if not request.metrics_finalized:
+            reason = (
+                request.denial_or_cancel_reason
+                or request.tsp_gate_reason
+                or terminal_state
+            )
+            if request.tsp_requested:
+                if request.tsp_action != TSP_ACTION_NONE:
+                    self.experiment_metrics["tsp_requests_granted"] += 1
+                    self.experiment_metrics["tsp_total_adjust_frames"] += max(
+                        0, int(request.tsp_adjust_frames or 0)
+                    )
+                    action_key = (
+                        "tsp_actions_early_green"
+                        if request.tsp_action == TSP_ACTION_EARLY_GREEN
+                        else "tsp_actions_extending"
+                    )
+                    self.experiment_metrics[action_key] += 1
+                    node_key = str(request.node_x)
+                    grants = self.experiment_metrics["node_tsp_grants"]
+                    grants[node_key] = grants.get(node_key, 0) + 1
+                else:
+                    self.experiment_metrics["tsp_requests_denied"] += 1
+                    reasons = self.experiment_metrics["tsp_denial_reasons"]
+                    reasons[reason] = reasons.get(reason, 0) + 1
+            if request.dbl_requested:
+                if request.dbl_granted:
+                    self.experiment_metrics["dbl_requests_granted"] += 1
+                    self.experiment_metrics["dbl_actions_activated"] += 1
+                    self.experiment_metrics["dbl_total_active_frames"] += max(
+                        0, self.frame_number - request.requested_at_frame
+                    )
+                else:
+                    self.experiment_metrics["dbl_requests_denied"] += 1
+                    reasons = self.experiment_metrics["dbl_denial_reasons"]
+                    reasons[reason] = reasons.get(reason, 0) + 1
+            request.metrics_finalized = True
         request.state = terminal_state
         snapshot = self._request_snapshot(request)
         snapshot["terminal_frame"] = self.frame_number
@@ -1656,6 +1762,8 @@ class SignalController:
         if node.active_request is None and node.request_queue:
             request = node.request_queue.pop(0)
             request.state = ARMED
+            if request.dbl_requested:
+                request.dbl_granted = True
             node.active_request = request
 
     def _begin_extension(self, node, request, cap):
@@ -1801,6 +1909,8 @@ class SignalController:
     def update(self, vehicles=None):
         vehicles = vehicles or []
         self.frame_number += 1
+        if self.discharge_active:
+            self.experiment_metrics["discharge_total_frames"] += 1
         self._cleanup_reservations(vehicles)
         self._consume_discharge_commands(vehicles)
         if self.discharge_active:
@@ -1811,6 +1921,67 @@ class SignalController:
         for node_x, node in self.nodes.items():
             self._priority_update(node_x, node, vehicles)
         self._publish_discharge_status()
+
+    def get_experiment_metrics(self):
+        """Detached JSON-safe counters for the current benchmark run.
+
+        Requests still live at the final frame are classified as granted when
+        the mechanism actually activated, otherwise denied with RUN_ENDED.
+        The controller itself is not mutated, so checkpoint exports remain
+        observational and cannot change simulation behavior.
+        """
+        result = {
+            **self.experiment_metrics,
+            "tsp_denial_reasons": dict(
+                self.experiment_metrics["tsp_denial_reasons"]
+            ),
+            "dbl_denial_reasons": dict(
+                self.experiment_metrics["dbl_denial_reasons"]
+            ),
+            "node_tsp_grants": dict(
+                self.experiment_metrics["node_tsp_grants"]
+            ),
+        }
+        pending = []
+        for node in self.nodes.values():
+            if node.active_request is not None:
+                pending.append(node.active_request)
+            pending.extend(node.request_queue)
+        for request in pending:
+            if request.metrics_finalized:
+                continue
+            if request.tsp_requested:
+                if request.tsp_action != TSP_ACTION_NONE:
+                    result["tsp_requests_granted"] += 1
+                    result["tsp_total_adjust_frames"] += max(
+                        0, int(request.tsp_adjust_frames or 0)
+                    )
+                    action_key = (
+                        "tsp_actions_early_green"
+                        if request.tsp_action == TSP_ACTION_EARLY_GREEN
+                        else "tsp_actions_extending"
+                    )
+                    result[action_key] += 1
+                    node_key = str(request.node_x)
+                    result["node_tsp_grants"][node_key] = (
+                        result["node_tsp_grants"].get(node_key, 0) + 1
+                    )
+                else:
+                    result["tsp_requests_denied"] += 1
+                    reasons = result["tsp_denial_reasons"]
+                    reasons["RUN_ENDED"] = reasons.get("RUN_ENDED", 0) + 1
+            if request.dbl_requested:
+                if request.dbl_granted:
+                    result["dbl_requests_granted"] += 1
+                    result["dbl_actions_activated"] += 1
+                    result["dbl_total_active_frames"] += max(
+                        0, self.frame_number - request.requested_at_frame
+                    )
+                else:
+                    result["dbl_requests_denied"] += 1
+                    reasons = result["dbl_denial_reasons"]
+                    reasons["RUN_ENDED"] = reasons.get("RUN_ENDED", 0) + 1
+        return result
 
     def _base_signals_for_node(self, node):
         # TSP never isolates one approach: an extension is simply the running

@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 from src.ui import canvas_gemini as canvas
-from src.core.vehicle import Bus
+from src.core.vehicle import Bus, eta_frames_to_stop_bar
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -28,12 +28,31 @@ TSP_ACTION_NONE = "none"
 NODE_EVENT_FIELDS = (
     "node_x",
     "arrival_frame",
+    "signal_phase_at_arrival",
+    "signal_colour_at_arrival",
+    "residual_green_frames",
+    "eta_frames_at_decision",
+    "would_have_stopped",
+    "tsp_requested",
+    "tsp_granted",
     "tsp_treated",
     "tsp_action",
     "tsp_adjust_frames",
+    "denial_reason",
     "stop_bar_cross_frame",
     "node_wait_frames",
     "node_clear_frame",
+    "queue_ahead_veh",
+)
+
+BUS_NODE_EVENT_HEADERS = (
+    "run_uuid", "campaign_id", "model", "seed", "bus_id", "route_id",
+    "node_x", "node_seq", "arrival_frame", "signal_phase_at_arrival",
+    "signal_colour_at_arrival", "residual_green_frames",
+    "eta_frames_at_decision", "would_have_stopped", "tsp_requested",
+    "tsp_granted", "tsp_action", "tsp_adjust_frames", "denial_reason",
+    "stop_bar_cross_frame", "node_wait_frames", "node_clear_frame",
+    "queue_ahead_veh", "passengers",
 )
 
 # Flat column order for the "Bus Events" sheet. A bus traverses at most two
@@ -57,13 +76,42 @@ def _new_node_event(node_x):
     return {
         "node_x": int(node_x),
         "arrival_frame": None,
+        "signal_phase_at_arrival": None,
+        "signal_colour_at_arrival": None,
+        "residual_green_frames": None,
+        "eta_frames_at_decision": None,
+        "would_have_stopped": None,
+        "tsp_requested": False,
+        "tsp_granted": False,
         "tsp_treated": False,
         "tsp_action": TSP_ACTION_NONE,
         "tsp_adjust_frames": 0,
+        "denial_reason": "",
         "stop_bar_cross_frame": None,
         "node_wait_frames": 0,
         "node_clear_frame": None,
+        "queue_ahead_veh": 0,
     }
+
+
+def iter_bus_node_event_rows(record, identity=None):
+    """Yield one tidy row per traversed/planned node without a two-node cap."""
+    identity = identity or {}
+    for node_seq, node in enumerate(record.get("nodes") or [], start=1):
+        if not isinstance(node, dict):
+            continue
+        row = {
+            "run_uuid": identity.get("run_uuid"),
+            "campaign_id": identity.get("campaign_id"),
+            "model": identity.get("model"),
+            "seed": identity.get("seed"),
+            "bus_id": record.get("bus_id"),
+            "route_id": record.get("route_id"),
+            "node_seq": node_seq,
+            "passengers": record.get("passengers"),
+        }
+        row.update({field: node.get(field) for field in NODE_EVENT_FIELDS})
+        yield {header: row.get(header) for header in BUS_NODE_EVENT_HEADERS}
 
 
 def flatten_bus_event(record):
@@ -130,7 +178,9 @@ class BusEventTracker:
             frame_number = int(frame_number)
             for vehicle in vehicles:
                 if isinstance(vehicle, Bus):
-                    self._observe_bus(vehicle, frame_number, signal_controller)
+                    self._observe_bus(
+                        vehicle, frame_number, signal_controller, vehicles
+                    )
         except Exception:
             pass
 
@@ -152,7 +202,7 @@ class BusEventTracker:
         self._records[bus.bus_id] = record
         return record
 
-    def _observe_bus(self, bus, frame_number, signal_controller):
+    def _observe_bus(self, bus, frame_number, signal_controller, vehicles):
         record = self._records.get(bus.bus_id)
         if record is None:
             record = self._register(bus, frame_number)
@@ -191,12 +241,70 @@ class BusEventTracker:
                 zone = self._eligibility_px(signal_controller)
                 if 0 <= distance <= zone:
                     node["arrival_frame"] = frame_number
+                    self._capture_arrival_context(
+                        node, bus, node_x, distance, signal_controller, vehicles
+                    )
             if upstream:
                 if stopped:
                     node["node_wait_frames"] += 1
             elif node["stop_bar_cross_frame"] is None:
                 node["stop_bar_cross_frame"] = frame_number
             self._attribute_from_live_request(node, bus.bus_id, signal_controller)
+
+    @staticmethod
+    def _queue_ahead_count(bus, node_x, vehicles):
+        bus_distance = bus.distance_to_node_stop_bar(
+            node_x, canvas.H_Y, canvas.ROAD_W, canvas.STOP
+        )
+        count = 0
+        for other in vehicles or []:
+            if other is bus or other.direction != bus.direction:
+                continue
+            if float(getattr(other, "speed", 0.0)) >= STOP_SPEED_THRESHOLD:
+                continue
+            other_distance = other.distance_to_node_stop_bar(
+                node_x, canvas.H_Y, canvas.ROAD_W, canvas.STOP
+            )
+            if 0.0 <= other_distance < bus_distance:
+                count += 1
+        return count
+
+    def _capture_arrival_context(
+        self, node, bus, node_x, distance, signal_controller, vehicles
+    ):
+        """Freeze the pre-treatment arrival state used for matched TSP analysis."""
+        node["eta_frames_at_decision"] = round(
+            eta_frames_to_stop_bar(distance, getattr(bus, "speed", 0.0)), 2
+        )
+        node["queue_ahead_veh"] = self._queue_ahead_count(
+            bus, node_x, vehicles
+        )
+        try:
+            status = signal_controller.get_node_status(node_x)
+            phase = int(status.get("phase_index"))
+            colour = str((status.get("signals") or {}).get(bus.direction, "RED"))
+            node["signal_phase_at_arrival"] = phase
+            node["signal_colour_at_arrival"] = colour
+            node["residual_green_frames"] = (
+                max(
+                    0,
+                    int(signal_controller.get_green_time(node_x, phase))
+                    - int(status.get("phase_timer_frames") or 0),
+                )
+                if colour == "GREEN"
+                else 0
+            )
+            request = signal_controller.get_priority_status_for_bus(bus, node_x)
+            node["tsp_requested"] = bool(
+                isinstance(request, dict) and request.get("tsp_requested")
+            ) or bool(signal_controller.is_bus_tsp_eligible(bus, node_x))
+        except Exception:
+            colour = None
+        unrestricted_left = getattr(bus, "target_turn", "STRAIGHT") == "LEFT"
+        node["would_have_stopped"] = bool(
+            node["queue_ahead_veh"]
+            or (not unrestricted_left and colour != "GREEN")
+        )
 
     @staticmethod
     def _eligibility_px(signal_controller):
@@ -210,6 +318,8 @@ class BusEventTracker:
         if not action or action == TSP_ACTION_NONE:
             return
         node["tsp_treated"] = True
+        node["tsp_requested"] = True
+        node["tsp_granted"] = True
         node["tsp_action"] = str(action)
         node["tsp_adjust_frames"] = max(
             int(node.get("tsp_adjust_frames") or 0), int(adjust_frames or 0)
@@ -226,6 +336,10 @@ class BusEventTracker:
         request = getattr(controller_node, "active_request", None)
         if request is None or getattr(request, "bus_id", None) != bus_id:
             return
+        node["tsp_requested"] = bool(getattr(request, "tsp_requested", False))
+        node["denial_reason"] = str(
+            getattr(request, "denial_or_cancel_reason", "") or ""
+        )
         self._apply_tsp(
             node,
             getattr(request, "tsp_action", TSP_ACTION_NONE),
@@ -244,6 +358,12 @@ class BusEventTracker:
                 continue
             if snapshot.get("bus_id") != bus_id:
                 continue
+            node["tsp_requested"] = bool(snapshot.get("tsp_requested", False))
+            node["denial_reason"] = str(
+                snapshot.get("denial_or_cancel_reason", "")
+                or snapshot.get("tsp_gate_reason", "")
+                or ""
+            )
             self._apply_tsp(
                 node,
                 snapshot.get("tsp_action", TSP_ACTION_NONE),

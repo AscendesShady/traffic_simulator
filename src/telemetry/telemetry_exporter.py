@@ -496,9 +496,23 @@ class TelemetryExporter:
             phase_labels.append(label)
             node_key = str(node_x)
             node_queue_passengers = queues_passengers_by_node[node_key]
+            # Frames of green left in the current phase (0 unless a green
+            # phase is running) -- same definition bus_event_log records at
+            # arrival, so a decision can be judged against the field it saw.
+            try:
+                phase_green = int(
+                    signal_controller.get_green_time(node_x, int(status.get("phase_index", 0)))
+                )
+            except Exception:
+                phase_green = 0
+            residual_green = (
+                max(0, phase_green - int(status.get("phase_timer_frames") or 0))
+                if "GREEN" in label else 0
+            )
             node_states[node_key] = {
                 **status,
                 "phase": label,
+                "residual_green_frames": residual_green,
                 "queues": queues_by_node[node_key],
                 "queues_passengers_est": node_queue_passengers,
                 "total_waiting_passengers_est": sum(
@@ -508,6 +522,27 @@ class TelemetryExporter:
                 "downstream_space_m": downstream_space_m_by_node[node_key],
                 "downstream_blocked": downstream_blocked_by_node[node_key],
             }
+
+        # Per-bus arrival test, the one fact that decides whether TSP can help
+        # at all: a bus that reaches the bar inside the residual green gains
+        # nothing from priority. cross_traffic_pax is what a grant would hold.
+        for bus in buses:
+            leg = bus.get("route_leg")
+            node = node_states.get(str(leg["node_x"])) if leg else None
+            if not node:
+                continue
+            approach = str(leg.get("approach") or bus.get("direction"))
+            colour = str((node.get("signals") or {}).get(approach, "RED"))
+            residual_sec = node["residual_green_frames"] / 60.0 if colour == "GREEN" else 0.0
+            conflicting = ("NB", "SB") if approach in ("EB", "WB") else ("EB", "WB")
+            bus["signal_colour_ahead"] = colour
+            bus["residual_green_sec"] = round(residual_sec, 1)
+            bus["would_have_stopped"] = bool(
+                colour != "GREEN" or bus["eta_to_stop_bar_sec_live"] > residual_sec
+            )
+            bus["cross_traffic_pax"] = int(
+                sum(node["queues_passengers_est"].get(a, 0) for a in conflicting)
+            )
 
         current_phase = phase_labels[0] if len(set(phase_labels)) == 1 else "MIXED"
         green_frames = signal_controller.get_green_time()

@@ -631,3 +631,60 @@ def test_vertical_traffic_completes_only_its_physical_node(
 
     assert vehicle.passed_nodes == {node_x}
     assert vehicle.get_next_target_node(INT_X) == node_x
+
+
+def test_starved_left_turn_holds_new_through_entries_until_corner_drains():
+    """A left-turner denied the corner sweep by a same-approach through
+    vehicle for LEFT_TURN_STARVATION_FRAMES makes the controller hold NEW
+    through entries at the bar; vehicles already reserved are untouched, and
+    the hold lifts once the left turn is granted."""
+    from src.core import signal_controller as sc
+
+    controller = SignalController({"green_time": 999})
+    # A through car already in the corner sweep with a reservation.
+    in_box = Vehicle(300 - 2.5 * LANE, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
+    turning = Vehicle(220, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2)
+    follower = Vehicle(200, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
+    vehicles = [in_box, turning, follower]
+    assert controller.request_intersection_entry(in_box, 300, vehicles)
+    assert not controller.request_intersection_entry(turning, 300, vehicles)
+    # A cancel (what a stopped vehicle issues every frame) must not erase the wait.
+    controller.cancel_intersection_entry(turning, 300)
+    assert "EB" in controller.nodes[300].left_turn_waiting
+
+    # Before the threshold a new through vehicle still gets in.
+    controller.frame_number += sc.LEFT_TURN_STARVATION_FRAMES - 1
+    assert controller.request_intersection_entry(follower, 300, vehicles)
+    controller.cancel_intersection_entry(follower, 300)
+
+    # At the threshold, new through entries are held; the reserved one is not.
+    controller.frame_number += 1
+    assert not controller.request_intersection_entry(follower, 300, vehicles)
+    assert id(in_box) in controller.nodes[300].reservations
+
+    # Corner drains: the through car leaves the sweep, the left turn is
+    # granted, the wait clears and through traffic flows again.
+    in_box.x = 300 + 3 * LANE
+    controller.cancel_intersection_entry(in_box, 300)
+    assert controller.request_intersection_entry(turning, 300, vehicles)
+    assert "EB" not in controller.nodes[300].left_turn_waiting
+    turning.passed_nodes.add(300)
+    controller.cancel_intersection_entry(turning, 300)
+    assert controller.request_intersection_entry(follower, 300, vehicles)
+
+
+def test_left_turn_wait_is_dropped_when_the_turner_is_gone():
+    from src.core import signal_controller as sc
+
+    controller = SignalController({"green_time": 999})
+    in_box = Vehicle(300 - 2.5 * LANE, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
+    turning = Vehicle(220, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2)
+    follower = Vehicle(200, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
+    assert controller.request_intersection_entry(in_box, 300, [in_box, turning, follower])
+    assert not controller.request_intersection_entry(turning, 300, [in_box, turning, follower])
+    controller.frame_number += sc.LEFT_TURN_STARVATION_FRAMES
+    in_box.x = 300 + 3 * LANE
+    controller.cancel_intersection_entry(in_box, 300)
+    # The turner has left the network: no stale hold on through traffic.
+    assert controller.request_intersection_entry(follower, 300, [in_box, follower])
+    assert "EB" not in controller.nodes[300].left_turn_waiting

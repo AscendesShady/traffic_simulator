@@ -65,7 +65,7 @@ def test_checkpoints_fire_at_marks(monkeypatch):
         main, "export_test_workbook",
         lambda *a, **k: exported_marks.append(k.get("checkpoint_sim_seconds")),
     )
-    monkeypatch.setattr(main, "append_experiment_summary_row", lambda mark: None)
+    monkeypatch.setattr(main, "append_experiment_summary_row", lambda mark, **kwargs: None)
 
     assert main.compute_checkpoint_marks(900) == [300, 600]
     assert main.compute_checkpoint_marks(300) == []
@@ -103,7 +103,7 @@ def test_checkpoint_fires_once_for_a_five_minute_test(monkeypatch):
         main, "export_test_workbook",
         lambda *a, **k: exported_marks.append(k.get("checkpoint_sim_seconds")),
     )
-    monkeypatch.setattr(main, "append_experiment_summary_row", lambda mark: None)
+    monkeypatch.setattr(main, "append_experiment_summary_row", lambda mark, **kwargs: None)
 
     control_panel.global_config["test_running"] = True
     control_panel.global_config["test_duration_sim_seconds"] = 300
@@ -123,7 +123,7 @@ def test_checkpoint_fires_once_for_a_five_minute_test(monkeypatch):
 
 def test_checkpoint_does_not_stop_run(monkeypatch):
     monkeypatch.setattr(main, "export_test_workbook", lambda *a, **k: None)
-    monkeypatch.setattr(main, "append_experiment_summary_row", lambda mark: None)
+    monkeypatch.setattr(main, "append_experiment_summary_row", lambda mark, **kwargs: None)
 
     control_panel.global_config["test_running"] = True
     control_panel.global_config["is_running"] = True
@@ -392,6 +392,10 @@ def test_summary_mechanism_columns_from_bus_events(monkeypatch):
     with main.BUS_EVENTS_LOG_PATH.open("w", encoding="utf-8") as handle:
         for event in events:
             handle.write(json.dumps(event) + "\n")
+    # The exporter refuses a row whose bus count disagrees with its own Bus
+    # Events log, so the throughput counter must see the same three buses.
+    main.network_throughput["buses_served"] = 3
+    main.network_throughput["vehicles_served_total"] = 3
 
     row = main.build_experiment_summary_row(300)
 
@@ -543,6 +547,7 @@ def test_steady_columns_are_none_before_warmup_ends():
     _seed_regime()
     control_panel.global_config["warmup_discard_frames"] = 7200
     main.network_throughput["passengers_served_total"] = 50
+    main.network_throughput["passengers_served_car"] = 50
     row = main.build_experiment_summary_row(60)
     assert row["pax_per_min_steady"] is None
     assert row["steady_window_sec"] == 0.0
@@ -552,6 +557,7 @@ def test_steady_columns_are_none_before_warmup_ends():
 def test_converged_flag_compares_cumulative_rate_at_0_8T():
     _seed_regime()
     main.network_throughput["passengers_served_total"] = 600  # 60/min at T=600
+    main.network_throughput["passengers_served_car"] = 600
     _write_telemetry_rows([
         {"sim_time_s": 300, "pax_per_min_cumulative": 40.0},
         {"sim_time_s": 480, "pax_per_min_cumulative": 58.0},  # within 5% of 60
@@ -595,3 +601,123 @@ def test_default_benchmark_is_an_hour_with_two_minute_warmup():
         param == "warmup_discard_frames" and value == 7200
         for _section, param, value in main.control_panel_input_rows()
     )
+
+
+def test_every_checkpoint_workbook_carries_the_runs_summary_rows_so_far(monkeypatch):
+    """A 10-min run's 5-min workbook holds the 5-min row; its final workbook
+    holds the 5-min AND 10-min rows, identical to what the CSV received."""
+    from openpyxl import load_workbook
+    _seed_regime()
+    main.network_throughput["passengers_served_total"] = 600
+    main.network_throughput["passengers_served_car"] = 600
+    main._run_summary_rows.clear()
+    control_panel.global_config.update({
+        "test_running": True, "test_model": "None", "test_seed": 7,
+        "test_duration_sim_seconds": 600,
+    })
+    main.pending_checkpoints_sec[:] = main.compute_checkpoint_marks(600)
+
+    main.fire_due_checkpoints(300 * 60)
+    main.finish_timed_test(600 * 60)
+
+    workbooks = sorted(main.EXCEL_EXPORT_DIR.glob("*.xlsx"))
+    assert len(workbooks) == 2
+    sheets = []
+    for path in workbooks:
+        rows = list(load_workbook(path, read_only=True)["Experiment Summary"].iter_rows(values_only=True))
+        assert list(rows[0]) == list(main.EXPERIMENT_SUMMARY_HEADERS)
+        sheets.append([dict(zip(rows[0], r)) for r in rows[1:]])
+    by_count = sorted(sheets, key=len)
+    assert [r["checkpoint_min"] for r in by_count[0]] == [5.0]
+    assert [r["checkpoint_min"] for r in by_count[1]] == [5.0, 10.0]
+    csv_rows = read_summary_rows()
+    assert [float(r["checkpoint_min"]) for r in csv_rows] == [5.0, 10.0]
+    assert csv_rows[0]["workbook_filename"] == by_count[0][0]["workbook_filename"]
+    assert csv_rows[0]["workbook_filename"] in {p.name for p in workbooks}
+
+
+def test_travel_delay_counts_crawl_that_stopped_delay_misses():
+    """Travel-time delay is time below the vehicle's own free-flow speed: a
+    vehicle at max_speed adds 0, at half speed adds pax/2 per frame, and a
+    stopped one adds pax per frame (equal to its stopped-delay contribution).
+    Stopped delay sees only the third."""
+    bus = make_bus_for_leg("R1_EB_A_NB", 300, "TRAVEL_BUS")
+    bus.speed = 0.0
+    car_free = Vehicle(0, H_Y - 0.5 * LANE, "EB")
+    car_free.speed = car_free.max_speed
+    car_crawl = Vehicle(100, H_Y - 0.5 * LANE, "EB")
+    car_crawl.speed = car_crawl.max_speed / 2.0
+
+    for _ in range(60):
+        main.accumulate_frame_metrics([bus, car_free, car_crawl])
+
+    assert main.network_throughput["bus_passenger_travel_delay_frames"] == pytest.approx(45 * 60)
+    assert main.network_throughput["car_passenger_travel_delay_frames"] == pytest.approx(4 * 30)
+    assert main.network_throughput["car_passenger_delay_frames"] == 0  # crawl is invisible here
+
+
+def test_summary_row_has_travel_delay_but_no_per_run_net_saved(monkeypatch):
+    """No per-run column may claim 'net person-hours saved': the baseline is
+    another run, so that number only exists as a paired difference."""
+    _seed_regime()
+    main.network_throughput.update({
+        "passengers_served_total": 400, "passengers_served_car": 400,
+        "bus_passenger_travel_delay_frames": 45 * 3600.0,
+        "car_passenger_travel_delay_frames": 4 * 3600.0,
+    })
+    row = main.build_experiment_summary_row(300)
+    assert "net_person_hours_saved" not in main.EXPERIMENT_SUMMARY_HEADERS
+    assert "tsp_window_cross_street_person_hours" in main.EXPERIMENT_SUMMARY_HEADERS
+    assert row["bus_person_hours_travel_delay"] == pytest.approx(45 / 60, abs=1e-4)
+    assert row["car_person_hours_travel_delay"] == pytest.approx(4 / 60, abs=1e-4)
+    assert row["total_person_hours_travel_delay"] == pytest.approx(
+        row["bus_person_hours_travel_delay"] + row["car_person_hours_travel_delay"]
+    )
+
+
+def test_pair_against_baseline_is_baseline_minus_arm_on_the_same_seed():
+    def row(model, seed, travel, bus, car, stopped, converged="True", uuid_=""):
+        return {
+            "campaign_id": "C", "model": model, "seed": str(seed), "run_uuid": uuid_,
+            "total_person_hours_travel_delay_steady": str(travel),
+            "bus_person_hours_travel_delay_steady": str(bus),
+            "car_person_hours_travel_delay_steady": str(car),
+            "total_person_hours_delay_steady": str(stopped),
+            "converged": converged,
+        }
+    rows = [
+        row("None", 1, 10.0, 6.0, 4.0, 7.0, uuid_="b1"),
+        row("rule", 1, 8.5, 4.0, 4.5, 6.0, uuid_="a1"),
+        row("None", 2, 12.0, 7.0, 5.0, 9.0, converged="False", uuid_="b2"),
+        row("rule", 2, 12.5, 7.5, 5.0, 9.5, uuid_="a2"),
+        row("rule", 3, 5.0, 3.0, 2.0, 4.0, uuid_="a3"),  # no baseline for seed 3
+    ]
+    pairs, unpaired = main.pair_against_baseline(rows)
+    assert unpaired == ["3"]
+    assert [(p["seed"], p["model"]) for p in pairs] == [("1", "rule"), ("2", "rule")]
+    first, second = pairs
+    assert first["net_person_hours_saved"] == pytest.approx(1.5)
+    assert first["bus_person_hours_saved"] == pytest.approx(2.0)
+    assert first["car_person_hours_saved"] == pytest.approx(-0.5)  # cars paid for it
+    assert first["net_person_hours_saved_stopped"] == pytest.approx(1.0)
+    assert first["baseline_run_uuid"] == "b1" and first["arm_run_uuid"] == "a1"
+    assert first["converged_both"] is True
+    assert second["net_person_hours_saved"] == pytest.approx(-0.5)
+    assert second["converged_both"] is False
+
+
+def test_paired_dv_csv_written_with_declared_header(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "EXPERIMENT_SUMMARY_PATH", tmp_path / "experiment_summary.csv")
+    pairs, _ = main.pair_against_baseline([
+        {"campaign_id": "C", "model": "None", "seed": "1", "run_uuid": "b",
+         "total_person_hours_travel_delay_steady": "3", "converged": "True"},
+        {"campaign_id": "C", "model": "rule", "seed": "1", "run_uuid": "a",
+         "total_person_hours_travel_delay_steady": "2", "converged": "True"},
+    ])
+    path = main.write_paired_dv_csv("C", pairs)
+    with path.open(newline="") as handle:
+        written = list(csv.DictReader(handle))
+    assert path.name == "paired_dv_C.csv"
+    assert list(written[0].keys()) == list(main.PAIRED_DV_HEADERS)
+    assert float(written[0]["net_person_hours_saved"]) == 1.0
+    assert written[0]["bus_person_hours_saved"] == ""  # missing split stays blank, not 0

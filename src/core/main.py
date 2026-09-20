@@ -8,6 +8,11 @@ import csv
 import subprocess
 import atexit
 import time
+import uuid
+import hashlib
+import statistics
+import datetime
+import copy
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
@@ -22,11 +27,16 @@ from src.ui import control_panel
 from src.core import guard
 from src.core import webster
 from src.experiments import batch_runner
-from src.core.vehicle import Vehicle, Bus, DBL_LANE_INDEX
-from src.core.signal_controller import SignalController
+from src.core.vehicle import Vehicle, Bus, DBL_LANE_INDEX, BUS_PASSENGERS
+from src.core.signal_controller import SignalController, TSP_MAX_ADJUST_FRACTION, MIN_GREEN_FRAMES
 from src.ui.telemetry_dashboard import TelemetryDashboard, build_excel_export_filename
 from src.telemetry.telemetry_exporter import TelemetryExporter
-from src.telemetry.bus_event_log import BusEventTracker, write_bus_events_sheet
+from src.telemetry.bus_event_log import (
+    BUS_NODE_EVENT_HEADERS,
+    BusEventTracker,
+    iter_bus_node_event_rows,
+    write_bus_events_sheet,
+)
 from src.telemetry import real_world_units
 
 # ==========================================================
@@ -52,6 +62,7 @@ def _new_spawner_state():
         "peak_active": False,
         "effective_rate_vpm": 0.0,
         "requested_arrivals": 0,
+        "offered_passengers": 0.0,
         "admitted_arrivals": 0,
         "overflow_arrivals": 0,
         "last_model": None,
@@ -79,6 +90,12 @@ network_throughput = {
     # exporter turns these into person-hours and per-passenger means.
     "bus_passenger_delay_frames": 0,
     "car_passenger_delay_frames": 0,
+    # Passenger-frames of travel-time delay: time lost below the vehicle's
+    # own free-flow speed, sum(1 - speed/max_speed) per frame. Unlike the
+    # stopped counters above this also sees crawl, so a controller cannot
+    # look better by turning stops into creeping. Floats.
+    "bus_passenger_travel_delay_frames": 0.0,
+    "car_passenger_travel_delay_frames": 0.0,
     # Congestion sampled once per simulated frame, for a run-long mean/max.
     "vehicles_in_network_frame_sum": 0,
     "vehicles_in_network_sample_count": 0,
@@ -90,6 +107,51 @@ network_throughput_at_warmup = {}
 # 120 s at 60 fps: the network takes ~90 s to fill from empty, so a
 # cumulative DV over a short run is mostly fill. Operator-configurable.
 WARMUP_DISCARD_FRAMES = 7200
+
+
+def _empty_approach_metric():
+    return {
+        f"node_{node_x}_{approach}": 0
+        for node_x in canvas.INT_X
+        for approach in ("EB", "WB", "NB", "SB")
+    }
+
+
+def _new_run_metrics():
+    """Exact per-run counters that do not belong in sampled telemetry."""
+    return {
+        "buses_spawned": 0,
+        "vehicles_in_network_current": 0,
+        "vehicles_in_network_steady_sum": 0,
+        "vehicles_in_network_steady_samples": 0,
+        "bus_delay_samples_sec": [],
+        "car_delay_samples_sec": [],
+        "bus_delay_samples_steady_sec": [],
+        "car_delay_samples_steady_sec": [],
+        "cross_street_vehicle_delay_frames": 0,
+        "cross_street_passenger_delay_frames": 0,
+        "cross_street_vehicle_ids": set(),
+        "cross_street_passenger_ids": set(),
+        "cross_street_unique_pax": 0,
+        "queue_sum_by_approach": _empty_approach_metric(),
+        "queue_max_by_approach": _empty_approach_metric(),
+        "queue_samples": 0,
+        "spillback_events": 0,
+        "spillback_active_ids": set(),
+        "node_stopped_vehicle_frames": {str(node_x): 0 for node_x in canvas.INT_X},
+        "node_throughput_veh": {str(node_x): 0 for node_x in canvas.INT_X},
+        "node_phase_failures": {str(node_x): 0 for node_x in canvas.INT_X},
+        "node_max_queue_len": {str(node_x): 0 for node_x in canvas.INT_X},
+        "last_node_phases": {},
+    }
+
+
+run_metrics = _new_run_metrics()
+
+
+def reset_run_metrics():
+    run_metrics.clear()
+    run_metrics.update(_new_run_metrics())
 
 
 def warmup_discard_frames():
@@ -109,7 +171,145 @@ def snapshot_warmup_baseline(master_frame_count):
     network_throughput_at_warmup["frame"] = int(master_frame_count)
 
 
-def accumulate_frame_metrics(vehicles):
+# Realised-demand fingerprint: updated once per admitted vehicle spawn
+# (try_spawn_vehicle) so "same seed = same demand" is a one-column check
+# instead of re-deriving it from six approach_configs fields. Reset each run.
+_demand_draw_state = {"hash": hashlib.sha256()}
+
+
+def _record_demand_draw(approach_key, lane_idx, target_turn, is_heavy, speed):
+    _demand_draw_state["hash"].update(
+        f"{approach_key}|{lane_idx}|{target_turn}|{int(is_heavy)}|{speed:.4f}|".encode(
+            "utf-8"
+        )
+    )
+
+
+def _demand_draw_hash_hex():
+    return _demand_draw_state["hash"].copy().hexdigest()[:16]
+
+
+def _record_demand_offer(approach_key, state, count=1):
+    """Count and fingerprint exogenous arrivals before source admission.
+
+    Offered passenger demand uses the configured heavy-vehicle mixture's
+    expected occupancy (car=4, truck=1). This remains independent of source
+    blockage; served passenger totals continue to use each admitted vehicle's
+    actual draw.
+    """
+    count = max(0, int(count))
+    if not count:
+        return
+    cfg = control_panel.approach_configs.get(approach_key, {})
+    heavy_ratio = min(1.0, max(0.0, float(cfg.get("heavy_ratio", 0.10) or 0.0)))
+    expected_pax = (1.0 - heavy_ratio) * 4.0 + heavy_ratio * 1.0
+    start = int(state["requested_arrivals"])
+    state["requested_arrivals"] += count
+    state["offered_passengers"] += expected_pax * count
+    for sequence in range(start + 1, start + count + 1):
+        _demand_draw_state["hash"].update(
+            f"{approach_key}|{sequence}|{state.get('last_model')}|".encode("utf-8")
+        )
+
+
+# git_sha/git_dirty describe the code the CURRENT process is running, which
+# cannot change mid-process, so one lookup is cached for the whole session.
+_GIT_INFO_CACHE = None
+
+
+def _git_info():
+    global _GIT_INFO_CACHE
+    if _GIT_INFO_CACHE is None:
+        try:
+            sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=BASE_DIR, stderr=subprocess.DEVNULL
+            ).decode().strip()
+        except Exception:
+            sha = None
+        try:
+            dirty = bool(
+                subprocess.check_output(
+                    ["git", "status", "--porcelain"],
+                    cwd=BASE_DIR, stderr=subprocess.DEVNULL,
+                ).decode().strip()
+            )
+        except Exception:
+            dirty = None
+        _GIT_INFO_CACHE = (sha, dirty)
+    return _GIT_INFO_CACHE
+
+
+# Regime fields hashed into config_hash: everything that must stay frozen for
+# the whole campaign (demand, geometry/timing-derived state, run length).
+# Deliberately excludes per-run/per-arm values (seed, test_model, timestamps).
+_CONFIG_HASH_GLOBAL_KEYS = (
+    "vehicle_speed_scale", "priority_eligibility_px", "measured_saturation_flow",
+    "warmup_discard_frames", "cycle_time_sec", "test_duration_sim_seconds",
+)
+
+
+def _config_regime_hash(config):
+    payload = {
+        "global": {key: config.get(key) for key in _CONFIG_HASH_GLOBAL_KEYS},
+        "approach_configs": control_panel.approach_configs,
+        "bus_routes_config": control_panel.bus_routes_config,
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def _current_campaign_id(config):
+    """One id per frozen-config campaign: the batch runner's id when this run
+    is part of a batch, otherwise the run's own id (a campaign of one)."""
+    batch_runtime = config.get("batch_runtime") or {}
+    campaign_id = batch_runtime.get("campaign_id")
+    return campaign_id or config.get("_run_uuid", "")
+
+
+def _network_demand_model(approach_configs):
+    active_models = {
+        cfg.get("model", "Poisson")
+        for cfg in approach_configs.values()
+        if isinstance(cfg, dict) and cfg.get("active", False)
+    }
+    if not active_models:
+        return None
+    return next(iter(active_models)) if len(active_models) == 1 else "mixed"
+
+
+def _record_node_crossings(vehicle):
+    seen = getattr(vehicle, "_experiment_nodes_counted", set())
+    if not isinstance(seen, set):
+        seen = set()
+    for node_x in getattr(vehicle, "passed_nodes", set()) - seen:
+        key = str(node_x)
+        if key in run_metrics["node_throughput_veh"]:
+            run_metrics["node_throughput_veh"][key] += 1
+    vehicle._experiment_nodes_counted = set(getattr(vehicle, "passed_nodes", set()))
+
+
+def _record_completed_vehicle_delay(vehicle):
+    delay_sec = float(getattr(vehicle, "_experiment_stopped_frames", 0)) / 60.0
+    steady_delay_sec = (
+        float(getattr(vehicle, "_experiment_steady_stopped_frames", 0)) / 60.0
+    )
+    passengers = max(0, int(getattr(vehicle, "passengers", 0) or 0))
+    target = (
+        run_metrics["bus_delay_samples_sec"]
+        if isinstance(vehicle, Bus)
+        else run_metrics["car_delay_samples_sec"]
+    )
+    steady_target = (
+        run_metrics["bus_delay_samples_steady_sec"]
+        if isinstance(vehicle, Bus)
+        else run_metrics["car_delay_samples_steady_sec"]
+    )
+    if passengers:
+        target.append((delay_sec, passengers))
+        steady_target.append((steady_delay_sec, passengers))
+
+
+def accumulate_frame_metrics(vehicles, signal_controller=None):
     """Update network_throughput's per-frame cumulative counters.
 
     Called once per simulated frame (never per callback, so it stays exact
@@ -123,21 +323,116 @@ def accumulate_frame_metrics(vehicles):
     stopped_count = 0
     stopped_bus_pax = 0
     stopped_car_pax = 0
+    queue_counts = _empty_approach_metric()
+    spillback_now = set()
+    cross_requests = {}
+    if signal_controller is not None:
+        for node_x, node in getattr(signal_controller, "nodes", {}).items():
+            request = getattr(node, "active_request", None)
+            if request is not None and getattr(request, "tsp_action", "none") != "none":
+                cross_requests[int(node_x)] = set(
+                    getattr(request, "conflicting_approaches", ())
+                )
+    travel_bus_pax = 0.0
+    travel_car_pax = 0.0
     for v in vehicles:
+        _record_node_crossings(v)
+        free_flow = float(getattr(v, "max_speed", 0.0) or 0.0)
+        if free_flow > 0:
+            lost = 1.0 - min(max(float(v.speed), 0.0), free_flow) / free_flow
+            if isinstance(v, Bus):
+                travel_bus_pax += int(getattr(v, "passengers", 0)) * lost
+            else:
+                travel_car_pax += int(getattr(v, "passengers", 0)) * lost
         if v.speed < 0.25:
             stopped_count += 1
             pax = int(getattr(v, "passengers", 0))
+            v._experiment_stopped_frames = (
+                int(getattr(v, "_experiment_stopped_frames", 0)) + 1
+            )
+            if network_throughput_at_warmup:
+                v._experiment_steady_stopped_frames = (
+                    int(getattr(v, "_experiment_steady_stopped_frames", 0)) + 1
+                )
             if isinstance(v, Bus):
                 stopped_bus_pax += pax
             else:
                 stopped_car_pax += pax
+            try:
+                target_node = v.get_next_target_node(canvas.INT_X)
+                if (
+                    target_node in canvas.INT_X
+                    and v.is_front_bumper_upstream(
+                        target_node, canvas.H_Y, canvas.ROAD_W, canvas.STOP
+                    )
+                ):
+                    approach_key = f"node_{target_node}_{v.direction}"
+                    if approach_key in queue_counts:
+                        queue_counts[approach_key] += 1
+                    run_metrics["node_stopped_vehicle_frames"][str(target_node)] += 1
+                    if v.direction in cross_requests.get(target_node, set()):
+                        run_metrics["cross_street_vehicle_delay_frames"] += 1
+                        run_metrics["cross_street_passenger_delay_frames"] += pax
+                        run_metrics["cross_street_vehicle_ids"].add(id(v))
+                        if pax and id(v) not in run_metrics["cross_street_passenger_ids"]:
+                            run_metrics["cross_street_passenger_ids"].add(id(v))
+                            run_metrics["cross_street_unique_pax"] += pax
+            except Exception:
+                pass
+        try:
+            target_node = v.get_next_target_node(canvas.INT_X)
+            upstream = v.is_front_bumper_upstream(
+                target_node, canvas.H_Y, canvas.ROAD_W, canvas.STOP
+            )
+            if upstream and v.is_spillback_blocked(
+                target_node, canvas.H_Y, canvas.ROAD_W, vehicles
+            ):
+                spillback_now.add(id(v))
+        except Exception:
+            pass
     network_throughput["stopped_vehicle_frames"] += stopped_count
     network_throughput["bus_passenger_delay_frames"] += stopped_bus_pax
     network_throughput["car_passenger_delay_frames"] += stopped_car_pax
+    network_throughput["bus_passenger_travel_delay_frames"] += travel_bus_pax
+    network_throughput["car_passenger_travel_delay_frames"] += travel_car_pax
     network_throughput["vehicles_in_network_frame_sum"] += len(vehicles)
     network_throughput["vehicles_in_network_sample_count"] += 1
     if len(vehicles) > network_throughput["vehicles_in_network_max"]:
         network_throughput["vehicles_in_network_max"] = len(vehicles)
+    run_metrics["vehicles_in_network_current"] = len(vehicles)
+    if network_throughput_at_warmup:
+        run_metrics["vehicles_in_network_steady_sum"] += len(vehicles)
+        run_metrics["vehicles_in_network_steady_samples"] += 1
+    run_metrics["queue_samples"] += 1
+    for key, value in queue_counts.items():
+        run_metrics["queue_sum_by_approach"][key] += value
+        run_metrics["queue_max_by_approach"][key] = max(
+            run_metrics["queue_max_by_approach"][key], value
+        )
+    for node_x in canvas.INT_X:
+        node_total = sum(
+            queue_counts[f"node_{node_x}_{approach}"]
+            for approach in ("EB", "WB", "NB", "SB")
+        )
+        key = str(node_x)
+        run_metrics["node_max_queue_len"][key] = max(
+            run_metrics["node_max_queue_len"][key], node_total
+        )
+        if signal_controller is not None:
+            try:
+                phase = signal_controller.nodes[node_x].phase
+                previous = run_metrics["last_node_phases"].get(key)
+                if previous in (0, 3) and phase in (1, 4):
+                    served = ("EB", "WB") if previous == 0 else ("NB", "SB")
+                    if any(queue_counts[f"node_{node_x}_{a}"] for a in served):
+                        run_metrics["node_phase_failures"][key] += 1
+                run_metrics["last_node_phases"][key] = phase
+            except Exception:
+                pass
+    run_metrics["spillback_events"] += len(
+        spillback_now - run_metrics["spillback_active_ids"]
+    )
+    run_metrics["spillback_active_ids"] = spillback_now
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -173,6 +468,7 @@ _last_telemetry_log_frame = None
 # Per-bus lifecycle records (spawn, waits, TSP treatment, completion). The
 # path is resolved lazily so tests can re-point BUS_EVENTS_LOG_PATH.
 bus_event_tracker = BusEventTracker(lambda: BUS_EVENTS_LOG_PATH)
+_active_signal_controller = None
 
 
 def apply_configured_random_seed():
@@ -1077,19 +1373,48 @@ def write_unit_conversions_sheet(sheet, telemetry=None):
     )
 
 
+# Bumped whenever a column is added/removed/redefined. append_experiment_summary_row
+# rotates the CSV (never appends ragged) when either this or config_hash changes.
+EXPERIMENT_SUMMARY_SCHEMA_VERSION = 4
+
+# PRIMARY DV: total_person_hours_travel_delay_steady, compared as a paired
+# per-seed difference against the baseline arm (pair_against_baseline ->
+# paired_dv_<campaign>.csv: net_person_hours_saved = baseline - arm). It is
+# passenger-weighted time below each vehicle's own free-flow speed after the
+# warm-up discard, bus occupancy fixed at BUS_PASSENGERS. Turn/merge
+# slow-downs count as delay in every arm alike and cancel in the pairing.
+# The stopped-delay triple (speed < 0.25) is the robustness measure. No
+# per-run column can be "net saved": the baseline is another run.
+
 EXPERIMENT_SUMMARY_HEADERS = (
     # Identity
     "timestamp", "model", "seed", "checkpoint_min", "test_duration_min",
+    # Run identity/provenance (section A): what this row was produced by.
+    "run_uuid", "campaign_id", "git_sha", "git_dirty", "config_hash",
+    "run_started_utc", "run_ended_utc", "wall_clock_sec", "workbook_filename",
+    "schema_version",
     # Regime
     "vehicle_speed_scale", "saturation_flow_veh_hr", "cycle_sec", "vc_ratio",
     "demand_EB_veh_min", "demand_WB_veh_min", "demand_A_NB_veh_min",
     "demand_A_SB_veh_min", "demand_B_NB_veh_min", "demand_B_SB_veh_min",
     "demand_symmetric",
+    # Configuration echo (section B): frozen inputs, so cross-run comparison
+    # never requires opening a workbook's Control Panel Inputs sheet.
+    "decision_interval_sec", "sim_speed", "random_seed", "llm_model", "llm_armed",
+    "test_duration_sim_sec",
+    "priority_eligibility_px", "link_length_px", "tsp_max_adjust_fraction",
+    "min_green_frames", "TSP_MAX_ADJUST_FRACTION", "MIN_GREEN_FRAMES",
+    "yellow_time_frames", "red_clearance_time_frames",
+    "lost_time_sec", "min_cycle_sec", "discharge_selection",
+    "measured_saturation_flow_veh_per_hr", "bus_occupancy_pax", "demand_model",
+    "demand_draw_hash", "sampling_params_json",
     # Throughput
     "passengers_served_total", "passengers_served_bus", "passengers_served_car",
     "buses_served", "cars_served", "pax_per_min",
     # Delay (the headline)
     "total_person_hours_delay", "bus_person_hours_delay", "car_person_hours_delay",
+    "total_person_hours_travel_delay", "bus_person_hours_travel_delay",
+    "car_person_hours_travel_delay",
     "mean_bus_passenger_delay_sec", "mean_car_passenger_delay_sec",
     # Congestion
     "mean_vehicles_in_network", "max_vehicles_in_network",
@@ -1099,16 +1424,102 @@ EXPERIMENT_SUMMARY_HEADERS = (
     # LLM meta
     "mean_decision_latency_ms", "guard_reject_rate", "total_decisions",
     "decision_lag_sec_used",
+    # Decision exposure (section C): the fixed-schedule confound fix -- offered
+    # opportunities vs. issued decisions, so decision frequency stops being a
+    # free variable correlated with model speed.
+    "decision_opportunities", "decisions_issued", "decisions_skipped_slow",
+    "actual_decision_interval_sec_mean", "actual_decision_interval_sec_median",
+    "decisions_effective", "utilisation_rate", "is_noop",
+    # Realised demand and service (section D).
+    "offered_veh", "offered_pax", "served_veh", "served_pax",
+    "served_fraction_veh", "served_fraction_pax",
+    "vehicles_still_in_network_at_end", "buses_spawned", "buses_completed",
+    "bus_completion_rate",
     # LOS
     "level_of_service",
     # Steady-state DVs: the same quantities over the post-warm-up window only.
     # The cumulative columns above are kept untouched so old rows stay readable.
-    "warmup_discard_sec", "steady_window_sec", "converged",
+    "warmup_discard_sec", "steady_window_sec", "converged", "time_to_converge_sec",
+    "passengers_served_total_at_warmup", "passengers_served_bus_at_warmup",
+    "passengers_served_car_at_warmup",
     "pax_per_min_steady",
+    "pax_per_min_cumulative",
     "total_person_hours_delay_steady", "bus_person_hours_delay_steady",
     "car_person_hours_delay_steady",
+    "total_person_hours_travel_delay_steady", "bus_person_hours_travel_delay_steady",
+    "car_person_hours_travel_delay_steady",
     "mean_bus_passenger_delay_sec_steady", "mean_car_passenger_delay_sec_steady",
+    "bus_passenger_delay_sec_p50", "bus_passenger_delay_sec_p90",
+    "car_passenger_delay_sec_p50", "car_passenger_delay_sec_p90",
+    "bus_passenger_delay_sec_p50_steady", "bus_passenger_delay_sec_p90_steady",
+    "car_passenger_delay_sec_p50_steady", "car_passenger_delay_sec_p90_steady",
+    # Priority mechanism exposure (section G).
+    "tsp_requests_raised", "tsp_requests_granted", "tsp_requests_denied",
+    "tsp_grant_rate", "tsp_denial_reasons_json", "tsp_actions_early_green",
+    "tsp_actions_extending", "tsp_total_adjust_frames",
+    "dbl_requests_raised", "dbl_requests_granted", "dbl_requests_denied",
+    "dbl_grant_rate", "dbl_denial_reasons_json", "dbl_actions_activated",
+    "dbl_total_active_frames",
+    # Cross-street cost/equity (section H). Descriptive only: counted while a
+    # TSP action is active, so it is 0 for the baseline by construction. The
+    # network's real cross-street cost is inside car_person_hours_*_delay.
+    "cross_street_delay_sec_mean", "cross_street_pax_delayed",
+    "tsp_window_cross_street_person_hours",
+    "p90_over_p50_pax_delay",
+    # Network stability (section I).
+    "discharge_activations", "discharge_total_frames",
+    "discharge_recovery_failed", "spillback_events",
+    "max_queue_len_by_approach_json", "mean_queue_len_by_approach_json",
+    "mean_vehicles_in_network_steady", "network_cleared_at_end",
+    # Reliability and operating cost (section J).
+    "guard_ok_count", "guard_held_all_off_count",
+    "guard_observation_only_count", "guard_malformed_count",
+    "stale_observation_count", "latency_ms_p50", "latency_ms_p95",
+    "latency_ms_max", "latency_to_cycle_ratio_p50",
+    "latency_to_cycle_ratio_p95", "input_tokens_total",
+    "output_tokens_total", "tokens_per_sec_mean", "cost_usd_estimate",
+    # Independent-controller breakdown (section K).
+    "node_300_mean_delay_sec", "node_300_throughput_veh",
+    "node_300_tsp_grants", "node_300_cycle_sec_mean",
+    "node_300_phase_failures", "node_300_max_queue_len",
+    "node_700_mean_delay_sec", "node_700_throughput_veh",
+    "node_700_tsp_grants", "node_700_cycle_sec_mean",
+    "node_700_phase_failures", "node_700_max_queue_len",
+    # Data-quality flags (section L): computed by the exporter, not the analyst.
+    "qa_null_columns_json", "qa_baseline_contaminated", "qa_unbalanced_seed",
+    "qa_duration_deviation_sec", "qa_flags_count",
 )
+
+
+def _time_to_converge_sec(telemetry_rows, checkpoint_seconds):
+    """Earliest sim-time X such that pax_per_min_cumulative stays within 5%
+    of its final value for every sample from X through the end -- measured,
+    not guessed, so warmup_discard_frames can be set from data instead of a
+    single traced estimate."""
+    rows = sorted(
+        (
+            row for row in telemetry_rows
+            if isinstance(row, dict)
+            and isinstance(row.get("sim_time_s"), (int, float))
+            and isinstance(row.get("pax_per_min_cumulative"), (int, float))
+            and row["sim_time_s"] <= checkpoint_seconds
+        ),
+        key=lambda row: row["sim_time_s"],
+    )
+    if not rows:
+        return None
+    final_value = rows[-1]["pax_per_min_cumulative"]
+    if not final_value:
+        return None
+    violation_index = None
+    for index in range(len(rows) - 1, -1, -1):
+        if abs(rows[index]["pax_per_min_cumulative"] - final_value) / final_value >= 0.05:
+            violation_index = index
+            break
+    converge_at = 0 if violation_index is None else violation_index + 1
+    if converge_at >= len(rows):
+        return None
+    return round(rows[converge_at]["sim_time_s"], 1)
 
 
 def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
@@ -1121,20 +1532,35 @@ def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
         "warmup_discard_sec": round(warmup_sec, 1),
         "steady_window_sec": round(max(0.0, steady_sec), 1),
         "converged": None,
+        "time_to_converge_sec": _time_to_converge_sec(telemetry_rows, checkpoint_seconds),
+        "passengers_served_total_at_warmup": (
+            int(warm.get("passengers_served_total", 0) or 0) if warm else None
+        ),
+        "passengers_served_bus_at_warmup": (
+            int(warm.get("passengers_served_bus", 0) or 0) if warm else None
+        ),
+        "passengers_served_car_at_warmup": (
+            int(warm.get("passengers_served_car", 0) or 0) if warm else None
+        ),
         "pax_per_min_steady": None,
         "total_person_hours_delay_steady": None,
         "bus_person_hours_delay_steady": None,
         "car_person_hours_delay_steady": None,
+        "total_person_hours_travel_delay_steady": None,
+        "bus_person_hours_travel_delay_steady": None,
+        "car_person_hours_travel_delay_steady": None,
         "mean_bus_passenger_delay_sec_steady": None,
         "mean_car_passenger_delay_sec_steady": None,
     }
     if warm and steady_sec > 0:
         def delta(key):
-            return int(network_throughput.get(key, 0) or 0) - int(warm.get(key, 0) or 0)
-        bus_pax = delta("passengers_served_bus")
-        car_pax = delta("passengers_served_car")
+            return float(network_throughput.get(key, 0) or 0) - float(warm.get(key, 0) or 0)
+        bus_pax = int(delta("passengers_served_bus"))
+        car_pax = int(delta("passengers_served_car"))
         bus_delay_sec = delta("bus_passenger_delay_frames") / 60.0
         car_delay_sec = delta("car_passenger_delay_frames") / 60.0
+        bus_travel_h = delta("bus_passenger_travel_delay_frames") / 60.0 / 3600.0
+        car_travel_h = delta("car_passenger_travel_delay_frames") / 60.0 / 3600.0
         out.update({
             "pax_per_min_steady": round(
                 delta("passengers_served_total") / (steady_sec / 60.0), 2
@@ -1144,6 +1570,11 @@ def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
             ),
             "bus_person_hours_delay_steady": round(bus_delay_sec / 3600.0, 4),
             "car_person_hours_delay_steady": round(car_delay_sec / 3600.0, 4),
+            "total_person_hours_travel_delay_steady": round(
+                round(bus_travel_h, 4) + round(car_travel_h, 4), 4
+            ),
+            "bus_person_hours_travel_delay_steady": round(bus_travel_h, 4),
+            "car_person_hours_travel_delay_steady": round(car_travel_h, 4),
             "mean_bus_passenger_delay_sec_steady": (
                 round(bus_delay_sec / bus_pax, 2) if bus_pax else None
             ),
@@ -1221,12 +1652,328 @@ class BaselineContaminationError(RuntimeError):
     """The no-controller baseline arm shows decisions or TSP treatment."""
 
 
+class ExportAssertionError(RuntimeError):
+    """A summary row failed one of its own internal consistency checks
+    (section O): fail the export, never emit a row that contradicts itself."""
+
+
 def is_baseline_run(config=None):
     config = control_panel.global_config if config is None else config
     return str(config.get("test_model", "None")) == "None"
 
 
-def build_experiment_summary_row(checkpoint_sim_seconds):
+def _decisions_effective_count(decisions):
+    """Turns where the merged route-flag state actually changed, counting
+    the first turn against the implicit all-off state before it. A model
+    that returns 300 no-op turns in a row scores 0 here, however many rows
+    total_decisions counts -- the signal a dead/no-op arm needs."""
+
+    def normalize(flags):
+        if not isinstance(flags, dict):
+            return frozenset()
+        return frozenset(
+            (route_id, bool(route_flags.get("tsp", False)), bool(route_flags.get("dbl", False)))
+            for route_id, route_flags in flags.items()
+            if isinstance(route_flags, dict)
+            and (route_flags.get("tsp") is True or route_flags.get("dbl") is True)
+        )
+
+    previous = frozenset()
+    effective = 0
+    for decision in decisions:
+        flags = normalize(decision.get("flags", {}))
+        if flags != previous:
+            effective += 1
+        previous = flags
+    return effective
+
+
+def _decision_schedule_metrics(
+    all_turn_rows, decisions, nominal_interval=None, actual_seconds=None,
+    baseline=False,
+):
+    """Offered vs. issued decisions under the fixed decision schedule
+    (section 0/C): every grid point is one opportunity, whether a model
+    answered it (an entry in ``decisions``), was skipped because the
+    previous turn was still running (SKIPPED_SLOW), or -- rarely, a stale-arm
+    straggler right at a model switch -- came back OBSERVATION_ONLY.
+    """
+    skipped = [row for row in all_turn_rows if row.get("status") == "SKIPPED_SLOW"]
+    expected = 0
+    if (
+        isinstance(nominal_interval, (int, float))
+        and nominal_interval > 0
+        and isinstance(actual_seconds, (int, float))
+    ):
+        expected = max(0, int(float(actual_seconds) // float(nominal_interval)))
+    opportunities = max(len(all_turn_rows), expected)
+    issued = len(decisions)
+    # An OBSERVATION_ONLY row with a schedule stamp is a stale-arm straggler
+    # (guard_baseline) from the run that just ended, and can carry that
+    # run's much later grid point into this log; one such row turns a clean
+    # 5 s cadence into a 300 s gap. Keep the cadence measurement to this run.
+    scheduled_times = sorted(
+        row["scheduled_sim_time"] for row in all_turn_rows
+        if isinstance(row.get("scheduled_sim_time"), (int, float))
+        and row.get("status") != "OBSERVATION_ONLY"
+        and (
+            not isinstance(actual_seconds, (int, float))
+            or row["scheduled_sim_time"] <= float(actual_seconds) + 1.0
+        )
+    )
+    gaps = [b - a for a, b in zip(scheduled_times, scheduled_times[1:]) if b > a]
+    nominal_candidates = [
+        row["decision_interval_sec"] for row in all_turn_rows
+        if isinstance(row.get("decision_interval_sec"), (int, float))
+    ]
+    nominal = statistics.mode(nominal_candidates) if nominal_candidates else nominal_interval
+    if not gaps and opportunities >= 2 and nominal:
+        gaps = [float(nominal)] * (opportunities - 1)
+    return {
+        "decision_opportunities": opportunities,
+        "decisions_issued": issued,
+        "decisions_skipped_slow": (
+            0 if baseline else max(len(skipped), opportunities - issued)
+        ),
+        "utilisation_rate": (
+            round(issued / opportunities, 4) if opportunities else None
+        ),
+        "actual_decision_interval_sec_mean": (
+            round(sum(gaps) / len(gaps), 3) if gaps else None
+        ),
+        "actual_decision_interval_sec_median": (
+            round(statistics.median(gaps), 3) if gaps else None
+        ),
+        "_nominal_decision_interval_sec": nominal,
+        "_cadence_gap_count": len(gaps),
+    }
+
+
+def _sampling_params_json(config):
+    """Temperature/top_p/etc for an LLM arm; null for rule-based and baseline,
+    which have no sampling to report."""
+    model = config.get("test_model", "None")
+    if is_baseline_run(config) or model == control_panel.RULE_BASED_MODEL:
+        return None
+    # Every provider call in agent.py (_call_gemini/_call_openai/_call_grok/
+    # _call_ollama) is hardcoded to temperature=0.2; update here if that ever
+    # becomes per-run configurable.
+    return json.dumps({"temperature": 0.2})
+
+
+# Standard, non-batch text-token rates checked against provider pricing on
+# 2026-09-20. Exact per-request cost from a provider response wins over this
+# estimate. Unknown/local models intentionally remain null rather than being
+# assigned a fabricated price.
+MODEL_TOKEN_RATES_USD_PER_MILLION = {
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+    "gemini-2.5-pro": (1.25, 10.00),
+    "gpt-5": (1.25, 10.00),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-4.1": (2.00, 8.00),
+    "grok-4.6": (2.00, 6.00),
+    "grok-4": (3.00, 15.00),
+    "grok-3-mini": (0.30, 0.50),
+}
+
+
+def _percentile(values, percentile):
+    numbers = sorted(
+        float(value) for value in values
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+    if not numbers:
+        return None
+    if len(numbers) == 1:
+        return round(numbers[0], 3)
+    position = (len(numbers) - 1) * float(percentile)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return round(numbers[lower], 3)
+    fraction = position - lower
+    return round(numbers[lower] * (1 - fraction) + numbers[upper] * fraction, 3)
+
+
+def _weighted_percentile(samples, percentile):
+    weighted = sorted(
+        (float(value), int(weight))
+        for value, weight in samples
+        if isinstance(value, (int, float)) and int(weight) > 0
+    )
+    total = sum(weight for _value, weight in weighted)
+    if not total:
+        return None
+    threshold = max(1.0, float(percentile) * total)
+    cumulative = 0
+    for value, weight in weighted:
+        cumulative += weight
+        if cumulative >= threshold:
+            return round(value, 3)
+    return round(weighted[-1][0], 3)
+
+
+def _decision_reliability(all_turn_rows, cycle_sec, model):
+    statuses = [str(row.get("status", "")) for row in all_turn_rows]
+    latencies = [
+        float(row["latency_ms"])
+        for row in all_turn_rows
+        if isinstance(row.get("latency_ms"), (int, float))
+        and not isinstance(row.get("latency_ms"), bool)
+    ]
+    input_tokens = sum(
+        float(row["input_tokens"])
+        for row in all_turn_rows
+        if isinstance(row.get("input_tokens"), (int, float))
+        and not isinstance(row.get("input_tokens"), bool)
+    )
+    output_tokens = sum(
+        float(row["output_tokens"])
+        for row in all_turn_rows
+        if isinstance(row.get("output_tokens"), (int, float))
+        and not isinstance(row.get("output_tokens"), bool)
+    )
+    exact_costs = [
+        float(row["cost_usd"])
+        for row in all_turn_rows
+        if isinstance(row.get("cost_usd"), (int, float))
+        and not isinstance(row.get("cost_usd"), bool)
+    ]
+    if exact_costs:
+        cost = round(sum(exact_costs), 8)
+    elif model in MODEL_TOKEN_RATES_USD_PER_MILLION:
+        input_rate, output_rate = MODEL_TOKEN_RATES_USD_PER_MILLION[model]
+        cost = round(
+            (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000.0,
+            8,
+        )
+    else:
+        cost = None
+    ratios = (
+        [latency / 1000.0 / cycle_sec for latency in latencies]
+        if isinstance(cycle_sec, (int, float)) and cycle_sec > 0
+        else []
+    )
+    token_rates = [
+        float(row["tokens_per_sec"])
+        for row in all_turn_rows
+        if isinstance(row.get("tokens_per_sec"), (int, float))
+        and not isinstance(row.get("tokens_per_sec"), bool)
+    ]
+    return {
+        "guard_ok_count": statuses.count("OK"),
+        "guard_held_all_off_count": statuses.count("HELD_ALL_OFF"),
+        "guard_observation_only_count": statuses.count("OBSERVATION_ONLY"),
+        "guard_malformed_count": statuses.count("INVALID"),
+        "stale_observation_count": sum(bool(row.get("stale")) for row in all_turn_rows),
+        "latency_ms_p50": _percentile(latencies, 0.50),
+        "latency_ms_p95": _percentile(latencies, 0.95),
+        "latency_ms_max": round(max(latencies), 3) if latencies else None,
+        "latency_to_cycle_ratio_p50": _percentile(ratios, 0.50),
+        "latency_to_cycle_ratio_p95": _percentile(ratios, 0.95),
+        "input_tokens_total": int(input_tokens),
+        "output_tokens_total": int(output_tokens),
+        "tokens_per_sec_mean": (
+            round(sum(token_rates) / len(token_rates), 3) if token_rates else None
+        ),
+        "cost_usd_estimate": cost,
+    }
+
+
+def _controller_experiment_metrics():
+    controller = _active_signal_controller
+    if controller is not None and hasattr(controller, "get_experiment_metrics"):
+        try:
+            return controller.get_experiment_metrics()
+        except Exception:
+            pass
+    return {
+        "tsp_requests_raised": 0, "tsp_requests_granted": 0,
+        "tsp_requests_denied": 0, "tsp_denial_reasons": {},
+        "tsp_actions_early_green": 0, "tsp_actions_extending": 0,
+        "tsp_total_adjust_frames": 0, "dbl_requests_raised": 0,
+        "dbl_requests_granted": 0, "dbl_requests_denied": 0,
+        "dbl_denial_reasons": {}, "dbl_actions_activated": 0,
+        "dbl_total_active_frames": 0, "discharge_activations": 0,
+        "discharge_total_frames": 0, "discharge_recovery_failed": False,
+        "node_tsp_grants": {str(node_x): 0 for node_x in canvas.INT_X},
+    }
+
+
+def _qa_unbalanced_seed(campaign_id, model, seed):
+    """Best-effort, using only rows already on disk: True when this arm's
+    seed set (so far) does not match the union of seeds seen anywhere in the
+    campaign. Necessarily partial mid-campaign; accurate once the campaign's
+    last (seed, model) combination has been appended."""
+    if not campaign_id or not EXPERIMENT_SUMMARY_PATH.exists():
+        return False
+    try:
+        seeds_by_model = {}
+        with EXPERIMENT_SUMMARY_PATH.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames or "campaign_id" not in reader.fieldnames:
+                return False
+            for existing in reader:
+                if existing.get("campaign_id") != campaign_id:
+                    continue
+                seeds_by_model.setdefault(existing.get("model"), set()).add(
+                    existing.get("seed")
+                )
+    except (OSError, csv.Error):
+        return False
+    seeds_by_model.setdefault(str(model), set()).add(str(seed))
+    all_seeds = set().union(*seeds_by_model.values())
+    return seeds_by_model.get(str(model), set()) != all_seeds
+
+
+def _run_export_assertions(row, schedule):
+    """Section O: fail the export rather than emit a row that contradicts
+    its own inputs. Every check here is cheap arithmetic on values already
+    in ``row`` -- this is a regression guard, not new measurement."""
+    problems = []
+    expected_window = row["checkpoint_min"] * 60.0 - row["warmup_discard_sec"]
+    # A checkpoint inside the warm-up has no steady window by design (clamped
+    # to 0); only a positive window has to match exactly.
+    if expected_window > 0 and abs(row["steady_window_sec"] - expected_window) > 0.02:
+        problems.append(
+            f"steady_window_sec={row['steady_window_sec']} does not equal "
+            f"checkpoint-warmup ({row['checkpoint_min'] * 60.0 - row['warmup_discard_sec']})"
+        )
+    if row["passengers_served_total"] != row["passengers_served_bus"] + row["passengers_served_car"]:
+        problems.append("passengers_served_total != bus + car")
+    if row["buses_served"] != row["buses_tsp_treated"] + row["buses_untreated"]:
+        problems.append("buses_served != buses_tsp_treated + buses_untreated")
+    if abs(
+        row["total_person_hours_delay"]
+        - (row["bus_person_hours_delay"] + row["car_person_hours_delay"])
+    ) > 1e-4:
+        problems.append("total_person_hours_delay != bus + car person-hours")
+    if abs(
+        row["total_person_hours_travel_delay"]
+        - (row["bus_person_hours_travel_delay"] + row["car_person_hours_travel_delay"])
+    ) > 1e-4:
+        problems.append("total_person_hours_travel_delay != bus + car person-hours")
+    # Median, not mean: this checks that the schedule's grid points are
+    # spaced at the nominal interval, and a single out-of-run row must not be
+    # able to fail an otherwise clean run.
+    nominal = schedule.get("_nominal_decision_interval_sec")
+    realised = row["actual_decision_interval_sec_median"]
+    if nominal and schedule.get("_cadence_gap_count", 0) >= 3 and realised is not None:
+        deviation = abs(realised - nominal) / nominal
+        if deviation > 0.2:
+            problems.append(
+                f"realised decision cadence (median) {realised}s deviates "
+                f"{deviation:.0%} from nominal {nominal}s (fixed-schedule bug?)"
+            )
+    if problems:
+        raise ExportAssertionError("; ".join(problems))
+
+
+def build_experiment_summary_row(
+    checkpoint_sim_seconds, workbook_filename=None, actual_sim_seconds=None
+):
     """One cumulative-to-date row for the cross-run comparison dataset.
 
     Reads the same cumulative sources a checkpoint workbook reads --
@@ -1237,11 +1984,16 @@ def build_experiment_summary_row(checkpoint_sim_seconds):
     config = control_panel.global_config
     throughput = network_throughput
     checkpoint_seconds = float(checkpoint_sim_seconds or 0.0)
+    actual_seconds = (
+        float(actual_sim_seconds) if actual_sim_seconds is not None else checkpoint_seconds
+    )
 
     bus_pax_served = int(throughput.get("passengers_served_bus", 0) or 0)
     car_pax_served = int(throughput.get("passengers_served_car", 0) or 0)
     bus_delay_sec = int(throughput.get("bus_passenger_delay_frames", 0) or 0) / 60.0
     car_delay_sec = int(throughput.get("car_passenger_delay_frames", 0) or 0) / 60.0
+    bus_travel_h = float(throughput.get("bus_passenger_travel_delay_frames", 0) or 0) / 60.0 / 3600.0
+    car_travel_h = float(throughput.get("car_passenger_travel_delay_frames", 0) or 0) / 60.0 / 3600.0
     stopped_frames = int(throughput.get("stopped_vehicle_frames", 0) or 0)
     vehicles_served_total = int(throughput.get("vehicles_served_total", 0) or 0)
     mean_stopped_delay_sec_per_vehicle = (
@@ -1251,17 +2003,37 @@ def build_experiment_summary_row(checkpoint_sim_seconds):
     sample_count = int(throughput.get("vehicles_in_network_sample_count", 0) or 0)
     frame_sum = int(throughput.get("vehicles_in_network_frame_sum", 0) or 0)
     total_served = int(throughput.get("passengers_served_total", 0) or 0)
+    buses_served = int(throughput.get("buses_served", 0) or 0)
+    cars_served = int(throughput.get("cars_served", 0) or 0)
 
-    # Observation-only turns are the agent watching a baseline, not decisions.
+    all_turn_rows = _read_jsonl_rows(AGENT_TURN_LOG_PATH)
+    # Observation-only turns are the agent watching a baseline (or a stale-arm
+    # straggler), and SKIPPED_SLOW ticks never reached a model: neither is a
+    # decision.
     decisions = [
-        row for row in _read_jsonl_rows(AGENT_TURN_LOG_PATH)
-        if row.get("status") != "OBSERVATION_ONLY"
+        row for row in all_turn_rows
+        if row.get("status") not in ("OBSERVATION_ONLY", "SKIPPED_SLOW")
     ]
     decision_rollup = summarize_turn_log(decisions)
+    nominal_interval = config.get("ai_runtime", {}).get("tick_seconds")
+    if config.get("test_running") or config.get("test_duration_sim_seconds"):
+        nominal_interval = (config.get("batch_runtime") or {}).get(
+            "tick_seconds", nominal_interval
+        )
+    schedule = _decision_schedule_metrics(
+        all_turn_rows,
+        decisions,
+        nominal_interval=nominal_interval,
+        actual_seconds=actual_seconds,
+        baseline=is_baseline_run(config),
+    )
     bus_events = _read_jsonl_rows(BUS_EVENTS_LOG_PATH)
     mechanism = _bus_event_mechanism_summary(bus_events)
+    controller_metrics = _controller_experiment_metrics()
     if is_baseline_run(config) and (
-        decision_rollup.get("turns", 0) or mechanism["buses_tsp_treated"]
+        decision_rollup.get("turns", 0)
+        or mechanism["buses_tsp_treated"]
+        or controller_metrics.get("tsp_requests_granted", 0)
     ):
         # A reference row with a controller's fingerprints on it is worse
         # than no row: refuse to export it.
@@ -1277,15 +2049,79 @@ def build_experiment_summary_row(checkpoint_sim_seconds):
     cycle_splits = config.get("cycle_time_sec") or {}
     cycle_sec = cycle_splits.get(canvas.INT_X[0], cycle_splits.get(str(canvas.INT_X[0])))
     mean_latency_ms = decision_rollup.get("avg_latency_ms")
+    webster_splits = config.get("webster_splits") or {}
+    node_a_split = webster_splits.get(canvas.INT_X[0], webster_splits.get(str(canvas.INT_X[0]))) or {}
+    decisions_effective = _decisions_effective_count(decisions)
+    model = config.get("test_model", "None")
+    campaign_id = _current_campaign_id(config)
+    git_sha, git_dirty = _git_info()
+    run_started_wall = config.get("_run_started_wall")
+    now_wall = time.time()
+    qa_duration_deviation_sec = round(actual_seconds - checkpoint_seconds, 4)
+    demand_offered_veh = sum(
+        int(state.get("requested_arrivals", 0) or 0)
+        for state in spawner_states.values()
+    ) + int(run_metrics["buses_spawned"])
+    demand_offered_pax = sum(
+        float(state.get("offered_passengers", 0.0) or 0.0)
+        for state in spawner_states.values()
+    ) + int(run_metrics["buses_spawned"]) * BUS_PASSENGERS
+    reliability = _decision_reliability(all_turn_rows, cycle_sec, model)
+    queue_samples = int(run_metrics["queue_samples"] or 0)
+    mean_queues = {
+        key: round(value / queue_samples, 4) if queue_samples else 0.0
+        for key, value in run_metrics["queue_sum_by_approach"].items()
+    }
+    max_queues = dict(run_metrics["queue_max_by_approach"])
+    bus_p50 = _weighted_percentile(run_metrics["bus_delay_samples_sec"], 0.50)
+    bus_p90 = _weighted_percentile(run_metrics["bus_delay_samples_sec"], 0.90)
+    car_p50 = _weighted_percentile(run_metrics["car_delay_samples_sec"], 0.50)
+    car_p90 = _weighted_percentile(run_metrics["car_delay_samples_sec"], 0.90)
+    steady_bus_p50 = _weighted_percentile(
+        run_metrics["bus_delay_samples_steady_sec"], 0.50
+    )
+    steady_bus_p90 = _weighted_percentile(
+        run_metrics["bus_delay_samples_steady_sec"], 0.90
+    )
+    steady_car_p50 = _weighted_percentile(
+        run_metrics["car_delay_samples_steady_sec"], 0.50
+    )
+    steady_car_p90 = _weighted_percentile(
+        run_metrics["car_delay_samples_steady_sec"], 0.90
+    )
+    combined_samples = (
+        run_metrics["bus_delay_samples_sec"] + run_metrics["car_delay_samples_sec"]
+    )
+    all_p50 = _weighted_percentile(combined_samples, 0.50)
+    all_p90 = _weighted_percentile(combined_samples, 0.90)
+    cross_vehicle_count = len(run_metrics["cross_street_vehicle_ids"])
+    cross_person_hours = (
+        run_metrics["cross_street_passenger_delay_frames"] / 60.0 / 3600.0
+    )
 
     row = {
-        "timestamp": round(time.time(), 3),
-        "model": config.get("test_model", "None"),
+        "timestamp": round(now_wall, 3),
+        "model": model,
         "seed": config.get("test_seed"),
         "checkpoint_min": round(checkpoint_seconds / 60.0, 3),
         "test_duration_min": round(
             float(config.get("test_duration_sim_seconds") or 0.0) / 60.0, 3
         ),
+        "run_uuid": config.get("_run_uuid", ""),
+        "campaign_id": campaign_id,
+        "git_sha": git_sha,
+        "git_dirty": git_dirty,
+        "config_hash": _config_regime_hash(config),
+        "run_started_utc": (
+            datetime.datetime.fromtimestamp(run_started_wall, datetime.timezone.utc).isoformat()
+            if run_started_wall else None
+        ),
+        "run_ended_utc": datetime.datetime.fromtimestamp(now_wall, datetime.timezone.utc).isoformat(),
+        "wall_clock_sec": (
+            round(now_wall - run_started_wall, 3) if run_started_wall else None
+        ),
+        "workbook_filename": workbook_filename or "",
+        "schema_version": EXPERIMENT_SUMMARY_SCHEMA_VERSION,
         "vehicle_speed_scale": config.get(
             "_active_vehicle_speed_scale", config.get("vehicle_speed_scale")
         ),
@@ -1301,17 +2137,52 @@ def build_experiment_summary_row(checkpoint_sim_seconds):
         "demand_B_NB_veh_min": rates["B_NB"],
         "demand_B_SB_veh_min": rates["B_SB"],
         "demand_symmetric": _demand_is_symmetric(rates),
+        "decision_interval_sec": nominal_interval,
+        "sim_speed": config.get("sim_speed"),
+        "random_seed": config.get("random_seed"),
+        "llm_model": model,
+        "llm_armed": bool(config.get("ai_runtime", {}).get("armed", False)),
+        "test_duration_sim_sec": config.get("test_duration_sim_seconds"),
+        "priority_eligibility_px": config.get("priority_eligibility_px"),
+        "link_length_px": canvas.INT_X[-1] - canvas.INT_X[0],
+        # yellow/red-clearance are constructed as literal 60/60 at the one
+        # SignalController(...) call site (main.py's build_main_window); kept
+        # here as constants instead of threading the live instance through
+        # the checkpoint/export call chain. Keep in sync if that call site
+        # ever parameterizes them.
+        "tsp_max_adjust_fraction": TSP_MAX_ADJUST_FRACTION,
+        "min_green_frames": MIN_GREEN_FRAMES,
+        "TSP_MAX_ADJUST_FRACTION": TSP_MAX_ADJUST_FRACTION,
+        "MIN_GREEN_FRAMES": MIN_GREEN_FRAMES,
+        "yellow_time_frames": getattr(_active_signal_controller, "yellow_time", 60),
+        "red_clearance_time_frames": getattr(
+            _active_signal_controller, "red_clearance_time", 60
+        ),
+        "lost_time_sec": node_a_split.get("lost_time_sec"),
+        "min_cycle_sec": node_a_split.get("min_cycle_sec"),
+        "discharge_selection": config.get("discharge_selection"),
+        "measured_saturation_flow_veh_per_hr": config.get("measured_saturation_flow"),
+        "bus_occupancy_pax": BUS_PASSENGERS,
+        "demand_model": _network_demand_model(control_panel.approach_configs),
+        "demand_draw_hash": _demand_draw_hash_hex(),
+        "sampling_params_json": _sampling_params_json(config),
         "passengers_served_total": total_served,
         "passengers_served_bus": bus_pax_served,
         "passengers_served_car": car_pax_served,
-        "buses_served": int(throughput.get("buses_served", 0) or 0),
-        "cars_served": int(throughput.get("cars_served", 0) or 0),
+        "buses_served": buses_served,
+        "cars_served": cars_served,
         "pax_per_min": round(total_served / max(checkpoint_seconds / 60.0, 1e-9), 2),
         "total_person_hours_delay": round(
             (bus_delay_sec + car_delay_sec) / 3600.0, 4
         ),
         "bus_person_hours_delay": round(bus_delay_sec / 3600.0, 4),
         "car_person_hours_delay": round(car_delay_sec / 3600.0, 4),
+        # Sum of the rounded parts, so the total == bus + car assertion holds exactly.
+        "total_person_hours_travel_delay": round(
+            round(bus_travel_h, 4) + round(car_travel_h, 4), 4
+        ),
+        "bus_person_hours_travel_delay": round(bus_travel_h, 4),
+        "car_person_hours_travel_delay": round(car_travel_h, 4),
         "mean_bus_passenger_delay_sec": (
             round(bus_delay_sec / bus_pax_served, 2) if bus_pax_served else None
         ),
@@ -1344,26 +2215,214 @@ def build_experiment_summary_row(checkpoint_sim_seconds):
         "decision_lag_sec_used": (
             round(mean_latency_ms / 1000.0, 3) if mean_latency_ms is not None else None
         ),
+        "decision_opportunities": schedule["decision_opportunities"],
+        "decisions_issued": schedule["decisions_issued"],
+        "decisions_skipped_slow": schedule["decisions_skipped_slow"],
+        "actual_decision_interval_sec_mean": schedule["actual_decision_interval_sec_mean"],
+        "actual_decision_interval_sec_median": schedule["actual_decision_interval_sec_median"],
+        "decisions_effective": decisions_effective,
+        "utilisation_rate": schedule["utilisation_rate"],
+        "is_noop": (not is_baseline_run(config)) and decisions_effective == 0,
+        "offered_veh": demand_offered_veh,
+        "offered_pax": round(demand_offered_pax, 3),
+        "served_veh": vehicles_served_total,
+        "served_pax": total_served,
+        "served_fraction_veh": (
+            round(vehicles_served_total / demand_offered_veh, 6)
+            if demand_offered_veh else None
+        ),
+        "served_fraction_pax": (
+            round(total_served / demand_offered_pax, 6)
+            if demand_offered_pax else None
+        ),
+        "vehicles_still_in_network_at_end": int(
+            run_metrics["vehicles_in_network_current"]
+        ),
+        "buses_spawned": int(run_metrics["buses_spawned"]),
+        "buses_completed": buses_served,
+        "bus_completion_rate": (
+            round(buses_served / run_metrics["buses_spawned"], 6)
+            if run_metrics["buses_spawned"] else None
+        ),
         "level_of_service": real_world_units.hcm_level_of_service(
             mean_stopped_delay_sec_per_vehicle
         ),
         **steady,
+        "pax_per_min_cumulative": round(
+            total_served / max(checkpoint_seconds / 60.0, 1e-9), 2
+        ),
+        "bus_passenger_delay_sec_p50": bus_p50,
+        "bus_passenger_delay_sec_p90": bus_p90,
+        "car_passenger_delay_sec_p50": car_p50,
+        "car_passenger_delay_sec_p90": car_p90,
+        "bus_passenger_delay_sec_p50_steady": steady_bus_p50,
+        "bus_passenger_delay_sec_p90_steady": steady_bus_p90,
+        "car_passenger_delay_sec_p50_steady": steady_car_p50,
+        "car_passenger_delay_sec_p90_steady": steady_car_p90,
+        "tsp_requests_raised": controller_metrics["tsp_requests_raised"],
+        "tsp_requests_granted": controller_metrics["tsp_requests_granted"],
+        "tsp_requests_denied": controller_metrics["tsp_requests_denied"],
+        "tsp_grant_rate": (
+            round(
+                controller_metrics["tsp_requests_granted"]
+                / controller_metrics["tsp_requests_raised"], 6
+            ) if controller_metrics["tsp_requests_raised"] else None
+        ),
+        "tsp_denial_reasons_json": json.dumps(
+            controller_metrics["tsp_denial_reasons"], sort_keys=True
+        ),
+        "tsp_actions_early_green": controller_metrics["tsp_actions_early_green"],
+        "tsp_actions_extending": controller_metrics["tsp_actions_extending"],
+        "tsp_total_adjust_frames": controller_metrics["tsp_total_adjust_frames"],
+        "dbl_requests_raised": controller_metrics["dbl_requests_raised"],
+        "dbl_requests_granted": controller_metrics["dbl_requests_granted"],
+        "dbl_requests_denied": controller_metrics["dbl_requests_denied"],
+        "dbl_grant_rate": (
+            round(
+                controller_metrics["dbl_requests_granted"]
+                / controller_metrics["dbl_requests_raised"], 6
+            ) if controller_metrics["dbl_requests_raised"] else None
+        ),
+        "dbl_denial_reasons_json": json.dumps(
+            controller_metrics["dbl_denial_reasons"], sort_keys=True
+        ),
+        "dbl_actions_activated": controller_metrics["dbl_actions_activated"],
+        "dbl_total_active_frames": controller_metrics["dbl_total_active_frames"],
+        "cross_street_delay_sec_mean": (
+            round(
+                run_metrics["cross_street_vehicle_delay_frames"]
+                / 60.0 / cross_vehicle_count, 3
+            ) if cross_vehicle_count else None
+        ),
+        "cross_street_pax_delayed": int(run_metrics["cross_street_unique_pax"]),
+        "tsp_window_cross_street_person_hours": round(cross_person_hours, 6),
+        "p90_over_p50_pax_delay": (
+            round(all_p90 / all_p50, 6) if all_p50 not in (None, 0) else None
+        ),
+        "discharge_activations": controller_metrics["discharge_activations"],
+        "discharge_total_frames": controller_metrics["discharge_total_frames"],
+        "discharge_recovery_failed": bool(
+            controller_metrics["discharge_recovery_failed"]
+        ),
+        "spillback_events": int(run_metrics["spillback_events"]),
+        "max_queue_len_by_approach_json": json.dumps(max_queues, sort_keys=True),
+        "mean_queue_len_by_approach_json": json.dumps(mean_queues, sort_keys=True),
+        "mean_vehicles_in_network_steady": (
+            round(
+                run_metrics["vehicles_in_network_steady_sum"]
+                / run_metrics["vehicles_in_network_steady_samples"], 4
+            ) if run_metrics["vehicles_in_network_steady_samples"] else None
+        ),
+        "network_cleared_at_end": bool(
+            run_metrics["vehicles_in_network_current"] == 0
+            and all(
+                int(state.get("pending_arrivals", 0) or 0) == 0
+                for state in spawner_states.values()
+            )
+        ),
+        **reliability,
+        "node_300_mean_delay_sec": (
+            round(
+                run_metrics["node_stopped_vehicle_frames"]["300"]
+                / 60.0 / run_metrics["node_throughput_veh"]["300"], 3
+            ) if run_metrics["node_throughput_veh"]["300"] else None
+        ),
+        "node_300_throughput_veh": run_metrics["node_throughput_veh"]["300"],
+        "node_300_tsp_grants": controller_metrics["node_tsp_grants"].get("300", 0),
+        "node_300_cycle_sec_mean": (
+            config.get("cycle_time_sec", {}).get(300)
+            or config.get("cycle_time_sec", {}).get("300")
+        ),
+        "node_300_phase_failures": run_metrics["node_phase_failures"]["300"],
+        "node_300_max_queue_len": run_metrics["node_max_queue_len"]["300"],
+        "node_700_mean_delay_sec": (
+            round(
+                run_metrics["node_stopped_vehicle_frames"]["700"]
+                / 60.0 / run_metrics["node_throughput_veh"]["700"], 3
+            ) if run_metrics["node_throughput_veh"]["700"] else None
+        ),
+        "node_700_throughput_veh": run_metrics["node_throughput_veh"]["700"],
+        "node_700_tsp_grants": controller_metrics["node_tsp_grants"].get("700", 0),
+        "node_700_cycle_sec_mean": (
+            config.get("cycle_time_sec", {}).get(700)
+            or config.get("cycle_time_sec", {}).get("700")
+        ),
+        "node_700_phase_failures": run_metrics["node_phase_failures"]["700"],
+        "node_700_max_queue_len": run_metrics["node_max_queue_len"]["700"],
+        "qa_baseline_contaminated": False,  # would have raised above otherwise
+        "qa_unbalanced_seed": _qa_unbalanced_seed(
+            campaign_id, model, config.get("test_seed")
+        ),
+        "qa_duration_deviation_sec": qa_duration_deviation_sec,
     }
+    null_columns = sorted(key for key, value in row.items() if value is None)
+    row["qa_null_columns_json"] = json.dumps(null_columns)
+    row["qa_flags_count"] = (
+        int(row["qa_baseline_contaminated"])
+        + int(row["qa_unbalanced_seed"])
+        + int(abs(qa_duration_deviation_sec) > 1.0)
+        + int(bool(null_columns))
+    )
+    _run_export_assertions(row, schedule)
     return row
 
 
-def append_experiment_summary_row(checkpoint_sim_seconds):
+# Summary rows of the CURRENT run, one per checkpoint fired so far, in order.
+# Every checkpoint workbook carries them as its "Experiment Summary" sheet, so
+# the final workbook of a 10-min run holds the 5-min and 10-min rows side by
+# side. perform_full_reset clears it.
+_run_summary_rows = []
+
+
+def build_experiment_summary_row_safely(
+    checkpoint_sim_seconds, workbook_filename=None, actual_sim_seconds=None
+):
+    """The summary row for this checkpoint, or None with the run marked
+    failed. Never raises: this runs inside the fixed-step Tk callback, and
+    an exception escaping there stops the callback from rescheduling -- the
+    sim freezes at the checkpoint and the batch runner, polled from the same
+    callback, never advances (2026-09-20 incident)."""
+    try:
+        return build_experiment_summary_row(
+            checkpoint_sim_seconds, workbook_filename, actual_sim_seconds
+        )
+    except BaselineContaminationError as exc:
+        control_panel.global_config["test_failed_reason"] = f"baseline_contaminated: {exc}"
+        print(f"\n!!! BASELINE CONTAMINATED -- summary row NOT written: {exc}\n")
+    except ExportAssertionError as exc:
+        control_panel.global_config["test_failed_reason"] = f"export_assertion: {exc}"
+        print(f"\n!!! EXPORT ASSERTION FAILED -- summary row NOT written: {exc}\n")
+    except Exception as exc:
+        control_panel.global_config["test_failed_reason"] = f"summary_row_error: {exc!r}"
+        print(f"\n!!! SUMMARY ROW ERROR -- summary row NOT written: {exc!r}\n")
+    return None
+
+
+def write_experiment_summary_sheet(sheet, rows=None):
+    """One row per checkpoint of this run, in EXPERIMENT_SUMMARY_HEADERS order
+    -- the same row the CSV gets, so a workbook is self-describing."""
+    sheet.append(list(EXPERIMENT_SUMMARY_HEADERS))
+    for row in (_run_summary_rows if rows is None else rows):
+        sheet.append([_excel_text(row.get(key)) if isinstance(row.get(key), (dict, list))
+                      else row.get(key) for key in EXPERIMENT_SUMMARY_HEADERS])
+
+
+def append_experiment_summary_row(
+    checkpoint_sim_seconds, workbook_filename=None, actual_sim_seconds=None, row=None
+):
     """Append one row to the accumulating experiment_summary.csv.
 
     Crash-safe and intentionally outside reset_session_logs: this file is
     the master dataset across the whole experiment (every run, every
     checkpoint), so RESET must never touch it -- only manual deletion does.
+    ``row`` lets a caller that already built (and exported) the row reuse
+    it; otherwise it is built here. Returns False when no row was written.
     """
-    try:
-        row = build_experiment_summary_row(checkpoint_sim_seconds)
-    except BaselineContaminationError as exc:
-        control_panel.global_config["test_failed_reason"] = f"baseline_contaminated: {exc}"
-        print(f"\n!!! BASELINE CONTAMINATED -- summary row NOT written: {exc}\n")
+    if row is None:
+        row = build_experiment_summary_row_safely(
+            checkpoint_sim_seconds, workbook_filename, actual_sim_seconds
+        )
+    if row is None:
         return False
     try:
         EXPERIMENT_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1460,6 +2519,7 @@ def export_test_workbook(
         )
         write_bus_events_sheet(workbook.create_sheet("Bus Events"), bus_events)
         write_unit_conversions_sheet(workbook.create_sheet("Unit Conversions"))
+        write_experiment_summary_sheet(workbook.create_sheet("Experiment Summary"))
 
         if destination is None:
             destination = EXCEL_EXPORT_DIR / build_test_export_filename(
@@ -1531,13 +2591,30 @@ def fire_due_checkpoints(master_frame_count):
         and simulation_time_seconds >= pending_checkpoints_sec[0]
     ):
         mark = pending_checkpoints_sec.pop(0)
-        export_test_workbook(
-            config.get("test_model", "None"),
-            config.get("test_duration_sim_seconds"),
-            config.get("test_seed"),
-            checkpoint_sim_seconds=mark,
-        )
-        append_experiment_summary_row(mark)
+        _export_checkpoint(config, mark, simulation_time_seconds)
+
+
+def _export_checkpoint(config, mark_sim_seconds, actual_sim_seconds):
+    """Summary row first (so this checkpoint's workbook can carry it), then
+    the workbook, then the CSV row. Returns the workbook path or None."""
+    model = config.get("test_model", "None")
+    duration = config.get("test_duration_sim_seconds")
+    seed = config.get("test_seed")
+    destination = EXCEL_EXPORT_DIR / build_test_export_filename(
+        model, duration, seed, checkpoint_sim_seconds=mark_sim_seconds
+    )
+    row = build_experiment_summary_row_safely(
+        mark_sim_seconds, destination.name, actual_sim_seconds
+    )
+    if row is not None:
+        _run_summary_rows.append(row)
+    written = export_test_workbook(
+        model, duration, seed, destination=destination,
+        checkpoint_sim_seconds=mark_sim_seconds,
+    )
+    if row is not None:
+        append_experiment_summary_row(mark_sim_seconds, row=row)
+    return written
 
 
 def timed_test_is_complete(master_frame_count):
@@ -1563,15 +2640,9 @@ def finish_timed_test(master_frame_count):
     config["is_running"] = False
     config["test_running"] = False
     duration = config.get("test_duration_sim_seconds")
-    destination = export_test_workbook(
-        config.get("test_model", "None"),
-        duration,
-        config.get("test_seed"),
-        checkpoint_sim_seconds=duration,
-    )
+    destination = _export_checkpoint(config, duration, master_frame_count / 60.0)
     config["test_last_export"] = destination.name if destination else ""
     control_panel.write_ai_control()
-    append_experiment_summary_row(duration)
     return destination
 
 
@@ -1647,6 +2718,114 @@ def build_batch_runner():
     )
 
 
+def print_campaign_summary(campaign_id):
+    """End-of-batch readout from the CSV's final-checkpoint rows of this
+    campaign: what a reviewer would otherwise have to compute by hand
+    before trusting the numbers."""
+    if not campaign_id or not EXPERIMENT_SUMMARY_PATH.exists():
+        return
+    try:
+        with EXPERIMENT_SUMMARY_PATH.open("r", encoding="utf-8", newline="") as handle:
+            rows = [
+                row for row in csv.DictReader(handle)
+                if row.get("campaign_id") == campaign_id
+                and row.get("checkpoint_min") == row.get("test_duration_min")
+            ]
+    except (OSError, csv.Error):
+        return
+    if not rows:
+        print("\n=== BATCH DONE: no summary rows were written for this campaign ===\n")
+        return
+    hashes = {row.get("config_hash") for row in rows}
+    not_converged = [f"{r['model']}/{r['seed']}" for r in rows if r.get("converged") != "True"]
+    noop = [f"{r['model']}/{r['seed']}" for r in rows if r.get("is_noop") == "True"]
+    lines = [
+        f"=== BATCH DONE: campaign {campaign_id} -- {len(rows)} run(s) ===",
+        f"config_hash: {'ONE (' + hashes.pop() + ')' if len(hashes) == 1 else 'MULTIPLE ' + str(sorted(hashes)) + ' -- NOT one campaign'}",
+        f"not converged: {len(not_converged)} {not_converged if not_converged else ''}",
+        f"no-op arms (decisions_effective == 0): {len(noop)} {noop if noop else ''}",
+        f"git_dirty rows: {sum(1 for r in rows if r.get('git_dirty') == 'True')}",
+    ]
+    pairs, unpaired = pair_against_baseline(rows)
+    if pairs:
+        path = write_paired_dv_csv(campaign_id, pairs)
+        lines.append(f"primary DV (net_person_hours_saved vs baseline, same seed) -> {path}")
+        by_model = {}
+        for pair in pairs:
+            by_model.setdefault(pair["model"], []).append(pair["net_person_hours_saved"])
+        for model_name, values in sorted(by_model.items()):
+            sd = statistics.pstdev(values) if len(values) > 1 else 0.0
+            lines.append(
+                f"  {model_name}: mean {statistics.fmean(values):+.4f} h  sd {sd:.4f}  n={len(values)}"
+            )
+    if unpaired:
+        lines.append(f"seeds without a baseline row (not paired): {unpaired}")
+    print("\n" + "\n".join(lines) + "\n")
+
+
+PAIRED_DV_HEADERS = (
+    "campaign_id", "seed", "model", "baseline_run_uuid", "arm_run_uuid",
+    "net_person_hours_saved", "bus_person_hours_saved", "car_person_hours_saved",
+    "net_person_hours_saved_stopped", "converged_both",
+)
+
+
+def pair_against_baseline(rows):
+    """The primary DV. For every non-baseline final-checkpoint row that has a
+    baseline (model == "None") row on the same seed, return
+    ``baseline − arm`` of the steady travel-delay person-hours (positive =
+    the arm saved person-hours), its bus/car split, and the same difference
+    on the stopped-delay measure. Returns ``(pairs, seeds_without_baseline)``.
+    Pure: takes CSV DictReader rows, so it can be re-run on any dataset."""
+    def num(row, key):
+        try:
+            return float(row.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    baselines = {row.get("seed"): row for row in rows if row.get("model") == "None"}
+    pairs, unpaired = [], set()
+    for row in rows:
+        if row.get("model") == "None":
+            continue
+        base = baselines.get(row.get("seed"))
+        if base is None:
+            unpaired.add(row.get("seed"))
+            continue
+
+        def diff(key):
+            b, a = num(base, key), num(row, key)
+            return round(b - a, 4) if b is not None and a is not None else None
+
+        pairs.append({
+            "campaign_id": row.get("campaign_id"),
+            "seed": row.get("seed"),
+            "model": row.get("model"),
+            "baseline_run_uuid": base.get("run_uuid"),
+            "arm_run_uuid": row.get("run_uuid"),
+            "net_person_hours_saved": diff("total_person_hours_travel_delay_steady"),
+            "bus_person_hours_saved": diff("bus_person_hours_travel_delay_steady"),
+            "car_person_hours_saved": diff("car_person_hours_travel_delay_steady"),
+            "net_person_hours_saved_stopped": diff("total_person_hours_delay_steady"),
+            "converged_both": (
+                base.get("converged") == "True" and row.get("converged") == "True"
+            ),
+        })
+    return pairs, sorted(unpaired, key=str)
+
+
+def write_paired_dv_csv(campaign_id, pairs):
+    """Atomically write paired_dv_<campaign>.csv beside experiment_summary.csv."""
+    path = EXPERIMENT_SUMMARY_PATH.with_name(f"paired_dv_{campaign_id}.csv")
+    tmp = path.with_suffix(".csv.tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PAIRED_DV_HEADERS)
+        writer.writeheader()
+        writer.writerows(pairs)
+    tmp.replace(path)  # atomic, same as os.replace
+    return path
+
+
 def poll_batch_runner():
     """Drive the Batch Benchmark Runner one tick at a time from inside the
     fixed simulation loop: batch progress can only be observed through the
@@ -1663,6 +2842,20 @@ def poll_batch_runner():
         runner = build_batch_runner()
         _batch_engine["runner"] = runner
         _batch_engine["phase"] = "IDLE"
+        # One campaign id for every run of this batch: what the summary
+        # rows, manifests and the end-of-batch checks group by.
+        runtime["campaign_id"] = str(uuid.uuid4())
+        _, dirty = _git_info()
+        if dirty:
+            print(
+                "\n!!! BATCH STARTED WITH UNCOMMITTED CHANGES -- git_dirty=True will be "
+                "recorded on every row; commit first if this is a campaign.\n"
+            )
+        if (config.get("test_duration_sim_seconds") or 0) < 1800:
+            print(
+                "\n!!! BATCH DURATION < 30 min: steady-state DVs rarely converge this "
+                "short (see converged / time_to_converge_sec).\n"
+            )
         runner.start(list(runtime.get("models", [])), list(runtime.get("seeds", [])))
         runtime["current"] = dict(runner.current) if runner.current else None
 
@@ -1673,6 +2866,8 @@ def poll_batch_runner():
             runtime["current"] = None
             runtime["results"] = list(runner.results)
             _batch_engine["runner"] = None
+            print_campaign_summary(runtime.get("campaign_id"))
+            runtime["campaign_id"] = None
         return
 
     if config.get("batch_stop_requested", False):
@@ -2022,6 +3217,11 @@ def perform_full_reset(vehicles, signals, telemetry=None):
     reset_session_logs()
     network_throughput.update({key: 0 for key in network_throughput})
     network_throughput_at_warmup.clear()
+    reset_run_metrics()
+    _run_summary_rows.clear()
+    _demand_draw_state["hash"] = hashlib.sha256()
+    control_panel.global_config["_run_uuid"] = str(uuid.uuid4())
+    control_panel.global_config["_run_started_wall"] = time.time()
     control_panel.global_config["test_failed_reason"] = ""
     if control_panel.global_config.get("test_running", False) and is_baseline_run():
         # The baseline arm has no controller: route flags left on by the
@@ -2082,6 +3282,7 @@ def _reset_state_for_model_change(state, model_type):
             "peak_active": False,
             "effective_rate_vpm": 0.0,
             "requested_arrivals": 0,
+            "offered_passengers": 0.0,
             "admitted_arrivals": 0,
             "overflow_arrivals": 0,
             "last_model": model_type,
@@ -2104,6 +3305,7 @@ def get_demand_telemetry():
             "peak_active": bool(state["peak_active"]),
             "pending_arrivals": int(state["pending_arrivals"]),
             "requested_arrivals": int(state["requested_arrivals"]),
+            "offered_passengers": round(float(state["offered_passengers"]), 3),
             "admitted_arrivals": int(state["admitted_arrivals"]),
             "overflow_arrivals": int(state["overflow_arrivals"]),
             "admission_suspended": admission_suspended,
@@ -2149,7 +3351,7 @@ def should_spawn_vehicle(approach_key, model_type, rate_v_m):
         state["effective_rate_vpm"] = effective_rate
         arrival_probability = 1.0 - math.exp(-effective_rate / 3600.0)
         if random.random() < arrival_probability:
-            state["requested_arrivals"] += 1
+            _record_demand_offer(approach_key, state)
             if state["pending_arrivals"] < MAX_PENDING_ARRIVALS:
                 state["pending_arrivals"] += 1
             else:
@@ -2166,7 +3368,9 @@ def should_spawn_vehicle(approach_key, model_type, rate_v_m):
         p_burst_start = lam_frame / MEAN_BURST_SIZE
 
         if random.random() < p_burst_start:
-            state["burst_queue"] += random.randint(1, 3)
+            burst = random.randint(1, 3)
+            state["burst_queue"] += burst
+            _record_demand_offer(approach_key, state, burst)
 
         if state["burst_queue"] > 0 and state["frames_since_spawn"] >= 18:
             state["frames_since_spawn"] = 0
@@ -2182,6 +3386,7 @@ def should_spawn_vehicle(approach_key, model_type, rate_v_m):
 
         p_metered = lam_frame * 2.0
         if random.random() < p_metered:
+            _record_demand_offer(approach_key, state)
             state["frames_since_spawn"] = 0
             return True
         return False
@@ -2191,6 +3396,7 @@ def should_spawn_vehicle(approach_key, model_type, rate_v_m):
         state["peak_active"] = False
         prob = 1.0 - math.exp(-lam_frame)
         if random.random() < prob:
+            _record_demand_offer(approach_key, state)
             state["frames_since_spawn"] = 0
             return True
         return False
@@ -2199,6 +3405,7 @@ def should_spawn_vehicle(approach_key, model_type, rate_v_m):
         state["effective_rate_vpm"] = float(rate_v_m)
         state["peak_active"] = False
         if random.random() < lam_frame:
+            _record_demand_offer(approach_key, state)
             state["frames_since_spawn"] = 0
             return True
         return False
@@ -2250,7 +3457,6 @@ def try_spawn_vehicle(
     state = spawner_states[approach_key]
     if model_type == CONGESTION_MODEL:
         state["pending_arrivals"] = max(0, state["pending_arrivals"] - 1)
-        state["admitted_arrivals"] += 1
         state["frames_since_spawn"] = 0
     elif model_type == "Neg Binomial" and state["burst_queue"] > 0:
         state["burst_queue"] -= 1
@@ -2281,6 +3487,7 @@ def try_spawn_vehicle(
             target_turn=target_turn, lane_index=lane_idx,
             assigned_node_x=assigned_node_x
         ))
+    state["admitted_arrivals"] += 1
 
 
 def check_and_dispatch_buses(vehicles, lane_options, dt):
@@ -2358,6 +3565,7 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
                 route_info=route_info, bus_id=unique_bus_id,
                 max_speed=1.0 * get_active_vehicle_speed_scale(),
             ))
+            run_metrics["buses_spawned"] += 1
 
 
 # --- Unified single-window shell --------------------------------------------
@@ -2901,6 +4109,7 @@ def build_simulation_canvas(parent):
 
 
 def main():
+    global _active_signal_controller
     # Seeding makes traffic generation reproducible, not LLM inference. The
     # valid benchmark is the same seed with one ARMED and one DISARMED run;
     # same-seed ARMED runs may diverge because model decisions can differ.
@@ -2917,6 +4126,7 @@ def main():
     screen = pygame.Surface((canvas.WIDTH, canvas.HEIGHT))
 
     signals = SignalController(global_config=control_panel.global_config, yellow_time=60, red_clearance_time=60)
+    _active_signal_controller = signals
     telemetry = TelemetryExporter(filename=TELEMETRY_PATH, export_interval_frames=10)
 
     lane_options = {
@@ -2962,9 +4172,15 @@ def main():
         control_panel.window_shape_hooks["cycle"] = shape_controller.cycle
 
     print("Launching LLM Control Agent...")
+    # stdin is a pipe the agent never reads for input: it watches for EOF,
+    # which arrives the moment this process dies for ANY reason (IDE stop,
+    # crash, frozen loop) -- not only the WM_DELETE_WINDOW path below. An
+    # agent that outlives its sim re-arms off the shared ai_control.json and
+    # drives the next session alongside the new agent (2026-09-20 audit).
     agent_proc = subprocess.Popen(
         [sys.executable, "-m", "src.agents.agent"],
         cwd=str(BASE_DIR),
+        stdin=subprocess.PIPE,
     )
 
     # 3. Register cleanup, then build the workbook after agent writes stop.
@@ -3102,8 +4318,10 @@ def main():
                         all_vehicles=vehicles,
                         signal_controller=signals
                     )
+                    _record_node_crossings(v)
                     if (v.x < -60 or v.x > canvas.WIDTH + 60 or v.y < -60 or v.y > canvas.HEIGHT + 60):
                         if len(getattr(v, "passed_nodes", set())) > 0:
+                            _record_completed_vehicle_delay(v)
                             passengers = int(getattr(v, "passengers", 0))
                             network_throughput["passengers_served_total"] += passengers
                             network_throughput["vehicles_served_total"] += 1
@@ -3118,7 +4336,7 @@ def main():
                 # Instrumentation only: samples post-update bus state and the
                 # controller's live priority requests for this frame.
                 bus_event_tracker.observe(vehicles, master_frame_count, signals)
-                accumulate_frame_metrics(vehicles)
+                accumulate_frame_metrics(vehicles, signals)
                 snapshot_warmup_baseline(master_frame_count)
                 
                 time_accumulator -= dt_step

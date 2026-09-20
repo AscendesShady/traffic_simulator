@@ -38,6 +38,7 @@ if str(BASE_DIR) not in sys.path:
 from src.ui import canvas_gemini as canvas  # noqa: E402
 from src.ui import control_panel  # noqa: E402
 from src.core import main  # noqa: E402
+from src.core.vehicle import lane_changes_suspended  # noqa: E402
 from src.core.signal_controller import SignalController  # noqa: E402
 
 FPS = 60
@@ -173,23 +174,24 @@ def measure(speed_scale, heavy_ratio=None, seed=20260909):
     # --- 1. Build a standing queue behind a red signal -------------------
     red = signal_state(False)
     build_frames = int(QUEUE_BUILD_LIMIT_SECONDS * FPS)
-    for frame in range(build_frames):
-        step(frame, red, spawning=True)
-        if len(queued_upstream(vehicles)) >= TARGET_QUEUE:
-            break
-    queue_at_release = len(queued_upstream(vehicles))
+    with lane_changes_suspended():   # one lane: nobody peels into the next
+        for frame in range(build_frames):
+            step(frame, red, spawning=True)
+            if len(queued_upstream(vehicles)) >= TARGET_QUEUE:
+                break
+        queue_at_release = len(queued_upstream(vehicles))
 
-    # --- 2. Release the green against a finite queue, no new arrivals ----
-    green = signal_state(True)
-    crossing_frames = []
-    mix = []
-    discharge_frames = int(DISCHARGE_LIMIT_SECONDS * FPS)
-    for frame in range(discharge_frames):
-        for vehicle in step(frame, green, spawning=False):
-            crossing_frames.append(frame)
-            mix.append("truck" if vehicle.is_heavy else "car")
-        if not queued_upstream(vehicles):
-            break   # queue exhausted; anything later is not saturated flow
+        # --- 2. Release the green against a finite queue, no new arrivals
+        green = signal_state(True)
+        crossing_frames = []
+        mix = []
+        discharge_frames = int(DISCHARGE_LIMIT_SECONDS * FPS)
+        for frame in range(discharge_frames):
+            for vehicle in step(frame, green, spawning=False):
+                crossing_frames.append(frame)
+                mix.append("truck" if vehicle.is_heavy else "car")
+            if not queued_upstream(vehicles):
+                break   # queue exhausted; anything later is not saturated flow
 
     # --- 3. Saturation headway from the steady-state vehicles ------------
     headways = [

@@ -27,7 +27,10 @@ from src.ui import control_panel
 from src.core import guard
 from src.core import webster
 from src.experiments import batch_runner
-from src.core.vehicle import Vehicle, Bus, DBL_LANE_INDEX, BUS_PASSENGERS
+from src.core import vehicle as vehicle_module
+from src.core.vehicle import (
+    Vehicle, Bus, DBL_LANE_INDEX, BUS_PASSENGERS, lane_changes_suspended,
+)
 from src.core.signal_controller import SignalController, TSP_MAX_ADJUST_FRACTION, MIN_GREEN_FRAMES
 from src.ui.telemetry_dashboard import TelemetryDashboard, build_excel_export_filename
 from src.telemetry.telemetry_exporter import TelemetryExporter
@@ -43,6 +46,10 @@ from src.telemetry import real_world_units
 # STOCHASTIC SPAWNER ENGINE (COMPOUND POISSON / EXACT RATE)
 # ==========================================================
 CONGESTION_MODEL = "Congestion Peak"
+# A vehicle whose centre is within this of a spawn lane's centre blocks a
+# spawn there: one vehicle width (widest is the 14 px bus), so a vehicle
+# sliding between lanes counts for the lane it is straddling.
+SPAWN_LATERAL_BLOCK_PX = 15.0
 CONGESTION_PEAK_SECONDS = 30
 CONGESTION_RECOVERY_SECONDS = 30
 CONGESTION_RATE_MULTIPLIER = 4.0
@@ -256,6 +263,9 @@ def _config_regime_hash(config):
         # Geometry is part of the regime: rows from a different network
         # length must never pair with these.
         "geometry": [canvas.WIDTH, canvas.HEIGHT, canvas.H_Y, list(canvas.INT_X)],
+        # So are the movement-model tunables: following law and lane-change
+        # incentives change capacity, so rows across a retune never pair.
+        "movement": vehicle_module.movement_model_signature(),
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
@@ -3128,18 +3138,19 @@ def calibrate_saturation_flow(
         return crossings
 
     red = _calibration_signals(False)
-    for _ in range(int(CALIBRATION_BUILD_LIMIT_SEC * 60)):
-        step(red, spawning=True)
-        if len(queued()) >= target_queue:
-            break
-
     green = _calibration_signals(True)
     crossing_frames = []
-    for frame in range(int(CALIBRATION_DISCHARGE_LIMIT_SEC * 60)):
-        for _ in range(step(green, spawning=False)):
-            crossing_frames.append(frame)
-        if not queued():
-            break
+    with lane_changes_suspended():
+        for _ in range(int(CALIBRATION_BUILD_LIMIT_SEC * 60)):
+            step(red, spawning=True)
+            if len(queued()) >= target_queue:
+                break
+
+        for frame in range(int(CALIBRATION_DISCHARGE_LIMIT_SEC * 60)):
+            for _ in range(step(green, spawning=False)):
+                crossing_frames.append(frame)
+            if not queued():
+                break
 
     control_panel.global_config["_active_vehicle_speed_scale"] = previous_scale
 
@@ -3444,12 +3455,14 @@ def try_spawn_vehicle(
 
     target_lane_coord = lane_coords[lane_idx]
 
-    # Entry Clearance Check
+    # Entry Clearance Check. The lateral window is a vehicle width, not a
+    # lane-centre tolerance, so a vehicle mid-slide between lanes still
+    # blocks the lane it is straddling.
     for v in vehicles:
         if v.direction == direction:
-            if direction in ("EB", "WB") and abs(v.x - spawn_coord) < min_gap and abs(v.y - target_lane_coord) < 8:
+            if direction in ("EB", "WB") and abs(v.x - spawn_coord) < min_gap and abs(v.y - target_lane_coord) < SPAWN_LATERAL_BLOCK_PX:
                 return
-            elif direction in ("NB", "SB") and abs(v.y - spawn_coord) < min_gap and abs(v.x - target_lane_coord) < 8:
+            elif direction in ("NB", "SB") and abs(v.y - spawn_coord) < min_gap and abs(v.x - target_lane_coord) < SPAWN_LATERAL_BLOCK_PX:
                 return
 
     state = spawner_states[approach_key]
@@ -3530,9 +3543,9 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
             for v in vehicles:
                 if v.direction == direction:
                     same_lane = (
-                        abs(v.y - target_lane_coord) < 8
+                        abs(v.y - target_lane_coord) < SPAWN_LATERAL_BLOCK_PX
                         if direction in ("EB", "WB")
-                        else abs(v.x - target_lane_coord) < 8
+                        else abs(v.x - target_lane_coord) < SPAWN_LATERAL_BLOCK_PX
                     )
                     longitudinal_gap = (
                         abs(v.x - spawn_coord)
@@ -3652,6 +3665,9 @@ LARGE_WINDOW_SCREEN_MARGIN_Y = 80
 # ~15Hz (see build_simulation_canvas). Maximized on a 2560-wide screen is
 # ~3.2x and stays at the full push rate.
 SCALED_PUSH_SKIP_FACTOR = 4
+# Mouse-wheel view zoom ceiling: 6x shows a 400x100 px window of the world,
+# one node and its approaches at ~3x display size.
+MAX_VIEW_ZOOM = 6.0
 
 
 def side_pane_widths_for(shape, screen_width):
@@ -4076,7 +4092,59 @@ def build_simulation_canvas(parent):
         "scaled": None,
         "push_every": 1,
         "pushes": 0,
+        # View zoom: display only. A zoomed push crops a WIDTH/zoom x
+        # HEIGHT/zoom window of the physics surface around (cx, cy) before
+        # scaling, so the world, the telemetry and the agent never see it.
+        "zoom": 1.0,
+        "cx": canvas.WIDTH / 2.0,
+        "cy": canvas.HEIGHT / 2.0,
+        "drag": None,
     }
+
+    def view_rect():
+        zoom = state["zoom"]
+        w, h = canvas.WIDTH / zoom, canvas.HEIGHT / zoom
+        state["cx"] = min(max(state["cx"], w / 2.0), canvas.WIDTH - w / 2.0)
+        state["cy"] = min(max(state["cy"], h / 2.0), canvas.HEIGHT - h / 2.0)
+        return pygame.Rect(
+            int(state["cx"] - w / 2.0), int(state["cy"] - h / 2.0), int(w), int(h)
+        )
+
+    def set_zoom(zoom, at=None):
+        """Zoom the view; ``at`` is a (canvas_x, canvas_y) pixel to keep fixed."""
+        zoom = min(max(float(zoom), 1.0), MAX_VIEW_ZOOM)
+        if at is not None:
+            # World point under the cursor stays under the cursor.
+            rect = view_rect()
+            fx, fy = at[0] / state["target"][0], at[1] / state["target"][1]
+            wx, wy = rect.x + fx * rect.w, rect.y + fy * rect.h
+            w, h = canvas.WIDTH / zoom, canvas.HEIGHT / zoom
+            state["cx"], state["cy"] = wx - (fx - 0.5) * w, wy - (fy - 0.5) * h
+        state["zoom"] = zoom
+        if zoom == 1.0:
+            state["cx"], state["cy"] = canvas.WIDTH / 2.0, canvas.HEIGHT / 2.0
+        state["scaled"] = (
+            None if zoom == 1.0 and state["target"] == native_size
+            else pygame.Surface(state["target"])
+        )
+
+    def on_wheel(event):
+        step = 1.25 if event.delta > 0 else 1 / 1.25
+        set_zoom(state["zoom"] * step, at=(event.x, event.y))
+
+    def on_drag(event):
+        if state["drag"] is not None:
+            dx, dy = event.x - state["drag"][0], event.y - state["drag"][1]
+            px = canvas.WIDTH / state["zoom"] / state["target"][0]
+            state["cx"] -= dx * px
+            state["cy"] -= dy * px
+        state["drag"] = (event.x, event.y)
+
+    simulation_canvas.bind("<MouseWheel>", on_wheel)
+    simulation_canvas.bind("<ButtonPress-1>", on_drag)
+    simulation_canvas.bind("<B1-Motion>", on_drag)
+    simulation_canvas.bind("<ButtonRelease-1>", lambda e: state.update(drag=None))
+    simulation_canvas.bind("<Double-Button-1>", lambda e: set_zoom(1.0))
 
     def set_target_size(width, height):
         target = (int(width), int(height))
@@ -4088,7 +4156,10 @@ def build_simulation_canvas(parent):
         # data until it is resized explicitly.
         photo.configure(width=target[0], height=target[1])
         state["header"] = f"P6 {target[0]} {target[1]} 255 ".encode("ascii")
-        state["scaled"] = None if target == native_size else pygame.Surface(target)
+        state["scaled"] = (
+            None if target == native_size and state["zoom"] == 1.0
+            else pygame.Surface(target)
+        )
         native_pixels = canvas.WIDTH * canvas.HEIGHT
         state["push_every"] = (
             2 if target[0] * target[1] > SCALED_PUSH_SKIP_FACTOR * native_pixels else 1
@@ -4100,6 +4171,8 @@ def build_simulation_canvas(parent):
             return
         scaled = state["scaled"]
         if scaled is not None:
+            if state["zoom"] != 1.0:
+                surface = surface.subsurface(view_rect())
             surface = pygame.transform.smoothscale(surface, state["target"], scaled)
         photo.configure(
             data=state["header"] + pygame.image.tostring(surface, "RGB"),
@@ -4114,6 +4187,8 @@ def build_simulation_canvas(parent):
         simulation_canvas.update_idletasks()
 
     simulation_canvas.set_target_size = set_target_size
+    simulation_canvas.set_view_zoom = set_zoom
+    simulation_canvas.view_rect = view_rect
     return simulation_canvas, push_frame
 
 

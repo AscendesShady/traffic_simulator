@@ -151,9 +151,12 @@ def test_production_congestion_peak_builds_a_queue_without_crashing():
                 if -60 <= vehicle.x <= WIDTH + 60
                 and -60 <= vehicle.y <= HEIGHT + 60
             ]
+            # Queued = stopped or crawling behind a leader; followers now
+            # creep with the car ahead instead of sitting at 0 until a full
+            # gap opens, so a queue is not a row of speed-0 vehicles.
             max_road_queue = max(
                 max_road_queue,
-                sum(vehicle.speed < 0.25 for vehicle in vehicles),
+                sum(vehicle.speed < 0.5 for vehicle in vehicles),
             )
 
         state = main.spawner_states["EB"]

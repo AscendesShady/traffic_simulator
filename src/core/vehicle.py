@@ -1,4 +1,7 @@
 # vehicle.py
+import contextlib
+import random
+
 import pygame
 
 from src.ui.canvas_gemini import INT_X
@@ -40,6 +43,54 @@ DBL_MERGE_YIELD_SPEED_RATIO = 0.5
 # ponytail: 10% of free flow; tune against measured queue-discharge speed.
 ETA_MIN_SPEED_PX_PER_FRAME = 0.05
 ETA_MAX_FRAMES = 6000.0
+# Car-following: stop inside SAFE_GAP, follow at a gap-proportional speed
+# up to FOLLOW_FREE_GAP, free flow beyond it.
+SAFE_GAP_PX = 12.0
+FOLLOW_FREE_GAP_PX = SAFE_GAP_PX + 25.0
+# Discretionary lane changes (MOBIL-lite: Kesting/Treiber/Helbing 2007 incentive
+# and safety criteria on this sim's gap-based following law). Only straight
+# cars, only between the two general lanes -- lane 2 stays the left-turn/DBL
+# lane -- and only upstream, clear of the stop-bar approach. Incentive is the
+# follow-speed gain as a fraction of the driver's own desired speed; moving
+# inward (lane 1) must gain LANE_CHANGE_GAIN + LANE_CHANGE_KEEP_OUTER_BIAS,
+# moving outward (lane 0) may even lose up to the bias, so free-flowing
+# traffic drifts out and the inner lane stays open for overtaking (MOBIL's
+# asymmetric keep-right rule, mirrored for this network). The per-frame hazard
+# keeps a platoon from changing in lockstep; it is the only stochastic term
+# and draws from the run-seeded global RNG.
+DISCRETIONARY_LANES = (0, 1)
+LANE_CHANGE_GAIN = 0.10
+LANE_CHANGE_KEEP_OUTER_BIAS = 0.10
+LANE_CHANGE_MIN_DIST_TO_BAR_PX = 150.0
+LANE_CHANGE_REAR_GAP_PX = 30.0
+LANE_CHANGE_HAZARD_PER_FRAME = 1.0 / 120.0  # mean 2 s between considerations
+
+
+def movement_model_signature():
+    """The tunables that set capacity, for experiment_summary's config_hash."""
+    return {
+        "safe_gap": SAFE_GAP_PX,
+        "follow_free_gap": FOLLOW_FREE_GAP_PX,
+        "lane_change": [
+            list(DISCRETIONARY_LANES), LANE_CHANGE_GAIN, LANE_CHANGE_KEEP_OUTER_BIAS,
+            LANE_CHANGE_MIN_DIST_TO_BAR_PX, LANE_CHANGE_REAR_GAP_PX,
+            LANE_CHANGE_HAZARD_PER_FRAME,
+        ],
+    }
+
+
+@contextlib.contextmanager
+def lane_changes_suspended():
+    """No discretionary lane changes inside the block. The saturation-flow
+    calibrators discharge one standing lane; cars peeling into the empty
+    neighbour would turn that into a two-lane count."""
+    global LANE_CHANGE_HAZARD_PER_FRAME
+    saved = LANE_CHANGE_HAZARD_PER_FRAME
+    LANE_CHANGE_HAZARD_PER_FRAME = 0.0
+    try:
+        yield
+    finally:
+        LANE_CHANGE_HAZARD_PER_FRAME = saved
 
 
 def eta_frames_to_stop_bar(distance_px, speed_px_per_frame):
@@ -69,6 +120,25 @@ def corridor_blockers(mover, desired_y, all_vehicles):
         other_min = other.y - other.width / 2.0
         other_max = other.y + other.width / 2.0
         if not (other_min < corridor_max and other_max > corridor_min):
+            continue
+        if abs(other.x - mover.x) < (mover.length + other.length) / 2.0 + 15:
+            blockers.append(other)
+    return blockers
+
+
+def lane_band_blockers(mover, desired_y, all_vehicles):
+    """Same-direction vehicles alongside `mover` in the lane centred on
+    ``desired_y`` only. Unlike corridor_blockers this ignores the lane the
+    mover is leaving: a leader a car-length ahead in the origin lane is a
+    following-distance matter, not a lateral one, and must not pin a car
+    that wants (or is told) to move over."""
+    band_min = desired_y - mover.width / 2.0
+    band_max = desired_y + mover.width / 2.0
+    blockers = []
+    for other in all_vehicles or []:
+        if other is mover or other.direction != mover.direction:
+            continue
+        if not (other.y - other.width / 2.0 < band_max and other.y + other.width / 2.0 > band_min):
             continue
         if abs(other.x - mover.x) < (mover.length + other.length) / 2.0 + 15:
             blockers.append(other)
@@ -252,13 +322,16 @@ class Vehicle:
     def is_target_lane_clear(self, desired_y, all_vehicles):
         return not corridor_blockers(self, desired_y, all_vehicles)
 
+    def is_lane_band_clear(self, desired_y, all_vehicles):
+        return not lane_band_blockers(self, desired_y, all_vehicles)
+
     def choose_vacate_lane(self, candidate_lanes, h_y, lane_w, all_vehicles):
-        """First lane in `candidate_lanes` whose whole corridor is clear."""
+        """First lane in `candidate_lanes` with nobody alongside in it."""
         for lane_index in candidate_lanes:
             if lane_index == self.lane_index:
                 continue
             desired_y = self.lane_center_y(lane_index, h_y, lane_w)
-            if self.is_target_lane_clear(desired_y, all_vehicles):
+            if self.is_lane_band_clear(desired_y, all_vehicles):
                 return lane_index
         return None
 
@@ -277,7 +350,10 @@ class Vehicle:
         if vehicle_is_inside_any_intersection(self, int_x_list, h_y, road_w):
             return
         desired_y = self.lane_center_y(self.lane_vacate_target, h_y, lane_w)
-        if not self.is_target_lane_clear(desired_y, all_vehicles):
+        # Lateral safety only: the leader ahead in the lane being left is
+        # already handled by the following law (it overlaps the mover's y
+        # for the whole slide).
+        if not self.is_lane_band_clear(desired_y, all_vehicles):
             return
         if abs(self.y - desired_y) > 1.0:
             self.y += (
@@ -301,23 +377,76 @@ class Vehicle:
                 self.assigned_node_x = min(sorted_nodes, key=lambda cx: abs(self.x - cx))
             return self.assigned_node_x
 
-    def get_lead_vehicle_distance(self, all_vehicles):
+    def follow_target_speed(self, lead_dist):
+        """Speed the following law aims for at this gap to the leader."""
+        if lead_dist < SAFE_GAP_PX:
+            return 0.0
+        if lead_dist < FOLLOW_FREE_GAP_PX:
+            return min(self.max_speed, (lead_dist / 30.0) * self.max_speed)
+        return self.max_speed
+
+    def rear_vehicle_gap(self, all_vehicles, at_y):
+        """Bumper gap to the nearest same-direction vehicle behind, in the
+        lane centred on ``at_y``; inf when that lane is empty behind."""
+        gap = float("inf")
+        for other in all_vehicles or []:
+            if other is self or other.direction != self.direction:
+                continue
+            if abs(other.y - at_y) >= 8.0:
+                continue
+            if self.direction == "EB":
+                behind = other.x < self.x
+            else:
+                behind = other.x > self.x
+            if behind:
+                gap = min(gap, abs(other.x - self.x) - (other.length + self.length) / 2.0)
+        return gap
+
+    def choose_discretionary_lane(self, h_y, lane_w, all_vehicles):
+        """MOBIL-lite: the other general lane, if it is safe and pays."""
+        current = self.follow_target_speed(self.get_lead_vehicle_distance(all_vehicles))
+        for lane_index in DISCRETIONARY_LANES:
+            if lane_index == self.lane_index:
+                continue
+            desired_y = self.lane_center_y(lane_index, h_y, lane_w)
+            # Safety: nobody alongside in that lane, and the new follower is
+            # not pushed into its braking band.
+            if not self.is_lane_band_clear(desired_y, all_vehicles):
+                continue
+            if self.rear_vehicle_gap(all_vehicles, desired_y) < LANE_CHANGE_REAR_GAP_PX:
+                continue
+            there = self.follow_target_speed(
+                self.get_lead_vehicle_distance(all_vehicles, at_y=desired_y)
+            )
+            gain = (there - current) / self.max_speed
+            inward = lane_index > self.lane_index
+            threshold = (
+                LANE_CHANGE_GAIN + LANE_CHANGE_KEEP_OUTER_BIAS
+                if inward
+                else -LANE_CHANGE_KEEP_OUTER_BIAS
+            )
+            if gain > threshold:
+                return lane_index
+        return None
+
+    def get_lead_vehicle_distance(self, all_vehicles, at_y=None):
         if not all_vehicles: return float('inf')
         min_dist = float('inf')
         my_half_w = self.width / 2.0
-        
+        my_y = self.y if at_y is None else at_y
+
         for other in all_vehicles:
             if other is self: continue
-            
+
             if other.direction in ("EB", "WB"):
                 o_min_y, o_max_y = other.y - other.width/2.0, other.y + other.width/2.0
                 o_min_x, o_max_x = other.x - other.length/2.0, other.x + other.length/2.0
             else:
                 o_min_y, o_max_y = other.y - other.length/2.0, other.y + other.length/2.0
                 o_min_x, o_max_x = other.x - other.width/2.0, other.x + other.width/2.0
-                
+
             if self.direction in ("EB", "WB"):
-                if not (self.y + my_half_w <= o_min_y or self.y - my_half_w >= o_max_y):
+                if not (my_y + my_half_w <= o_min_y or my_y - my_half_w >= o_max_y):
                     if self.direction == "EB" and o_min_x > self.x:
                         dist = o_min_x - (self.x + self.length/2.0)
                         if 0 <= dist < min_dist: min_dist = dist
@@ -477,6 +606,25 @@ class Vehicle:
                 else:
                     self.dbl_merge_yield_slow = True
 
+        # 1c. DISCRETIONARY LANE CHANGE. A straight car in a general lane,
+        #     upstream and clear of the stop-bar approach, occasionally asks
+        #     whether the other general lane pays (choose_discretionary_lane)
+        #     and rides the same cooperative slide as a DBL eviction.
+        if (
+            not isinstance(self, Bus)
+            and self.direction in ("EB", "WB")
+            and self.target_turn == "STRAIGHT"
+            and self.lane_vacate_target is None
+            and self.lane_index in DISCRETIONARY_LANES
+            and upstream
+            and self.distance_to_node_stop_bar(target_node_x, h_y, road_w, stop_offset)
+            > LANE_CHANGE_MIN_DIST_TO_BAR_PX
+            and random.random() < LANE_CHANGE_HAZARD_PER_FRAME
+        ):
+            self.lane_vacate_target = self.choose_discretionary_lane(
+                h_y, lane_w, all_vehicles
+            )
+
         self.step_lane_vacate(int_x_list, h_y, road_w, lane_w, all_vehicles)
 
         # A bus changing lanes between route legs owns a small cooperative
@@ -543,16 +691,18 @@ class Vehicle:
 
         # 3. KINEMATICS
         lead_dist = max(0.0, self.get_lead_vehicle_distance(all_vehicles))
-        SAFE_GAP = 12.0
+        target_speed = self.follow_target_speed(lead_dist)
 
-        if lead_dist < SAFE_GAP or should_stop:
+        if target_speed <= 0.0 or should_stop:
             should_stop = True
             self.speed = 0.0
-        elif lead_dist < SAFE_GAP + 25.0:
-            target_speed = min(self.max_speed, (lead_dist / 30.0) * self.max_speed)
-            self.speed = max(0.0, self.speed - 0.05) if self.speed > target_speed else self.speed
+        elif self.speed > target_speed:
+            self.speed = max(target_speed, self.speed - 0.05)
         else:
-            self.speed = min(self.max_speed, self.speed + 0.05)
+            # Ramp toward the gap-proportional (or free-flow) target: a queued
+            # vehicle pulls away as soon as the one ahead does, instead of
+            # sitting until a full FOLLOW_FREE_GAP_PX opens up.
+            self.speed = min(target_speed, self.speed + 0.05)
 
         if self.dbl_merge_yield_slow and not should_stop:
             self.speed = min(self.speed, self.max_speed * DBL_MERGE_YIELD_SPEED_RATIO)

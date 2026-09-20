@@ -19,7 +19,9 @@ _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 from src.core import guard
+from src.core.signal_controller import TSP_MAX_ADJUST_FRACTION
 from src.agents import rule_controller
+from src.ui import control_panel
 
 try:
     import ollama
@@ -123,14 +125,36 @@ ROUTE_ORDER_TEXT = "\n".join(
     for position, route_id in enumerate(guard.ROUTE_ORDER, start=1)
 )
 SYSTEM_PROMPT = f"""You add transit signal priority on top of two signalized
-nodes that are already running Webster-optimal timing. Each turn you decide
-only which bus routes get TSP (an early or extended green at the bus's target
-node) and DBL (the left-most approach lane reserved for that bus).
+nodes (NODE {control_panel.NODE_A_X} is upstream of NODE
+{control_panel.NODE_B_X} for eastbound traffic, the reverse for westbound)
+that are already running Webster-optimal timing. Each turn you decide only
+which bus routes get TSP and DBL. You never set a signal.
 
 OBJECTIVE: the fewest person-hours of delay across everyone in the network,
-bus riders and cross-street drivers alike, at the same passenger throughput.
+bus riders and cross-street drivers alike, and the most passengers moved
+through the nodes per minute. A bus carries 45 passengers, a car 4, a truck 1.
 A grant helps only when the bus riders it saves outnumber the cross-street
 passengers it holds.
+
+WHAT THE KNOBS DO:
+- TSP on a route asks the controller to serve that route's nearest
+  approaching bus at its target node: extend the current green until the bus
+  clears, or cut the conflicting phase short so its green starts early. Either
+  adjustment is capped at {int(TSP_MAX_ADJUST_FRACTION * 100)}% of the
+  phase's green, and the cross street always still gets its yellow, all-red
+  and minimum green. The controller only considers a bus inside the
+  eligibility distance of its node, and withholds an early green it cannot
+  deliver (the cut would not beat the bus to the stop bar, or the bus would
+  arrive outside the green it brings forward); such a bus finishes DENIED. A
+  TSP flag only requests: it never moves the bus, and a bus stuck in a queue
+  cannot use it.
+- DBL on a route reserves the left-most approach lane (lane 2) at that bus's
+  target node for the bus alone: every car in that lane is ordered out and the
+  bus merges into it. It helps only when the bus is queued behind cars it can
+  pass; it costs the cars a lane. DBL and TSP are independent: a route can
+  have either, both or neither.
+- A grant applies to the whole route (all its buses), is re-evaluated by you
+  every turn, and stays in force on a bus already being served (LOCKED).
 
 THE TSP TEST, for each route with an approaching bus (every number is on that
 route's ROUTES line):
@@ -141,7 +165,9 @@ route's ROUTES line):
   Set tsp=false.
 - cross_pax is the passengers queued on the approaches a grant would hold at
   red. If cross_pax >= passengers, set tsp=false: you would delay more people
-  than you help.
+  than you help. (Head-counts are the proxy: the bus saves up to one red, the
+  cross street loses at most one capped adjustment, so a bus with more riders
+  than the cross queue is a net gain.)
 - actionable=false: the bus arrives before your decision lands
   (eta_at_decision_land_sec <= 0) or is too far out to plan for. Set tsp=false.
 - Grant at most ONE route per node per turn. If two qualify at one node, take

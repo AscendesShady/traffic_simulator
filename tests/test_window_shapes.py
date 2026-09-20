@@ -195,6 +195,45 @@ def test_push_frame_scales_only_when_the_target_differs(monkeypatch):
         host.destroy()
 
 
+def test_view_zoom_crops_the_surface_and_is_display_only(monkeypatch):
+    host = tk.Tk()
+    sources = []
+    real = pygame.transform.smoothscale
+
+    def recording(surface, size, dest=None):
+        sources.append(surface.get_size())
+        return real(surface, size, dest)
+
+    monkeypatch.setattr(main.pygame.transform, "smoothscale", recording)
+    try:
+        simulation_canvas, push_frame = build_canvas(host)
+        surface = pygame.Surface((canvas.WIDTH, canvas.HEIGHT))
+        surface.fill((1, 2, 3))
+        simulation_canvas.set_view_zoom(2.0)
+        push_frame(surface)
+        assert sources == [(canvas.WIDTH // 2, canvas.HEIGHT // 2)]
+        assert simulation_canvas.view_rect().center == (canvas.WIDTH // 2, canvas.HEIGHT // 2)
+        # Zooming keeps the world point under the cursor fixed: from zoom 2
+        # the top-left corner shows world (600, 150), and it still does at 4.
+        simulation_canvas.set_view_zoom(4.0, at=(0, 0))
+        assert simulation_canvas.view_rect().topleft == (600, 150)
+        simulation_canvas.set_view_zoom(1.0)
+        simulation_canvas.set_view_zoom(4.0, at=(0, 0))
+        assert simulation_canvas.view_rect().topleft == (0, 0)
+        assert simulation_canvas.set_view_zoom(99) is None
+        assert simulation_canvas.view_rect().size == (
+            int(canvas.WIDTH / main.MAX_VIEW_ZOOM), int(canvas.HEIGHT / main.MAX_VIEW_ZOOM)
+        )
+        # The physics surface itself is untouched by zooming.
+        assert surface.get_size() == (canvas.WIDTH, canvas.HEIGHT)
+        simulation_canvas.set_view_zoom(1.0)
+        sources.clear()
+        push_frame(surface)
+        assert sources == []
+    finally:
+        host.destroy()
+
+
 def test_push_frame_halves_its_rate_above_the_pixel_threshold(monkeypatch):
     host = tk.Tk()
     pushes = []

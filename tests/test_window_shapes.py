@@ -226,6 +226,10 @@ def test_view_zoom_crops_the_surface_and_is_display_only(monkeypatch):
         )
         # The physics surface itself is untouched by zooming.
         assert surface.get_size() == (canvas.WIDTH, canvas.HEIGHT)
+        # Left and middle button both pan, in whatever shape the canvas is.
+        for button in (1, 2):
+            assert simulation_canvas.bind(f"<B{button}-Motion>")
+            assert simulation_canvas.bind(f"<ButtonPress-{button}>")
         simulation_canvas.set_view_zoom(1.0)
         sources.clear()
         push_frame(surface)

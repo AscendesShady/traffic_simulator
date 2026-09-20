@@ -4140,10 +4140,16 @@ def build_simulation_canvas(parent):
             state["cy"] -= dy * px
         state["drag"] = (event.x, event.y)
 
+    # Bound on the canvas widget itself, so they hold in every window shape
+    # (compact, large, maximized): the shape controller only resizes it.
+    # Left or middle button pans.
     simulation_canvas.bind("<MouseWheel>", on_wheel)
-    simulation_canvas.bind("<ButtonPress-1>", on_drag)
-    simulation_canvas.bind("<B1-Motion>", on_drag)
-    simulation_canvas.bind("<ButtonRelease-1>", lambda e: state.update(drag=None))
+    for button in (1, 2):
+        simulation_canvas.bind(f"<ButtonPress-{button}>", on_drag)
+        simulation_canvas.bind(f"<B{button}-Motion>", on_drag)
+        simulation_canvas.bind(
+            f"<ButtonRelease-{button}>", lambda e: state.update(drag=None)
+        )
     simulation_canvas.bind("<Double-Button-1>", lambda e: set_zoom(1.0))
 
     def set_target_size(width, height):

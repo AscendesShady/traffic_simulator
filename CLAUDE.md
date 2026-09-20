@@ -92,7 +92,7 @@ Physics is a fixed 60 Hz step (`dt_step = 1/60`); `sim_speed` controls how many 
 
 One following law, `Vehicle.follow_target_speed`: stop under `SAFE_GAP_PX` (12), follow at gap/30 × own desired speed up to `FOLLOW_FREE_GAP_PX` (37), free flow beyond; kinematics ramp ±0.05/frame *toward* it in both directions (a queued vehicle pulls away as soon as its leader does). Straight cars make MOBIL-lite discretionary lane changes between lanes 0 and 1 only (lane 2 is the left-turn/DBL lane): incentive is follow-speed gain as a fraction of the driver's own heterogeneous desired speed (inward needs +20 %, outward may lose 10 % — keep-outer), safety is nobody alongside in the target lane and ≥ 30 px behind, considered with a 1/120 per-frame hazard from the run-seeded RNG. No per-lane speed cap: the travel-delay DV measures against each vehicle's own `max_speed`. All cooperative slides (`step_lane_vacate`) check only the target lane band. `vehicle.lane_changes_suspended()` wraps the single-lane saturation calibrators, and `movement_model_signature()` is part of `config_hash`. See `docs/audits/2026-09-20-bus-stalls-on-green-and-lane-changes.md`.
 
-The sim pane zooms (mouse wheel, drag to pan, double-click to reset) by cropping the physics surface before the smoothscale in `build_simulation_canvas`; it is display-only and invisible to telemetry and the agent.
+The sim pane zooms (mouse wheel; left- or middle-drag to pan; double-click to reset — bound on the canvas widget, so it works in every window shape) by cropping the physics surface before the smoothscale in `build_simulation_canvas`; it is display-only and invisible to telemetry and the agent.
 
 ### Passenger-throughput objective
 

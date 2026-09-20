@@ -19,7 +19,7 @@ from src.core.signal_controller import SignalController
 from src.telemetry.telemetry_exporter import TelemetryExporter
 from src.core.vehicle import Bus, Vehicle
 from src.ui.canvas_gemini import H_Y, LANE
-from tests.helpers import make_bus_for_leg
+from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 
 
 # --------------------------------------------------------------------------
@@ -200,7 +200,7 @@ def test_checkpoint_filenames_unique():
 def test_accumulate_frame_metrics_splits_by_mode():
     """A queued bus contributes its full 45 passengers per frame to the bus
     accumulator; a queued car contributes its 4 to the car accumulator."""
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "DELAY_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "DELAY_BUS")
     bus.speed = 0.0
     car = Vehicle(0, H_Y - 0.5 * LANE, "EB")
     car.speed = 0.0
@@ -641,7 +641,7 @@ def test_travel_delay_counts_crawl_that_stopped_delay_misses():
     vehicle at max_speed adds 0, at half speed adds pax/2 per frame, and a
     stopped one adds pax per frame (equal to its stopped-delay contribution).
     Stopped delay sees only the third."""
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "TRAVEL_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "TRAVEL_BUS")
     bus.speed = 0.0
     car_free = Vehicle(0, H_Y - 0.5 * LANE, "EB")
     car_free.speed = car_free.max_speed

@@ -12,6 +12,7 @@ import src.ui.control_panel as control_panel
 import src.core.main as main
 import src.telemetry.real_world_units as units
 from src.core.vehicle import Vehicle
+from tests.helpers import NODE_A, NODE_B
 
 
 def test_time_conversion_exact():
@@ -135,7 +136,7 @@ def test_units_vc_agrees_with_webster_by_construction():
         config, control_panel.approach_configs, control_panel.APPROACH_NAMES
     )
     flow_rows = {r["quantity"]: r for s in sections if s["title"] == "Flow" for r in s["rows"]}
-    split = config["webster_splits"][300]
+    split = config["webster_splits"][NODE_A]
     g_over_c = split["EW_green_sec"] / split["cycle_time_sec"]
     expected = split["y_ew"] / g_over_c
     note = flow_rows["EB Corridor demand"]["note"]

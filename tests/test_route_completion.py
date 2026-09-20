@@ -4,6 +4,7 @@ import src.ui.control_panel as control_panel
 from src.ui.canvas_gemini import HEIGHT, H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
 from src.core.signal_controller import SignalController
 from src.core.vehicle import Bus
+from tests.helpers import NODE_A, NODE_B
 
 
 @pytest.mark.parametrize("route_id", list(control_panel.bus_routes_config))
@@ -12,7 +13,7 @@ def test_each_bus_route_completes_unobstructed_with_priority(route_id):
     config["tsp_enabled"] = True
     config["dbl_enabled"] = True
     direction = config["origin"]
-    first_node = 300 if direction == "EB" else 700
+    first_node = NODE_A if direction == "EB" else NODE_B
     lane_index = config["lanes"][first_node]
     y = H_Y - (lane_index + 0.5) * LANE if direction == "EB" else H_Y + (lane_index + 0.5) * LANE
     route_info = {

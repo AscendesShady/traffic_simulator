@@ -19,7 +19,7 @@ import src.agents.rule_controller as rc
 from src.telemetry.bus_event_log import BusEventTracker
 from src.ui.canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
 from src.core.signal_controller import TSP_ACTION_EXTENDING, SignalController
-from tests.helpers import make_bus_for_leg
+from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 
 
 @pytest.fixture(autouse=True)
@@ -74,8 +74,8 @@ def flags_by_route(decision):
 
 def test_rule_grants_tsp_for_uncontested_bus():
     snapshot = telemetry(
-        [bus("R1_EB_A_NB", 300, "EB", 20)],
-        node_queues={"300": {"NB": 8, "SB": 4}},
+        [bus("R1_EB_A_NB", NODE_A, "EB", 20)],
+        node_queues={str(NODE_A): {"NB": 8, "SB": 4}},
     )
     decision = rc.rule_based_decision(snapshot, decision_lag_sec=0.0)
     flags = flags_by_route(decision)
@@ -83,7 +83,7 @@ def test_rule_grants_tsp_for_uncontested_bus():
     assert flags["R1_EB_A_NB"] == {"tsp": True, "dbl": True}
     assert all(not v["tsp"] and not v["dbl"] for r, v in flags.items() if r != "R1_EB_A_NB")
     assert decision["reason"].startswith("rule: ")
-    assert "TSP R1_EB_A_NB@300 45pax vs cross 12<45" in decision["reason"]
+    assert f"TSP R1_EB_A_NB@{NODE_A} 45pax vs cross 12<45" in decision["reason"]
 
 
 def test_rule_withholds_tsp_for_bus_arriving_on_green():
@@ -91,45 +91,45 @@ def test_rule_withholds_tsp_for_bus_arriving_on_green():
     from priority; the rule spends no cross-street time on it. DBL is a
     lane reservation, not a signal grant, so it is unaffected."""
     snapshot = telemetry(
-        [bus("R1_EB_A_NB", 300, "EB", 20)],
-        node_queues={"300": {"NB": 8, "SB": 4}},
+        [bus("R1_EB_A_NB", NODE_A, "EB", 20)],
+        node_queues={str(NODE_A): {"NB": 8, "SB": 4}},
     )
     snapshot["active_buses"][0]["would_have_stopped"] = False
     flags = flags_by_route(rc.rule_based_decision(snapshot, decision_lag_sec=0.0))
 
     assert flags["R1_EB_A_NB"] == {"tsp": False, "dbl": True}
     reason = rc.rule_based_decision(snapshot, decision_lag_sec=0.0)["reason"]
-    assert "TSP R1_EB_A_NB@300 arrives on green" in reason
+    assert f"TSP R1_EB_A_NB@{NODE_A} arrives on green" in reason
 
 
 def test_rule_withholds_tsp_for_contested_bus():
     """The conditional part: cross-street load at/above the threshold blocks
     TSP even for an otherwise actionable bus. DBL is unaffected."""
     snapshot = telemetry(
-        [bus("R1_EB_A_NB", 300, "EB", 20)],
-        node_queues={"300": {"NB": 40, "SB": 20}},
+        [bus("R1_EB_A_NB", NODE_A, "EB", 20)],
+        node_queues={str(NODE_A): {"NB": 40, "SB": 20}},
     )
     decision = rc.rule_based_decision(snapshot, decision_lag_sec=0.0)
     flags = flags_by_route(decision)
 
     assert flags["R1_EB_A_NB"]["tsp"] is False
     assert flags["R1_EB_A_NB"]["dbl"] is True
-    assert "withheld: TSP R1_EB_A_NB@300 cross 60>=45" in decision["reason"]
+    assert f"withheld: TSP R1_EB_A_NB@{NODE_A} cross 60>=45" in decision["reason"]
 
     # Exactly at the threshold is withheld; one below is granted.
-    at = telemetry([bus("R1_EB_A_NB", 300, "EB", 20)], {"300": {"NB": 45}})
-    below = telemetry([bus("R1_EB_A_NB", 300, "EB", 20)], {"300": {"NB": 44}})
+    at = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 20)], {str(NODE_A): {"NB": 45}})
+    below = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 20)], {str(NODE_A): {"NB": 44}})
     assert flags_by_route(rc.rule_based_decision(at, 0.0))["R1_EB_A_NB"]["tsp"] is False
     assert flags_by_route(rc.rule_based_decision(below, 0.0))["R1_EB_A_NB"]["tsp"] is True
 
     # Only the conflicting phase counts: a queue on the bus's own axis is
     # not cross traffic.
-    same_axis = telemetry([bus("R1_EB_A_NB", 300, "EB", 20)], {"300": {"WB": 200}})
+    same_axis = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 20)], {str(NODE_A): {"WB": 200}})
     assert flags_by_route(rc.rule_based_decision(same_axis, 0.0))["R1_EB_A_NB"]["tsp"] is True
 
 
 def test_rule_threshold_is_tunable():
-    snapshot = telemetry([bus("R1_EB_A_NB", 300, "EB", 20)], {"300": {"NB": 30}})
+    snapshot = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 20)], {str(NODE_A): {"NB": 30}})
     assert rc.RULE_CROSS_QUEUE_THRESHOLD_PAX == 45
     assert flags_by_route(rc.rule_based_decision(snapshot, 0.0))["R1_EB_A_NB"]["tsp"] is True
     strict = rc.rule_based_decision(snapshot, 0.0, cross_queue_threshold_pax=30)
@@ -138,25 +138,25 @@ def test_rule_threshold_is_tunable():
 
 
 def test_rule_caps_grants_per_node():
-    """Two qualifying buses at node 300: only one TSP grant, the higher net
-    passenger benefit; the other is named as capped. Node 700 is judged
+    """Two qualifying buses at Node A: only one TSP grant, the higher net
+    passenger benefit; the other is named as capped. Node B is judged
     independently, so a bus there still gets its own grant."""
     snapshot = telemetry(
         [
-            bus("R1_EB_A_NB", 300, "EB", 20, passengers=45),
-            bus("R4_WB_A_SB", 300, "WB", 25, passengers=45),
-            bus("R2_EB_B_NB", 700, "EB", 30, passengers=45),
+            bus("R1_EB_A_NB", NODE_A, "EB", 20, passengers=45),
+            bus("R4_WB_A_SB", NODE_A, "WB", 25, passengers=45),
+            bus("R2_EB_B_NB", NODE_B, "EB", 30, passengers=45),
         ],
-        node_queues={"300": {"NB": 8, "SB": 4}},
+        node_queues={str(NODE_A): {"NB": 8, "SB": 4}},
     )
     decision = rc.rule_based_decision(snapshot, decision_lag_sec=0.0)
     flags = flags_by_route(decision)
 
-    tsp_at_300 = [r for r in ("R1_EB_A_NB", "R4_WB_A_SB") if flags[r]["tsp"]]
-    assert len(tsp_at_300) == rc.MAX_TSP_GRANTS_PER_NODE == 1
+    tsp_at_node_a = [r for r in ("R1_EB_A_NB", "R4_WB_A_SB") if flags[r]["tsp"]]
+    assert len(tsp_at_node_a) == rc.MAX_TSP_GRANTS_PER_NODE == 1
     # Equal benefit (45-12 each): the earlier ETA wins, deterministically.
-    assert tsp_at_300 == ["R1_EB_A_NB"]
-    assert "TSP R4_WB_A_SB@300 node cap 1" in decision["reason"]
+    assert tsp_at_node_a == ["R1_EB_A_NB"]
+    assert f"TSP R4_WB_A_SB@{NODE_A} node cap 1" in decision["reason"]
     assert flags["R2_EB_B_NB"]["tsp"] is True
     # DBL is a lane reservation, not capped.
     assert flags["R1_EB_A_NB"]["dbl"] and flags["R4_WB_A_SB"]["dbl"]
@@ -164,10 +164,10 @@ def test_rule_caps_grants_per_node():
     # Highest benefit wins when loads differ, regardless of ETA order.
     unequal = telemetry(
         [
-            bus("R1_EB_A_NB", 300, "EB", 20, passengers=20),
-            bus("R4_WB_A_SB", 300, "WB", 25, passengers=45),
+            bus("R1_EB_A_NB", NODE_A, "EB", 20, passengers=20),
+            bus("R4_WB_A_SB", NODE_A, "WB", 25, passengers=45),
         ],
-        node_queues={"300": {"NB": 8, "SB": 4}},
+        node_queues={str(NODE_A): {"NB": 8, "SB": 4}},
     )
     assert flags_by_route(rc.rule_based_decision(unequal, 0.0))["R4_WB_A_SB"]["tsp"] is True
     assert flags_by_route(rc.rule_based_decision(unequal, 0.0))["R1_EB_A_NB"]["tsp"] is False
@@ -179,7 +179,7 @@ def test_rule_caps_grants_per_node():
 
 def test_rule_dbl_respects_obstruction():
     snapshot = telemetry(
-        [bus("R1_EB_A_NB", 300, "EB", 20)],
+        [bus("R1_EB_A_NB", NODE_A, "EB", 20)],
         obstructed=("R1_EB_A_NB",),
     )
     decision = rc.rule_based_decision(snapshot, decision_lag_sec=0.0)
@@ -201,23 +201,23 @@ def test_rule_uses_the_agents_actionable_definition():
     """A bus that will already have crossed by the time the decision lands
     is not actionable for TSP (the agent's own horizon), but it still
     counts as approaching for DBL."""
-    late = telemetry([bus("R1_EB_A_NB", 300, "EB", 5)])
+    late = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 5)])
     decision = rc.rule_based_decision(late, decision_lag_sec=8.0)
     flags = flags_by_route(decision)
     assert agent.is_actionable(agent.eta_at_decision_land(5, 8.0)) is False
     assert flags["R1_EB_A_NB"]["tsp"] is False
     assert flags["R1_EB_A_NB"]["dbl"] is True
 
-    beyond = telemetry([bus("R1_EB_A_NB", 300, "EB", agent.ACTIONABLE_HORIZON_SEC + 10)])
+    beyond = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", agent.ACTIONABLE_HORIZON_SEC + 10)])
     assert flags_by_route(rc.rule_based_decision(beyond, 0.0))["R1_EB_A_NB"]["tsp"] is False
 
     # Buses not on an unfinished leg are ignored entirely.
-    finished = telemetry([{**bus("R1_EB_A_NB", 300, "EB", 20), "route_leg": None}])
+    finished = telemetry([{**bus("R1_EB_A_NB", NODE_A, "EB", 20), "route_leg": None}])
     assert rc.rule_based_decision(finished, 0.0)["reason"] == "rule: no grant"
 
 
 def test_rule_is_deterministic_and_safe_on_empty_input():
-    snapshot = telemetry([bus("R1_EB_A_NB", 300, "EB", 20), bus("R5_WB_B_SB", 700, "WB", 12)])
+    snapshot = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 20), bus("R5_WB_B_SB", NODE_B, "WB", 12)])
     first = rc.rule_based_decision(snapshot, 0.0)
     assert all(rc.rule_based_decision(snapshot, 0.0) == first for _ in range(5))
     for empty in ({}, None, {"active_buses": "garbage"}, {"active_buses": [None, 3]}):
@@ -230,8 +230,8 @@ def test_rule_is_deterministic_and_safe_on_empty_input():
 
 def test_rule_output_passes_guard():
     snapshot = telemetry(
-        [bus("R1_EB_A_NB", 300, "EB", 20), bus("R5_WB_B_SB", 700, "WB", 12)],
-        node_queues={"700": {"EB": 50}},
+        [bus("R1_EB_A_NB", NODE_A, "EB", 20), bus("R5_WB_B_SB", NODE_B, "WB", 12)],
+        node_queues={str(NODE_B): {"EB": 50}},
     )
     decision = rc.rule_based_decision(snapshot, decision_lag_sec=0.0)
 
@@ -269,7 +269,7 @@ def test_rule_mode_skips_llm(monkeypatch):
     monkeypatch.setattr(agent, "_call_gemini", fake_gemini)
     monkeypatch.setattr(agent, "_call_ollama", lambda *a, **k: fake_chat())
 
-    snapshot = telemetry([bus("R1_EB_A_NB", 300, "EB", 20)])
+    snapshot = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 20)])
     state = {
         "telemetry": snapshot, "minimap": "unused by the rule",
         "locked_routes": set(), "raw_output": "", "call_metrics": {},
@@ -307,7 +307,7 @@ def test_rule_mode_plans_with_near_zero_lag():
 
     # A bus 5 s out: not actionable under the model default, actionable for
     # the rule -- the comparator must not be handicapped by a lag it lacks.
-    close = telemetry([bus("R1_EB_A_NB", 300, "EB", 5)])
+    close = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 5)])
     assert flags_by_route(rc.rule_based_decision(close, agent.DEFAULT_DECISION_LAG_SEC))["R1_EB_A_NB"]["tsp"] is False
     assert flags_by_route(rc.rule_based_decision(close))["R1_EB_A_NB"]["tsp"] is True
     assert flags_by_route(rc.rule_based_decision(close, rc.RULE_DECISION_LAG_SEC))["R1_EB_A_NB"]["tsp"] is True
@@ -320,7 +320,7 @@ def test_rule_mode_plans_with_near_zero_lag():
 def test_rule_respects_locked_routes_like_a_model():
     """The locked-route overlay in anti_cheat applies to rule turns too: a
     route already granted keeps its live flags whatever the rule says."""
-    snapshot = telemetry([bus("R1_EB_A_NB", 300, "EB", 20)], {"300": {"NB": 100}})
+    snapshot = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 20)], {str(NODE_A): {"NB": 100}})
     snapshot["routes"]["R1_EB_A_NB"].update({"tsp_enabled": True, "dbl_enabled": False})
     state = {
         "telemetry": snapshot, "minimap": "", "locked_routes": {"R1_EB_A_NB"},
@@ -349,12 +349,12 @@ def test_rule_selectable_in_control_panel(monkeypatch):
 # --- same artefacts as an LLM run ----------------------------------------------
 
 def _drive_bus_with_tsp(tracker, controller):
-    """Run one EB bus through node 300 under a TSP extension (the same
+    """Run one EB bus through Node A under a TSP extension (the same
     scenario the bus-event tests use), logging it via the tracker."""
     control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] = True
     controller.phase = 0
     controller.timer = 97
-    vehicle = make_bus_for_leg("R1_EB_A_NB", 300, "RULE_BUS")
+    vehicle = make_bus_for_leg("R1_EB_A_NB", NODE_A, "RULE_BUS")
     vehicles = [vehicle]
     for frame in range(1, 3000):
         controller.update(vehicles)
@@ -383,7 +383,7 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
     monkeypatch.setitem(control_panel.global_config, "ai_runtime", runtime)
 
     # 1. The agent's turn, exactly as the graph runs it, with the rule deciding.
-    snapshot = telemetry([bus("R1_EB_A_NB", 300, "EB", 20)], {"300": {"NB": 8, "SB": 4}})
+    snapshot = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 20)], {str(NODE_A): {"NB": 8, "SB": 4}})
     state = {
         "telemetry": snapshot, "minimap": "minimap text", "locked_routes": set(),
         "raw_output": "", "call_metrics": {}, "decision": {}, "status": "OK",
@@ -397,7 +397,7 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
     assert decision_on_disk["model"] == "rule-based"
     assert decision_on_disk["status"] == "OK"
     assert decision_on_disk["flags"]["R1_EB_A_NB"] == {"tsp": True, "dbl": True}
-    assert decision_on_disk["reason"].startswith("rule: TSP R1_EB_A_NB@300")
+    assert decision_on_disk["reason"].startswith(f"rule: TSP R1_EB_A_NB@{NODE_A}")
 
     logged = [json.loads(line) for line in agent.TURN_LOG_PATH.read_text(encoding="utf-8").splitlines()]
     assert len(logged) == 1

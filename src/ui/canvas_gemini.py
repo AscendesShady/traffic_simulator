@@ -7,14 +7,20 @@ import pygame
 # ==========================================================
 # AUTHORITATIVE NETWORK GEOMETRY
 # ==========================================================
-WIDTH, HEIGHT = 1000, 600
+# Physics-surface size. The Tk pane smoothscales it to fit, so a wider world
+# only displays smaller; vehicle/lane/threshold pixels are unchanged. At
+# 0.25 m/px (real_world_units) the 800 px link is 200 m and each approach
+# from the spawn edge is ~190 m -- about 25 s of decision lead time at the
+# default speed scale, up from ~11 s on the old 1000 px surface. Nodes sit
+# symmetrically: 800 px from either edge, 800 px apart.
+WIDTH, HEIGHT = 2400, 600
 CANVAS_HEIGHT = HEIGHT
 
 LANE = 22
 LANES = 3
 ROAD_W = 2 * LANE * LANES  # 132 px
 H_Y = 300
-INT_X = [300, 700]  # Node A and Node B
+INT_X = [800, 1600]  # Node A and Node B
 STOP = 10
 
 

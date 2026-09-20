@@ -6,7 +6,7 @@ import src.ui.control_panel as control_panel
 import src.core.main as main
 from src.ui.canvas_gemini import HEIGHT, H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
 from src.core.signal_controller import SignalController
-from tests.helpers import rectangles_overlap
+from tests.helpers import rectangles_overlap, NODE_A, NODE_B
 from src.core.vehicle import Bus, Vehicle
 
 
@@ -40,7 +40,7 @@ def make_car():
 def make_bus(route_id, sequence):
     config = control_panel.bus_routes_config[route_id]
     direction = config["origin"]
-    first_node = 300 if direction == "EB" else 700
+    first_node = NODE_A if direction == "EB" else NODE_B
     lane_index = config["lanes"][first_node]
     route_info = {
         "route_id": route_id,
@@ -127,8 +127,10 @@ def test_production_congestion_peak_builds_a_queue_without_crashing():
 
     try:
         for _ in range(main.CONGESTION_PEAK_SECONDS * 60):
+            # Spawn 320 px short of Node A (the old canvas edge) so the
+            # 30 s peak still reaches the stop bar and queues.
             main.try_spawn_vehicle(
-                vehicles, "EB", "EB", -20, eb_lanes, config
+                vehicles, "EB", "EB", NODE_A - 320, eb_lanes, config
             )
             controller.update(vehicles)
             signals = controller.get_all_signals(INT_X)
@@ -175,10 +177,10 @@ def test_all_sources_congestion_peak_remains_collision_safe_and_bounded():
     sources = {
         "EB": ("EB", -20, LANES["EB"]),
         "WB": ("WB", WIDTH + 20, LANES["WB"]),
-        "A_NB": ("NB", HEIGHT + 20, LANES["NB"][300]),
-        "A_SB": ("SB", -20, LANES["SB"][300]),
-        "B_NB": ("NB", HEIGHT + 20, LANES["NB"][700]),
-        "B_SB": ("SB", -20, LANES["SB"][700]),
+        "A_NB": ("NB", HEIGHT + 20, LANES["NB"][NODE_A]),
+        "A_SB": ("SB", -20, LANES["SB"][NODE_A]),
+        "B_NB": ("NB", HEIGHT + 20, LANES["NB"][NODE_B]),
+        "B_SB": ("SB", -20, LANES["SB"][NODE_B]),
     }
     config = {
         "model": main.CONGESTION_MODEL,

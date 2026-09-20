@@ -5,7 +5,7 @@ shared east and west legs. Legs with nothing queued are skipped so the
 rotation never spends a green on an empty approach.
 """
 import src.ui.control_panel as control_panel
-from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
+from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
 from src.core.signal_controller import (
     DISCHARGE_ACTIVE,
     DISCHARGE_CLOCKWISE_ORDER,
@@ -13,6 +13,7 @@ from src.core.signal_controller import (
     SignalController,
 )
 from src.core.vehicle import Vehicle
+from tests.helpers import NODE_A, NODE_B
 
 
 def make_controller():
@@ -51,10 +52,10 @@ def queued(node_x, approach, count=2):
             x, y, approach, target_turn="STRAIGHT", lane_index=1,
             assigned_node_x=node_x,
         )
-        if approach == "EB" and node_x == 700:
-            vehicle.passed_nodes.add(300)
-        if approach == "WB" and node_x == 300:
-            vehicle.passed_nodes.add(700)
+        if approach == "EB" and node_x == NODE_B:
+            vehicle.passed_nodes.add(NODE_A)
+        if approach == "WB" and node_x == NODE_A:
+            vehicle.passed_nodes.add(NODE_B)
         vehicle.speed = 0.0
         made.append(vehicle)
     return made
@@ -74,7 +75,7 @@ def served_order(vehicles, frames=4000):
                 signal_controller=controller,
             )
         vehicles[:] = [
-            v for v in vehicles if -300 < v.x < 1300 and -300 < v.y < 1000
+            v for v in vehicles if -300 < v.x < WIDTH + 300 and -300 < v.y < 1000
         ]
         controller.update(vehicles)
         if (
@@ -117,7 +118,7 @@ def test_auto_serves_legs_in_clockwise_order():
 
 def test_auto_skips_legs_with_nothing_queued():
     # Only two legs have traffic: the eastbound corridor and Node B southbound.
-    vehicles = queued(300, "EB") + queued(700, "SB")
+    vehicles = queued(NODE_A, "EB") + queued(NODE_B, "SB")
 
     order = served_order(vehicles)
 

@@ -9,38 +9,38 @@ from src.core.vehicle import (
     ROUTE_MERGE_AREA_PX,
     Vehicle,
 )
-from tests.helpers import make_bus_for_leg, rectangles_overlap
+from tests.helpers import make_bus_for_leg, rectangles_overlap, NODE_A, NODE_B
 
 
 def signals_for(direction, state):
     node = {item: "RED" for item in ("EB", "WB", "NB", "SB")}
     node[direction] = state
-    return {300: dict(node), 700: dict(node)}
+    return {NODE_A: dict(node), NODE_B: dict(node)}
 
 
 @pytest.mark.parametrize("invalid", [None, "INVALID", (50, 220, 50), 123, {}])
 def test_invalid_signal_values_fail_closed(invalid):
-    vehicle = Vehicle(210, H_Y - 1.5 * LANE, "EB", lane_index=1)
-    data = {300: {"EB": invalid}, 700: {"EB": invalid}}
+    vehicle = Vehicle(NODE_A - 90, H_Y - 1.5 * LANE, "EB", lane_index=1)
+    data = {NODE_A: {"EB": invalid}, NODE_B: {"EB": invalid}}
     for _ in range(30):
         vehicle.update(data, INT_X, H_Y, ROAD_W, STOP, LANE, [vehicle], None)
-    assert vehicle.distance_to_node_stop_bar(300, H_Y, ROAD_W, STOP) >= 0
+    assert vehicle.distance_to_node_stop_bar(NODE_A, H_Y, ROAD_W, STOP) >= 0
     assert vehicle.speed == 0
 
 
 @pytest.mark.parametrize(
     "direction,start,expected",
     [
-        ("EB", (240, H_Y - 2.5 * LANE), "NB"),
-        ("WB", (360, H_Y + 2.5 * LANE), "SB"),
-        ("NB", (300 - 2.5 * LANE, 360), "WB"),
-        ("SB", (300 + 2.5 * LANE, 240), "EB"),
+        ("EB", (NODE_A - 60, H_Y - 2.5 * LANE), "NB"),
+        ("WB", (NODE_A + 60, H_Y + 2.5 * LANE), "SB"),
+        ("NB", (NODE_A - 2.5 * LANE, 360), "WB"),
+        ("SB", (NODE_A + 2.5 * LANE, 240), "EB"),
     ],
 )
 def test_left_turn_displacement_is_continuous(direction, start, expected):
     vehicle = Vehicle(*start, direction, target_turn="LEFT", lane_index=2)
     if direction == "WB":
-        vehicle.passed_nodes.add(700)
+        vehicle.passed_nodes.add(NODE_B)
     all_green = {node: {item: "GREEN" for item in ("EB", "WB", "NB", "SB")} for node in INT_X}
     maximum_step = 0
     for _ in range(150):
@@ -56,7 +56,7 @@ def test_left_turn_displacement_is_continuous(direction, start, expected):
 def test_same_origin_left_turn_and_through_vehicle_do_not_overlap():
     config = control_panel.bus_routes_config["R1_EB_A_NB"]
     bus = Bus(
-        220,
+        NODE_A - 80,
         H_Y - 2.5 * LANE,
         "EB",
         {
@@ -68,7 +68,7 @@ def test_same_origin_left_turn_and_through_vehicle_do_not_overlap():
         },
         "TURN_BUS",
     )
-    car = Vehicle(210, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
+    car = Vehicle(NODE_A - 90, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
     controller = SignalController({"green_time": 999})
     vehicles = [bus, car]
     for _ in range(300):
@@ -82,7 +82,7 @@ def test_same_origin_left_turn_and_through_vehicle_do_not_overlap():
 def test_green_through_vehicle_does_not_wait_for_compatible_left_turn_to_clear():
     controller = SignalController({"green_time": 999})
     turning = Vehicle(
-        220,
+        NODE_A - 80,
         H_Y - 2.5 * LANE,
         "EB",
         is_heavy=True,
@@ -90,14 +90,14 @@ def test_green_through_vehicle_does_not_wait_for_compatible_left_turn_to_clear()
         lane_index=2,
     )
     through = Vehicle(
-        215,
+        NODE_A - 85,
         H_Y - 1.5 * LANE,
         "EB",
         target_turn="STRAIGHT",
         lane_index=1,
     )
     vehicles = [turning, through]
-    assert controller.request_intersection_entry(turning, 300, vehicles)
+    assert controller.request_intersection_entry(turning, NODE_A, vehicles)
 
     # Advance only the turner until it has cleared the adjacent through lane,
     # but its long body still occupies the wider intersection rectangle.
@@ -113,19 +113,19 @@ def test_green_through_vehicle_does_not_wait_for_compatible_left_turn_to_clear()
             controller,
         )
         if controller._left_turn_cleared_adjacent_through_lane(
-            turning, "EB", 300
+            turning, "EB", NODE_A
         ):
             break
 
     signals = controller.get_all_signals(INT_X)
     before = through.x
-    assert controller.request_intersection_entry(through, 300, vehicles)
+    assert controller.request_intersection_entry(through, NODE_A, vehicles)
     through.update(signals, INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
 
-    assert signals[300]["EB"] == "GREEN"
-    assert controller.vehicle_occupies_intersection(turning, 300)
+    assert signals[NODE_A]["EB"] == "GREEN"
+    assert controller.vehicle_occupies_intersection(turning, NODE_A)
     assert through.x > before
-    assert id(through) in controller.nodes[300].reservations
+    assert id(through) in controller.nodes[NODE_A].reservations
 
 
 def test_conflict_matrix_allows_same_green_axis_but_blocks_perpendicular_axis():
@@ -140,7 +140,7 @@ def test_conflict_matrix_allows_same_green_axis_but_blocks_perpendicular_axis():
 def test_unrestricted_left_turn_crosses_on_red_when_conflict_free():
     """A general left turn yields for conflicts, not for its approach lamp."""
     vehicle = Vehicle(
-        210,
+        NODE_A - 90,
         H_Y - 2.5 * LANE,
         "EB",
         target_turn="LEFT",
@@ -169,23 +169,23 @@ def test_unrestricted_left_turn_crosses_on_red_when_conflict_free():
 
 def test_unrestricted_left_turn_yields_to_conflicting_reserved_movement():
     left_turner = Vehicle(
-        210,
+        NODE_A - 90,
         H_Y - 2.5 * LANE,
         "EB",
         target_turn="LEFT",
         lane_index=DBL_LANE_INDEX,
     )
     crossing = Vehicle(
-        300 - 1.5 * LANE,
+        NODE_A - 1.5 * LANE,
         H_Y + ROAD_W / 2 + STOP + 9 + 5,
         "NB",
         target_turn="STRAIGHT",
         lane_index=1,
-        assigned_node_x=300,
+        assigned_node_x=NODE_A,
     )
     controller = SignalController({"green_time": 999})
     vehicles = [crossing, left_turner]
-    assert controller.request_intersection_entry(crossing, 300, vehicles)
+    assert controller.request_intersection_entry(crossing, NODE_A, vehicles)
 
     starting_x = left_turner.x
     left_turner.update(
@@ -201,17 +201,17 @@ def test_unrestricted_left_turn_yields_to_conflicting_reserved_movement():
 
     assert left_turner.x == starting_x
     assert left_turner.speed == 0.0
-    assert id(left_turner) not in controller.nodes[300].reservations
+    assert id(left_turner) not in controller.nodes[NODE_A].reservations
 
 
 def test_r1_bus_follows_left_turner_before_entire_node_is_empty():
-    leader = make_bus_for_leg("R1_EB_A_NB", 300, "R1_LEADER")
-    follower = make_bus_for_leg("R1_EB_A_NB", 300, "R1_FOLLOWER")
-    leader.x = 220
-    follower.x = 178
+    leader = make_bus_for_leg("R1_EB_A_NB", NODE_A, "R1_LEADER")
+    follower = make_bus_for_leg("R1_EB_A_NB", NODE_A, "R1_FOLLOWER")
+    leader.x = NODE_A - 80
+    follower.x = NODE_A - 122
     controller = SignalController({"green_time": 999})
     vehicles = [leader, follower]
-    assert controller.request_intersection_entry(leader, 300, vehicles)
+    assert controller.request_intersection_entry(leader, NODE_A, vehicles)
 
     for _ in range(100):
         leader.update(
@@ -225,13 +225,13 @@ def test_r1_bus_follows_left_turner_before_entire_node_is_empty():
             controller,
         )
         if controller._left_turn_cleared_adjacent_through_lane(
-            leader, "EB", 300
+            leader, "EB", NODE_A
         ):
             break
 
-    assert controller.vehicle_occupies_intersection(leader, 300)
-    assert 300 not in leader.passed_nodes
-    assert controller.request_intersection_entry(follower, 300, vehicles)
+    assert controller.vehicle_occupies_intersection(leader, NODE_A)
+    assert NODE_A not in leader.passed_nodes
+    assert controller.request_intersection_entry(follower, NODE_A, vehicles)
 
     starting_x = follower.x
     for _ in range(200):
@@ -246,20 +246,20 @@ def test_r1_bus_follows_left_turner_before_entire_node_is_empty():
         assert not rectangles_overlap(leader, follower)
 
     assert follower.x > starting_x or follower.direction == "NB"
-    assert 300 in follower.passed_nodes
+    assert NODE_A in follower.passed_nodes
 
 
 def test_dbl_route_bus_moves_to_outer_lane_early():
     config = control_panel.bus_routes_config["R2_EB_B_NB"]
     config["dbl_enabled"] = True
-    bus = make_bus_for_leg("R2_EB_B_NB", 300, "EARLY_DBL")
+    bus = make_bus_for_leg("R2_EB_B_NB", NODE_A, "EARLY_DBL")
     bus.x = -100
     bus.y = H_Y - 1.5 * LANE
     controller = SignalController({"green_time": 999})
     starting_y = bus.y
 
     assert bus.target_turn == "STRAIGHT"
-    assert bus.distance_to_node_stop_bar(300, H_Y, ROAD_W, STOP) > 250
+    assert bus.distance_to_node_stop_bar(NODE_A, H_Y, ROAD_W, STOP) > 250
 
     bus.update(
         signals_for("EB", "GREEN"),
@@ -279,8 +279,8 @@ def test_dbl_route_bus_moves_to_outer_lane_early():
 def test_left_turn_lane_change_still_works():
     config = control_panel.bus_routes_config["R2_EB_B_NB"]
     config["dbl_enabled"] = False
-    bus = make_bus_for_leg("R2_EB_B_NB", 700, "LEFT_NO_DBL")
-    bus.x = 500
+    bus = make_bus_for_leg("R2_EB_B_NB", NODE_B, "LEFT_NO_DBL")
+    bus.x = NODE_B - 200
     bus.y = H_Y - 1.5 * LANE
     bus.lane_index = 1
     controller = SignalController({"green_time": 999})
@@ -307,7 +307,7 @@ def test_left_turn_lane_change_still_works():
 def test_dbl_migration_is_refused_when_lane_obstructed():
     config = control_panel.bus_routes_config["R2_EB_B_NB"]
     config["dbl_enabled"] = True
-    bus = make_bus_for_leg("R2_EB_B_NB", 300, "BLOCKED_DBL")
+    bus = make_bus_for_leg("R2_EB_B_NB", NODE_A, "BLOCKED_DBL")
     bus.x = -100
     bus.y = H_Y - 1.5 * LANE
     blocker = Vehicle(
@@ -340,9 +340,9 @@ def test_dbl_migration_is_refused_when_lane_obstructed():
 def test_dbl_car_ahead_does_not_deadlock_bus():
     config = control_panel.bus_routes_config["R1_EB_A_NB"]
     config["dbl_enabled"] = True
-    bus = make_bus_for_leg("R1_EB_A_NB", 300)
-    bus.x = 73
-    car = Vehicle(115, H_Y - 2.5 * LANE, "EB", lane_index=2)
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A)
+    bus.x = NODE_A - 227
+    car = Vehicle(NODE_A - 185, H_Y - 2.5 * LANE, "EB", lane_index=2)
     controller = SignalController({"green_time": 999}, 2, 2)
     vehicles = [bus, car]
     for _ in range(500):
@@ -350,17 +350,17 @@ def test_dbl_car_ahead_does_not_deadlock_bus():
         signals = controller.get_all_signals(INT_X)
         for vehicle in vehicles:
             vehicle.update(signals, INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
-    assert car.x > 300
+    assert car.x > NODE_A
     assert not rectangles_overlap(bus, car)
 
 
 def test_lane_blocked_bus_holds_upstream_of_stop_bar():
     config = control_panel.bus_routes_config["R2_EB_B_NB"]
-    bus = make_bus_for_leg("R2_EB_B_NB", 700)
-    bus.x = 500
+    bus = make_bus_for_leg("R2_EB_B_NB", NODE_B)
+    bus.x = NODE_B - 200
     bus.lane_index = 1
     bus.y = H_Y - 1.5 * LANE
-    blocker = Vehicle(520, H_Y - 2.5 * LANE, "EB", max_speed=0, lane_index=2)
+    blocker = Vehicle(NODE_B - 180, H_Y - 2.5 * LANE, "EB", max_speed=0, lane_index=2)
     controller = SignalController({"green_time": 999})
     vehicles = [bus, blocker]
     for _ in range(250):
@@ -369,16 +369,16 @@ def test_lane_blocked_bus_holds_upstream_of_stop_bar():
         bus.update(signals, INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
         controller.update(vehicles)
     assert bus.lane_index == 1
-    assert bus.is_front_bumper_upstream(700, H_Y, ROAD_W, STOP)
+    assert bus.is_front_bumper_upstream(NODE_B, H_Y, ROAD_W, STOP)
     assert bus.speed == 0
 
 
 def test_multileg_bus_reserves_next_lane_before_crossing_first_node():
     """R4 must not enter Node B if its post-node lane-2 merge has no storage."""
     control_panel.bus_routes_config["R4_WB_A_SB"]["dbl_enabled"] = False
-    bus = make_bus_for_leg("R4_WB_A_SB", 700, "R4_ENTRY_GATE")
+    bus = make_bus_for_leg("R4_WB_A_SB", NODE_B, "R4_ENTRY_GATE")
     controller = SignalController({"green_time": 999})
-    merge_x = bus.route_merge_point_x(700, ROAD_W)
+    merge_x = bus.route_merge_point_x(NODE_B, ROAD_W)
     blocker = Vehicle(
         merge_x,
         H_Y + 2.5 * LANE,
@@ -386,7 +386,7 @@ def test_multileg_bus_reserves_next_lane_before_crossing_first_node():
         max_speed=0.0,
         lane_index=2,
     )
-    blocker.passed_nodes.add(700)
+    blocker.passed_nodes.add(NODE_B)
     vehicles = [bus, blocker]
     starting_x = bus.x
 
@@ -404,7 +404,7 @@ def test_multileg_bus_reserves_next_lane_before_crossing_first_node():
     assert bus.route_exit_merge_blocked is True
     assert bus.x == starting_x
     assert bus.speed == 0.0
-    assert 700 not in bus.passed_nodes
+    assert NODE_B not in bus.passed_nodes
 
 
 def test_dbl_bus_already_in_next_lane_ignores_obsolete_merge_storage_gate(
@@ -413,11 +413,11 @@ def test_dbl_bus_already_in_next_lane_ignores_obsolete_merge_storage_gate(
     """DBL moved R4 to lane 2, so no post-Node-B lane-2 merge is pending."""
     config = control_panel.bus_routes_config["R4_WB_A_SB"]
     monkeypatch.setitem(config, "dbl_enabled", True)
-    bus = make_bus_for_leg("R4_WB_A_SB", 700, "R4_DBL_IN_TARGET_LANE")
+    bus = make_bus_for_leg("R4_WB_A_SB", NODE_B, "R4_DBL_IN_TARGET_LANE")
     bus.lane_index = DBL_LANE_INDEX
     bus.y = H_Y + 2.5 * LANE
     controller = SignalController({"green_time": 999})
-    merge_x = bus.route_merge_point_x(700, ROAD_W)
+    merge_x = bus.route_merge_point_x(NODE_B, ROAD_W)
     blocker = Vehicle(
         merge_x,
         H_Y + 2.5 * LANE,
@@ -425,12 +425,12 @@ def test_dbl_bus_already_in_next_lane_ignores_obsolete_merge_storage_gate(
         max_speed=0.0,
         lane_index=DBL_LANE_INDEX,
     )
-    blocker.passed_nodes.add(700)
+    blocker.passed_nodes.add(NODE_B)
     vehicles = [bus, blocker]
     controller.update(vehicles)
     starting_x = bus.x
 
-    assert controller.is_dbl_active_for_approach(700, "WB")
+    assert controller.is_dbl_active_for_approach(NODE_B, "WB")
     bus.update(
         signals_for("WB", "GREEN"),
         INT_X,
@@ -451,8 +451,8 @@ def test_r4_moves_to_next_legs_lane_immediately_after_node_b():
     """The lane plan is route-driven and works with both DBL and TSP disabled."""
     control_panel.bus_routes_config["R4_WB_A_SB"]["dbl_enabled"] = False
     control_panel.bus_routes_config["R4_WB_A_SB"]["tsp_enabled"] = False
-    bus = make_bus_for_leg("R4_WB_A_SB", 300, "R4_EARLY_ROUTE_MERGE")
-    bus.x = 610.0
+    bus = make_bus_for_leg("R4_WB_A_SB", NODE_A, "R4_EARLY_ROUTE_MERGE")
+    bus.x = NODE_B - 90
     bus.y = H_Y + 1.5 * LANE
     bus.lane_index = 1
     controller = SignalController({"green_time": 999})
@@ -475,18 +475,18 @@ def test_r4_moves_to_next_legs_lane_immediately_after_node_b():
 
 
 def test_route_merge_target_lane_vehicle_behind_yields():
-    bus = make_bus_for_leg("R4_WB_A_SB", 300, "R4_COOPERATIVE_MERGE")
-    bus.x = 570.0
+    bus = make_bus_for_leg("R4_WB_A_SB", NODE_A, "R4_COOPERATIVE_MERGE")
+    bus.x = NODE_B - 130.0
     bus.y = H_Y + 1.5 * LANE
     bus.lane_index = 1
     follower = Vehicle(
-        620.0,
+        NODE_B - 80,
         H_Y + 2.5 * LANE,
         "WB",
         max_speed=1.0,
         lane_index=2,
     )
-    follower.passed_nodes.add(700)
+    follower.passed_nodes.add(NODE_B)
     controller = SignalController({"green_time": 999})
     vehicles = [bus, follower]
 
@@ -518,10 +518,10 @@ def test_route_merge_target_lane_vehicle_behind_yields():
 
 
 def test_unresolved_route_merge_holds_near_previous_node_not_node_a():
-    bus = make_bus_for_leg("R4_WB_A_SB", 300, "R4_LINK_HOLD")
-    merge_x = bus.route_merge_point_x(700, ROAD_W)
+    bus = make_bus_for_leg("R4_WB_A_SB", NODE_A, "R4_LINK_HOLD")
+    merge_x = bus.route_merge_point_x(NODE_B, ROAD_W)
     assert merge_x == pytest.approx(
-        700 - ROAD_W / 2.0 - bus.length / 2.0 - ROUTE_MERGE_AREA_PX
+        NODE_B - ROAD_W / 2.0 - bus.length / 2.0 - ROUTE_MERGE_AREA_PX
     )
     bus.x = merge_x
     bus.y = H_Y + 1.5 * LANE
@@ -533,7 +533,7 @@ def test_unresolved_route_merge_holds_near_previous_node_not_node_a():
         max_speed=0.0,
         lane_index=2,
     )
-    blocker.passed_nodes.add(700)
+    blocker.passed_nodes.add(NODE_B)
     controller = SignalController({"green_time": 999})
     vehicles = [bus, blocker]
     starting_x = bus.x
@@ -552,7 +552,7 @@ def test_unresolved_route_merge_holds_near_previous_node_not_node_a():
     assert bus.route_merge_hold_active is True
     assert bus.speed == 0.0
     assert bus.x == starting_x
-    assert bus.distance_to_node_stop_bar(300, H_Y, ROAD_W, STOP) > 35.0
+    assert bus.distance_to_node_stop_bar(NODE_A, H_Y, ROAD_W, STOP) > 35.0
 
 
 def test_r4_completes_with_dbl_and_tsp_off_when_unobstructed():
@@ -568,7 +568,7 @@ def test_r4_completes_with_dbl_and_tsp_off_when_unobstructed():
         "lanes": dict(config["lanes"]),
     }
     bus = Bus(
-        1040,
+        NODE_B + 340,
         H_Y + 1.5 * LANE,
         "WB",
         route_info,
@@ -593,7 +593,7 @@ def test_r4_completes_with_dbl_and_tsp_off_when_unobstructed():
         if bus.y > 660:
             break
 
-    assert bus.passed_nodes == {700, 300}
+    assert bus.passed_nodes == {NODE_B, NODE_A}
     assert bus.direction == "SB"
     assert bus.y > 660
 
@@ -601,10 +601,10 @@ def test_r4_completes_with_dbl_and_tsp_off_when_unobstructed():
 @pytest.mark.parametrize(
     "direction,node_x,start_y",
     [
-        ("NB", 300, H_Y + ROAD_W),
-        ("NB", 700, H_Y + ROAD_W),
-        ("SB", 300, H_Y - ROAD_W),
-        ("SB", 700, H_Y - ROAD_W),
+        ("NB", NODE_A, H_Y + ROAD_W),
+        ("NB", NODE_B, H_Y + ROAD_W),
+        ("SB", NODE_A, H_Y - ROAD_W),
+        ("SB", NODE_B, H_Y - ROAD_W),
     ],
 )
 def test_vertical_traffic_completes_only_its_physical_node(
@@ -642,49 +642,49 @@ def test_starved_left_turn_holds_new_through_entries_until_corner_drains():
 
     controller = SignalController({"green_time": 999})
     # A through car already in the corner sweep with a reservation.
-    in_box = Vehicle(300 - 2.5 * LANE, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
-    turning = Vehicle(220, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2)
-    follower = Vehicle(200, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
+    in_box = Vehicle(NODE_A - 2.5 * LANE, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
+    turning = Vehicle(NODE_A - 80, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2)
+    follower = Vehicle(NODE_A - 100, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
     vehicles = [in_box, turning, follower]
-    assert controller.request_intersection_entry(in_box, 300, vehicles)
-    assert not controller.request_intersection_entry(turning, 300, vehicles)
+    assert controller.request_intersection_entry(in_box, NODE_A, vehicles)
+    assert not controller.request_intersection_entry(turning, NODE_A, vehicles)
     # A cancel (what a stopped vehicle issues every frame) must not erase the wait.
-    controller.cancel_intersection_entry(turning, 300)
-    assert "EB" in controller.nodes[300].left_turn_waiting
+    controller.cancel_intersection_entry(turning, NODE_A)
+    assert "EB" in controller.nodes[NODE_A].left_turn_waiting
 
     # Before the threshold a new through vehicle still gets in.
     controller.frame_number += sc.LEFT_TURN_STARVATION_FRAMES - 1
-    assert controller.request_intersection_entry(follower, 300, vehicles)
-    controller.cancel_intersection_entry(follower, 300)
+    assert controller.request_intersection_entry(follower, NODE_A, vehicles)
+    controller.cancel_intersection_entry(follower, NODE_A)
 
     # At the threshold, new through entries are held; the reserved one is not.
     controller.frame_number += 1
-    assert not controller.request_intersection_entry(follower, 300, vehicles)
-    assert id(in_box) in controller.nodes[300].reservations
+    assert not controller.request_intersection_entry(follower, NODE_A, vehicles)
+    assert id(in_box) in controller.nodes[NODE_A].reservations
 
     # Corner drains: the through car leaves the sweep, the left turn is
     # granted, the wait clears and through traffic flows again.
-    in_box.x = 300 + 3 * LANE
-    controller.cancel_intersection_entry(in_box, 300)
-    assert controller.request_intersection_entry(turning, 300, vehicles)
-    assert "EB" not in controller.nodes[300].left_turn_waiting
-    turning.passed_nodes.add(300)
-    controller.cancel_intersection_entry(turning, 300)
-    assert controller.request_intersection_entry(follower, 300, vehicles)
+    in_box.x = NODE_A + 3 * LANE
+    controller.cancel_intersection_entry(in_box, NODE_A)
+    assert controller.request_intersection_entry(turning, NODE_A, vehicles)
+    assert "EB" not in controller.nodes[NODE_A].left_turn_waiting
+    turning.passed_nodes.add(NODE_A)
+    controller.cancel_intersection_entry(turning, NODE_A)
+    assert controller.request_intersection_entry(follower, NODE_A, vehicles)
 
 
 def test_left_turn_wait_is_dropped_when_the_turner_is_gone():
     from src.core import signal_controller as sc
 
     controller = SignalController({"green_time": 999})
-    in_box = Vehicle(300 - 2.5 * LANE, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
-    turning = Vehicle(220, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2)
-    follower = Vehicle(200, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
-    assert controller.request_intersection_entry(in_box, 300, [in_box, turning, follower])
-    assert not controller.request_intersection_entry(turning, 300, [in_box, turning, follower])
+    in_box = Vehicle(NODE_A - 2.5 * LANE, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
+    turning = Vehicle(NODE_A - 80, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2)
+    follower = Vehicle(NODE_A - 100, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
+    assert controller.request_intersection_entry(in_box, NODE_A, [in_box, turning, follower])
+    assert not controller.request_intersection_entry(turning, NODE_A, [in_box, turning, follower])
     controller.frame_number += sc.LEFT_TURN_STARVATION_FRAMES
-    in_box.x = 300 + 3 * LANE
-    controller.cancel_intersection_entry(in_box, 300)
+    in_box.x = NODE_A + 3 * LANE
+    controller.cancel_intersection_entry(in_box, NODE_A)
     # The turner has left the network: no stale hold on through traffic.
-    assert controller.request_intersection_entry(follower, 300, [in_box, follower])
-    assert "EB" not in controller.nodes[300].left_turn_waiting
+    assert controller.request_intersection_entry(follower, NODE_A, [in_box, follower])
+    assert "EB" not in controller.nodes[NODE_A].left_turn_waiting

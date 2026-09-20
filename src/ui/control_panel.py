@@ -9,6 +9,9 @@ import tempfile
 import sys
 
 from src.experiments import batch_runner
+from src.ui.canvas_gemini import INT_X
+
+NODE_A_X, NODE_B_X = INT_X[0], INT_X[1]
 
 # ==========================================================
 # COLOR PALETTE & DESIGN SYSTEM CONSTANTS
@@ -299,7 +302,7 @@ def get_webster_timing_summary():
     splits = global_config.get("webster_splits") or {}
     nodes = []
     has_oversaturated_node = False
-    for node_x, node_name in ((300, "A"), (700, "B")):
+    for node_x, node_name in ((NODE_A_X, "A"), (NODE_B_X, "B")):
         split = splits.get(node_x) or splits.get(str(node_x))
         if not isinstance(split, dict):
             nodes.append({
@@ -886,15 +889,15 @@ def make_subsection_heading(parent, title, first=False):
     return row
 
 # ----------------------------------------------------------
-# 6 SIMULTANEOUS BUS ROUTES (NODE B CORRECTED TO X=700)
+# 6 SIMULTANEOUS BUS ROUTES (waypoints/lanes keyed by node x from canvas.INT_X)
 # ----------------------------------------------------------
 bus_routes_config = {
     "R1_EB_A_NB": {
         "name": "EB \u2192 Node A (NB)",
         "origin": "EB",
         "destination": "NODE_A_NB",
-        "waypoints": {300: "LEFT"},
-        "lanes": {300: 2},
+        "waypoints": {NODE_A_X: "LEFT"},
+        "lanes": {NODE_A_X: 2},
         "active": True,
         "headway_sec": 30,
         "tsp_enabled": False,
@@ -905,8 +908,8 @@ bus_routes_config = {
         "name": "EB \u2192 Node B (NB)",
         "origin": "EB",
         "destination": "NODE_B_NB",
-        "waypoints": {300: "STRAIGHT", 700: "LEFT"},
-        "lanes": {300: 1, 700: 2},
+        "waypoints": {NODE_A_X: "STRAIGHT", NODE_B_X: "LEFT"},
+        "lanes": {NODE_A_X: 1, NODE_B_X: 2},
         "active": True,
         "headway_sec": 45,
         "tsp_enabled": False,
@@ -917,8 +920,8 @@ bus_routes_config = {
         "name": "EB Corridor (Straight)",
         "origin": "EB",
         "destination": "EB_CORRIDOR",
-        "waypoints": {300: "STRAIGHT", 700: "STRAIGHT"},
-        "lanes": {300: 1, 700: 1},
+        "waypoints": {NODE_A_X: "STRAIGHT", NODE_B_X: "STRAIGHT"},
+        "lanes": {NODE_A_X: 1, NODE_B_X: 1},
         "active": False,
         "headway_sec": 30,
         "tsp_enabled": False,
@@ -929,8 +932,8 @@ bus_routes_config = {
         "name": "WB \u2192 Node A (SB)",
         "origin": "WB",
         "destination": "NODE_A_SB",
-        "waypoints": {700: "STRAIGHT", 300: "LEFT"},
-        "lanes": {700: 1, 300: 2},
+        "waypoints": {NODE_B_X: "STRAIGHT", NODE_A_X: "LEFT"},
+        "lanes": {NODE_B_X: 1, NODE_A_X: 2},
         "active": True,
         "headway_sec": 30,
         "tsp_enabled": False,
@@ -941,8 +944,8 @@ bus_routes_config = {
         "name": "WB \u2192 Node B (SB)",
         "origin": "WB",
         "destination": "NODE_B_SB",
-        "waypoints": {700: "LEFT"},
-        "lanes": {700: 2},
+        "waypoints": {NODE_B_X: "LEFT"},
+        "lanes": {NODE_B_X: 2},
         "active": True,
         "headway_sec": 45,
         "tsp_enabled": False,
@@ -953,8 +956,8 @@ bus_routes_config = {
         "name": "WB Corridor (Straight)",
         "origin": "WB",
         "destination": "WB_CORRIDOR",
-        "waypoints": {700: "STRAIGHT", 300: "STRAIGHT"},
-        "lanes": {700: 1, 300: 1},
+        "waypoints": {NODE_B_X: "STRAIGHT", NODE_A_X: "STRAIGHT"},
+        "lanes": {NODE_B_X: 1, NODE_A_X: 1},
         "active": False,
         "headway_sec": 30,
         "tsp_enabled": False,

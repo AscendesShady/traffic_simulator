@@ -69,7 +69,7 @@ def test_window_width_fits_side_panes_and_canvas_without_slack():
     assert control == main.MAX_CONTROL_PANE_WIDTH
     assert telemetry == main.MAX_TELEMETRY_PANE_WIDTH
     assert main.main_window_width_for(wide_screen) == (
-        control + telemetry + canvas.WIDTH + 2 * main.SIMULATION_PANE_GUTTER
+        control + telemetry + main.CANVAS_DISPLAY_WIDTH + 2 * main.SIMULATION_PANE_GUTTER
     )
     # The control column is a single stack of controls; telemetry keeps
     # roughly 30% more for its KPI grid and side-by-side node diagrams.
@@ -91,7 +91,7 @@ def test_window_width_fits_side_panes_and_canvas_without_slack():
         if root.winfo_screenwidth() - 60 >= fitted:
             # Center pane is the canvas plus its gutter (sashes excepted).
             assert simulation_pane.winfo_width() <= (
-                canvas.WIDTH + 2 * main.SIMULATION_PANE_GUTTER + 16
+                main.CANVAS_DISPLAY_WIDTH + 2 * main.SIMULATION_PANE_GUTTER + 16
             )
     finally:
         root.destroy()

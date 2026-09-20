@@ -5,6 +5,7 @@ carries the previous turn's measured latency forward as a decision horizon and
 shows, per route, where the nearest bus will be when the flags actually land.
 """
 import src.agents.agent as agent
+from tests.helpers import NODE_A, NODE_B
 
 
 def telemetry_with_eta(eta_sec, route_id="R1_EB_A_NB"):
@@ -19,7 +20,7 @@ def telemetry_with_eta(eta_sec, route_id="R1_EB_A_NB"):
                 "bus_id": "LATENCY_BUS",
                 "route_id": route_id,
                 "direction": "EB",
-                "route_leg": {"node_x": 300, "movement": "LEFT"},
+                "route_leg": {"node_x": NODE_A, "movement": "LEFT"},
                 "leg_state": "APPROACHING",
                 "distance_to_stop_bar_px": 120.0,
                 "eta_to_stop_bar_sec_freeflow": eta_sec,

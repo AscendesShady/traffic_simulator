@@ -12,7 +12,7 @@ from src.core.signal_controller import (
     NodeState,
     SignalController,
 )
-from tests.helpers import make_bus_for_leg
+from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 
 
 APPROACHES = ("EB", "WB", "NB", "SB")
@@ -38,8 +38,8 @@ def test_full_reset_restores_construction_state():
 
     controller.frame_number = 321
     controller._request_sequence = 12
-    controller._attempt_counts[("BUS_RESET", 300, 0)] = 3
-    node = controller.nodes[300]
+    controller._attempt_counts[("BUS_RESET", NODE_A, 0)] = 3
+    node = controller.nodes[NODE_A]
     node.phase = 4
     node.timer = 22
     node.priority_state = TSP_EXTENDING
@@ -48,7 +48,7 @@ def test_full_reset_restores_construction_state():
     node.request_queue.append(object())
     node.reservations[123] = {"vehicle": object()}
     node.terminal_history.append({"state": "COMPLETED"})
-    node.suppressed_keys.add(("BUS_RESET", 300, 0))
+    node.suppressed_keys.add(("BUS_RESET", NODE_A, 0))
     controller.discharge_active = True
     controller.discharge_mode = "Eastbound Corridor"
     controller.discharge_state = DISCHARGE_RECOVERY_FAILED
@@ -59,13 +59,13 @@ def test_full_reset_restores_construction_state():
     controller.discharge_recommendation = "mutated"
     controller.discharge_vehicles_discharged = 15
     controller.discharge_cycles = 4
-    controller._discharge_transition_signals[300]["EB"] = "GREEN"
-    controller._discharge_green_map = {300: "EB"}
+    controller._discharge_transition_signals[NODE_A]["EB"] = "GREEN"
+    controller._discharge_green_map = {NODE_A: "EB"}
     controller._discharge_stop_after_clearance = True
     controller._discharge_completed = True
     controller._discharge_last_progress_frame = 300
     controller._discharge_wait_snapshot = {"upstream": 10}
-    controller._discharge_tracked[(1, 300)] = object()
+    controller._discharge_tracked[(1, NODE_A)] = object()
     controller._discharge_last_served["Eastbound Corridor"] = 299
     config["discharge_start_requested"] = True
     config["discharge_stop_requested"] = True
@@ -112,7 +112,7 @@ def test_full_reset_restores_construction_state():
 
 def test_reset_clears_active_priority():
     control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] = True
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "RESET_ACTIVE_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "RESET_ACTIVE_BUS")
     controller = SignalController(
         {"green_time": 100}, yellow_time=2, red_clearance_time=2
     )
@@ -122,11 +122,11 @@ def test_reset_clears_active_priority():
 
     for _ in range(20):
         controller.update([bus])
-        if controller.nodes[300].priority_state == TSP_EXTENDING:
+        if controller.nodes[NODE_A].priority_state == TSP_EXTENDING:
             break
 
-    assert controller.nodes[300].priority_state == TSP_EXTENDING
-    assert controller.nodes[300].active_request is not None
+    assert controller.nodes[NODE_A].priority_state == TSP_EXTENDING
+    assert controller.nodes[NODE_A].active_request is not None
 
     controller.reset_all_state()
 

@@ -68,19 +68,21 @@ class DischargeStage:
     greens: tuple[tuple[int, str], ...]
 
 
+NODE_A_X, NODE_B_X = INT_X[0], INT_X[1]
+
 DISCHARGE_PLAN_STAGES = {
     "Eastbound Corridor": (
-        DischargeStage("Node B downstream", ((700, "EB"),)),
-        DischargeStage("Node B → Node A coordinated", ((300, "EB"), (700, "EB"))),
+        DischargeStage("Node B downstream", ((NODE_B_X, "EB"),)),
+        DischargeStage("Node B → Node A coordinated", ((NODE_A_X, "EB"), (NODE_B_X, "EB"))),
     ),
     "Westbound Corridor": (
-        DischargeStage("Node A downstream", ((300, "WB"),)),
-        DischargeStage("Node A → Node B coordinated", ((300, "WB"), (700, "WB"))),
+        DischargeStage("Node A downstream", ((NODE_A_X, "WB"),)),
+        DischargeStage("Node A → Node B coordinated", ((NODE_A_X, "WB"), (NODE_B_X, "WB"))),
     ),
-    "Node A Northbound": (DischargeStage("Node A northbound", ((300, "NB"),)),),
-    "Node A Southbound": (DischargeStage("Node A southbound", ((300, "SB"),)),),
-    "Node B Northbound": (DischargeStage("Node B northbound", ((700, "NB"),)),),
-    "Node B Southbound": (DischargeStage("Node B southbound", ((700, "SB"),)),),
+    "Node A Northbound": (DischargeStage("Node A northbound", ((NODE_A_X, "NB"),)),),
+    "Node A Southbound": (DischargeStage("Node A southbound", ((NODE_A_X, "SB"),)),),
+    "Node B Northbound": (DischargeStage("Node B northbound", ((NODE_B_X, "NB"),)),),
+    "Node B Southbound": (DischargeStage("Node B southbound", ((NODE_B_X, "SB"),)),),
 }
 
 # Auto recovery walks each node clockwise (N -> E -> S -> W), with the two

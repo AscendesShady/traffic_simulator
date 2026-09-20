@@ -6,7 +6,7 @@ import src.ui.control_panel as control_panel
 import src.core.main as main
 from src.ui.canvas_gemini import H_Y, LANE
 from src.core.signal_controller import SignalController
-from tests.helpers import make_bus_for_leg
+from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 from src.core.vehicle import Bus, DBL_LANE_INDEX, Vehicle
 
 
@@ -26,7 +26,7 @@ def _lane_options():
 
 
 def _put_bus_at_stop_bar_distance(bus, distance):
-    current = bus.distance_to_node_stop_bar(300, H_Y, 132, 10)
+    current = bus.distance_to_node_stop_bar(NODE_A, H_Y, 132, 10)
     delta = float(distance) - current
     bus.x += -delta if bus.direction == "EB" else delta
 
@@ -86,7 +86,7 @@ def test_bus_at_400px_uses_configured_eligibility_zone():
     route = control_panel.bus_routes_config["R1_EB_A_NB"]
     route["tsp_enabled"] = True
     route["dbl_enabled"] = True
-    bus = make_bus_for_leg("R1_EB_A_NB", 300)
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A)
     bus.lane_index = DBL_LANE_INDEX
     bus.y = H_Y - (DBL_LANE_INDEX + 0.5) * LANE
     _put_bus_at_stop_bar_distance(bus, 400)
@@ -94,10 +94,10 @@ def test_bus_at_400px_uses_configured_eligibility_zone():
     wide = SignalController({"green_time": 100, "priority_eligibility_px": 400})
     narrow = SignalController({"green_time": 100, "priority_eligibility_px": 250})
 
-    assert wide.is_bus_tsp_eligible(bus, 300)
-    assert wide.is_bus_dbl_eligible(bus, 300)
-    assert not narrow.is_bus_tsp_eligible(bus, 300)
-    assert not narrow.is_bus_dbl_eligible(bus, 300)
+    assert wide.is_bus_tsp_eligible(bus, NODE_A)
+    assert wide.is_bus_dbl_eligible(bus, NODE_A)
+    assert not narrow.is_bus_tsp_eligible(bus, NODE_A)
+    assert not narrow.is_bus_dbl_eligible(bus, NODE_A)
 
 
 def test_eligibility_slider_value_waits_for_controller_reset():

@@ -18,7 +18,7 @@ from src.core.signal_controller import (
 )
 from src.ui.telemetry_dashboard import COLOR_WARNING, TelemetryDashboard
 from src.telemetry.telemetry_exporter import TelemetryExporter
-from tests.helpers import make_bus_for_leg, rectangles_overlap
+from tests.helpers import make_bus_for_leg, rectangles_overlap, NODE_A, NODE_B
 from src.core.vehicle import Vehicle
 
 
@@ -42,7 +42,7 @@ def make_controller(selection=control_panel.DISCHARGE_AUTO):
 
 
 def eb_vehicle_before_node(node_x):
-    x = 100 if node_x == 300 else 500
+    x = 100 if node_x == NODE_A else 500
     vehicle = Vehicle(
         x,
         H_Y - 1.5 * LANE,
@@ -50,8 +50,8 @@ def eb_vehicle_before_node(node_x):
         target_turn="STRAIGHT",
         lane_index=1,
     )
-    if node_x == 700:
-        vehicle.passed_nodes.add(300)
+    if node_x == NODE_B:
+        vehicle.passed_nodes.add(NODE_A)
     vehicle.speed = 0.0
     return vehicle
 
@@ -123,21 +123,21 @@ def vehicle_in_box(node_x, direction):
 
 def wb_vehicle_before_node_a():
     vehicle = Vehicle(
-        500,
+        NODE_A + 200,
         H_Y + 1.5 * LANE,
         "WB",
         target_turn="STRAIGHT",
         lane_index=1,
     )
-    vehicle.passed_nodes.add(700)
+    vehicle.passed_nodes.add(NODE_B)
     vehicle.speed = 0.0
     return vehicle
 
 
 def test_manual_eastbound_discharge_is_downstream_first_then_coordinated():
     controller, config = make_controller("Eastbound Corridor")
-    upstream_a = eb_vehicle_before_node(300)
-    upstream_b = eb_vehicle_before_node(700)
+    upstream_a = eb_vehicle_before_node(NODE_A)
+    upstream_b = eb_vehicle_before_node(NODE_B)
     vehicles = [upstream_a, upstream_b]
 
     request_discharge(controller, config, vehicles, "Eastbound Corridor")
@@ -149,9 +149,9 @@ def test_manual_eastbound_discharge_is_downstream_first_then_coordinated():
 
     assert DISCHARGE_ALL_RED in observed
     assert controller.current_discharge_stage.label == "Node B downstream"
-    assert_exclusive_greens(controller.get_all_signals(), {700: "EB"})
+    assert_exclusive_greens(controller.get_all_signals(), {NODE_B: "EB"})
 
-    upstream_b.passed_nodes.add(700)
+    upstream_b.passed_nodes.add(NODE_B)
     advance_until(
         controller,
         vehicles,
@@ -162,17 +162,17 @@ def test_manual_eastbound_discharge_is_downstream_first_then_coordinated():
         ),
     )
     assert_exclusive_greens(
-        controller.get_all_signals(), {300: "EB", 700: "EB"}
+        controller.get_all_signals(), {NODE_A: "EB", NODE_B: "EB"}
     )
 
 
 def test_auto_selects_largest_safe_queue_and_keeps_other_movements_red():
     controller, config = make_controller()
     vehicles = [
-        vertical_vehicle(300, "NB", 0),
-        vertical_vehicle(300, "NB", 35),
-        vertical_vehicle(300, "NB", 70),
-        vertical_vehicle(700, "SB", 0),
+        vertical_vehicle(NODE_A, "NB", 0),
+        vertical_vehicle(NODE_A, "NB", 35),
+        vertical_vehicle(NODE_A, "NB", 70),
+        vertical_vehicle(NODE_B, "SB", 0),
     ]
 
     request_discharge(controller, config, vehicles, control_panel.DISCHARGE_AUTO)
@@ -188,21 +188,21 @@ def test_auto_selects_largest_safe_queue_and_keeps_other_movements_red():
     assert status["status"] == "DISCHARGING"
     assert status["arrivals_suspended"] is True
     assert status["priority_suspended"] is True
-    assert_exclusive_greens(controller.get_all_signals(), {300: "NB"})
+    assert_exclusive_greens(controller.get_all_signals(), {NODE_A: "NB"})
 
 
 def test_manual_selection_waits_with_reason_when_receiving_space_is_full():
     controller, config = make_controller("Eastbound Corridor")
-    waiting = eb_vehicle_before_node(700)
+    waiting = eb_vehicle_before_node(NODE_B)
     downstream_blocker = Vehicle(
-        780,
+        NODE_B + 80,
         waiting.y,
         "EB",
         target_turn="STRAIGHT",
         lane_index=1,
     )
     downstream_blocker.speed = 0.0
-    alternative = vertical_vehicle(700, "NB")
+    alternative = vertical_vehicle(NODE_B, "NB")
     vehicles = [waiting, downstream_blocker, alternative]
 
     request_discharge(controller, config, vehicles, "Eastbound Corridor")
@@ -219,24 +219,24 @@ def test_manual_selection_waits_with_reason_when_receiving_space_is_full():
         "Node B eastbound exit has insufficient storage"
     )
     assert status["recommendation"] == "Discharge Node B Northbound"
-    assert set(controller.get_all_signals()[700].values()) == {"RED"}
+    assert set(controller.get_all_signals()[NODE_B].values()) == {"RED"}
 
 
 def test_direction_aware_clearance_releases_same_direction_exiter():
     controller, _config = make_controller()
-    stage = DischargeStage("Node A eastbound", ((300, "EB"),))
-    exiter = vehicle_in_box(300, "EB")
-    waiting = eb_vehicle_before_node(300)
+    stage = DischargeStage("Node A eastbound", ((NODE_A, "EB"),))
+    exiter = vehicle_in_box(NODE_A, "EB")
+    waiting = eb_vehicle_before_node(NODE_A)
 
-    assert not controller.is_intersection_clear(300, [exiter])
+    assert not controller.is_intersection_clear(NODE_A, [exiter])
     assert controller.is_intersection_clear_for_greens(
-        300, stage.greens, [exiter]
+        NODE_A, stage.greens, [exiter]
     )
     assert controller._stage_readiness(stage, [exiter, waiting])[0] is True
 
-    cross_direction = vehicle_in_box(300, "NB")
+    cross_direction = vehicle_in_box(NODE_A, "NB")
     assert not controller.is_intersection_clear_for_greens(
-        300, stage.greens, [cross_direction]
+        NODE_A, stage.greens, [cross_direction]
     )
     assert controller._stage_readiness(
         stage, [cross_direction, waiting]
@@ -246,19 +246,19 @@ def test_direction_aware_clearance_releases_same_direction_exiter():
 def test_auto_selects_blocker_draining_plan():
     controller, config = make_controller()
     blocker = make_bus_for_leg(
-        "R2_EB_B_NB", 300, "BUS_R2_EB_B_NB_GRIDLOCK"
+        "R2_EB_B_NB", NODE_A, "BUS_R2_EB_B_NB_GRIDLOCK"
     )
-    blocker.x = 380.5
+    blocker.x = NODE_A + 80.5
     blocker.leg_state = "IN_INTERSECTION"
     blocker.speed = 0.0
     downstream_leader = Vehicle(
-        420,
+        NODE_A + 120,
         H_Y - 1.5 * LANE,
         "EB",
         target_turn="STRAIGHT",
         lane_index=1,
     )
-    downstream_leader.passed_nodes.add(300)
+    downstream_leader.passed_nodes.add(NODE_A)
     downstream_leader.speed = 0.0
     vehicles = [blocker, downstream_leader]
 
@@ -275,7 +275,7 @@ def test_auto_selects_blocker_draining_plan():
     assert status["mode"] == control_panel.DISCHARGE_AUTO
     assert status["selected"] == "Eastbound Corridor"
     assert controller.current_discharge_stage.label == "Node B downstream"
-    assert_exclusive_greens(controller.get_all_signals(), {700: "EB"})
+    assert_exclusive_greens(controller.get_all_signals(), {NODE_B: "EB"})
 
     for _ in range(120):
         signals = controller.get_all_signals()
@@ -291,18 +291,18 @@ def test_auto_selects_blocker_draining_plan():
                 controller,
             )
         controller.update(vehicles)
-        if 300 in blocker.passed_nodes:
+        if NODE_A in blocker.passed_nodes:
             break
 
-    assert 300 in blocker.passed_nodes
-    assert controller.is_intersection_clear(300, vehicles)
+    assert NODE_A in blocker.passed_nodes
+    assert controller.is_intersection_clear(NODE_A, vehicles)
 
 
 def test_auto_reranks_when_latched_candidate_unready():
     controller, config = make_controller()
     waiting_wb = wb_vehicle_before_node_a()
-    blocker_eb = vehicle_in_box(300, "EB")
-    blocker_nb = vehicle_in_box(300, "NB")
+    blocker_eb = vehicle_in_box(NODE_A, "EB")
+    blocker_nb = vehicle_in_box(NODE_A, "NB")
     vehicles = [waiting_wb, blocker_eb, blocker_nb]
 
     request_discharge(
@@ -315,7 +315,7 @@ def test_auto_reranks_when_latched_candidate_unready():
     )
     assert controller.discharge_plan_name is not None
 
-    alternative = vertical_vehicle(700, "NB")
+    alternative = vertical_vehicle(NODE_B, "NB")
     vehicles.append(alternative)
     # The clockwise rotation holds its due leg for a bounded grace period, so
     # a persistently blocked leg is handed over to the next servable leg
@@ -329,14 +329,14 @@ def test_auto_reranks_when_latched_candidate_unready():
 
     assert controller.discharge_state == DISCHARGE_ACTIVE
     assert controller.discharge_plan_name == "Node B Northbound"
-    assert_exclusive_greens(controller.get_all_signals(), {700: "NB"})
+    assert_exclusive_greens(controller.get_all_signals(), {NODE_B: "NB"})
 
 
 def test_waiting_never_all_red_forever():
     controller, config = make_controller()
     vehicles = [
-        vehicle_in_box(300, "EB"),
-        vehicle_in_box(300, "NB"),
+        vehicle_in_box(NODE_A, "EB"),
+        vehicle_in_box(NODE_A, "NB"),
     ]
 
     request_discharge(
@@ -374,7 +374,7 @@ def test_waiting_never_all_red_forever():
 
 def test_manual_plan_not_silently_switched():
     controller, config = make_controller("Westbound Corridor")
-    vehicles = [wb_vehicle_before_node_a(), vehicle_in_box(300, "EB")]
+    vehicles = [wb_vehicle_before_node_a(), vehicle_in_box(NODE_A, "EB")]
 
     request_discharge(controller, config, vehicles, "Westbound Corridor")
     advance_until(
@@ -394,15 +394,15 @@ def test_manual_plan_not_silently_switched():
 
 def test_no_perpendicular_overlap_during_recovery():
     controller, config = make_controller()
-    blocker = vehicle_in_box(300, "EB")
+    blocker = vehicle_in_box(NODE_A, "EB")
     downstream_leader = Vehicle(
-        410,
+        NODE_A + 110,
         H_Y - 1.5 * LANE,
         "EB",
         target_turn="STRAIGHT",
         lane_index=1,
     )
-    downstream_leader.passed_nodes.add(300)
+    downstream_leader.passed_nodes.add(NODE_A)
     vehicles = [blocker, downstream_leader]
     request_discharge(
         controller, config, vehicles, control_panel.DISCHARGE_AUTO
@@ -423,19 +423,19 @@ def test_no_perpendicular_overlap_during_recovery():
 def test_auto_selects_westbound_for_node_b_blocker():
     controller, config = make_controller()
     blocker = make_bus_for_leg(
-        "R4_WB_A_SB", 700, "BUS_R4_WB_A_SB_GRIDLOCK"
+        "R4_WB_A_SB", NODE_B, "BUS_R4_WB_A_SB_GRIDLOCK"
     )
-    blocker.x = 619.5
+    blocker.x = NODE_B - 80.5
     blocker.leg_state = "IN_INTERSECTION"
     blocker.speed = 0.0
     downstream_leader = Vehicle(
-        580,
+        NODE_B - 120,
         H_Y + 1.5 * LANE,
         "WB",
         target_turn="STRAIGHT",
         lane_index=1,
     )
-    downstream_leader.passed_nodes.add(700)
+    downstream_leader.passed_nodes.add(NODE_B)
     downstream_leader.speed = 0.0
     vehicles = [blocker, downstream_leader]
 
@@ -450,12 +450,12 @@ def test_auto_selects_westbound_for_node_b_blocker():
 
     assert controller.discharge_plan_name == "Westbound Corridor"
     assert controller.current_discharge_stage.label == "Node A downstream"
-    assert_exclusive_greens(controller.get_all_signals(), {300: "WB"})
+    assert_exclusive_greens(controller.get_all_signals(), {NODE_A: "WB"})
 
 
 def test_safe_stop_uses_yellow_and_all_red_before_normal_control():
     controller, config = make_controller("Node A Northbound")
-    vehicles = [vertical_vehicle(300, "NB")]
+    vehicles = [vertical_vehicle(NODE_A, "NB")]
     request_discharge(controller, config, vehicles, "Node A Northbound")
     advance_until(
         controller,
@@ -466,7 +466,7 @@ def test_safe_stop_uses_yellow_and_all_red_before_normal_control():
     config["discharge_stop_requested"] = True
     controller.update(vehicles)
     assert controller.discharge_state == DISCHARGE_STOPPING_YELLOW
-    assert controller.get_all_signals()[300]["NB"] == "YELLOW"
+    assert controller.get_all_signals()[NODE_A]["NB"] == "YELLOW"
 
     observed = advance_until(
         controller,
@@ -476,15 +476,15 @@ def test_safe_stop_uses_yellow_and_all_red_before_normal_control():
     assert DISCHARGE_STOPPING_ALL_RED in observed
     assert controller.is_discharge_active() is False
     assert controller.get_discharge_status()["status"] == "COMPLETED"
-    assert controller.get_all_signals()[300] == {
+    assert controller.get_all_signals()[NODE_A] == {
         "EB": "GREEN", "WB": "GREEN", "NB": "RED", "SB": "RED"
     }
 
 
 def test_safe_stop_remains_all_red_while_either_conflict_box_is_occupied():
     controller, config = make_controller("Node A Northbound")
-    waiting = vertical_vehicle(300, "NB")
-    blocker = Vehicle(700, H_Y, "EB", target_turn="STRAIGHT", lane_index=1)
+    waiting = vertical_vehicle(NODE_A, "NB")
+    blocker = Vehicle(NODE_B, H_Y, "EB", target_turn="STRAIGHT", lane_index=1)
     vehicles = [waiting, blocker]
     request_discharge(controller, config, vehicles, "Node A Northbound")
     advance_until(
@@ -518,7 +518,7 @@ def test_recovery_request_and_active_state_suspend_new_demand():
     assert not main.is_discharge_demand_suspended(controller)
 
     config["discharge_start_requested"] = True
-    controller.update([vertical_vehicle(700, "SB")])
+    controller.update([vertical_vehicle(NODE_B, "SB")])
     assert main.is_discharge_demand_suspended(controller)
 
 
@@ -542,7 +542,7 @@ def test_post_recovery_demand_is_metered_without_discarding_backlog():
 
 def test_telemetry_and_dashboard_expose_recovery_message():
     controller, config = make_controller("Node A Southbound")
-    vehicle = vertical_vehicle(300, "SB")
+    vehicle = vertical_vehicle(NODE_A, "SB")
     request_discharge(controller, config, [vehicle], "Node A Southbound")
     advance_until(
         controller,
@@ -559,7 +559,7 @@ def test_telemetry_and_dashboard_expose_recovery_message():
     recovery = payload["network_discharge"]
     assert recovery["selected"] == "Node A Southbound"
     assert recovery["status"] == "DISCHARGING"
-    assert payload["signal_state"]["nodes"]["300"]["phase"].startswith(
+    assert payload["signal_state"]["nodes"][str(NODE_A)]["phase"].startswith(
         "NETWORK_DISCHARGE_"
     )
 
@@ -576,7 +576,7 @@ def test_reset_clears_discharge_commands_and_runtime_state():
     request_discharge(
         controller,
         config,
-        [vertical_vehicle(700, "NB")],
+        [vertical_vehicle(NODE_B, "NB")],
         "Node B Northbound",
     )
     controller.reset_discharge()
@@ -590,13 +590,13 @@ def test_reset_clears_discharge_commands_and_runtime_state():
 def test_starting_discharge_cancels_and_audits_pending_priority_requests():
     controller, config = make_controller("Node A Northbound")
     control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] = True
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "RECOVERY_PRIORITY_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "RECOVERY_PRIORITY_BUS")
     controller.update([bus])
-    assert controller.get_node_status(300)["active_request"] is not None
+    assert controller.get_node_status(NODE_A)["active_request"] is not None
 
     request_discharge(controller, config, [bus], "Node A Northbound")
 
-    node_status = controller.get_node_status(300)
+    node_status = controller.get_node_status(NODE_A)
     assert node_status["active_request"] is None
     assert node_status["queued_requests"] == []
     terminal = node_status["terminal_history"][-1]
@@ -609,21 +609,21 @@ def test_starting_discharge_cancels_and_audits_pending_priority_requests():
 def test_active_priority_green_transitions_to_yellow_before_discharge_all_red():
     controller, config = make_controller("Node A Southbound")
     control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] = True
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "ACTIVE_PRIORITY_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "ACTIVE_PRIORITY_BUS")
     # EW green about to end with the bus still upstream: TSP holds it.
     controller.phase = 0
-    controller.timer = controller.get_green_time(300, 0) - 3
+    controller.timer = controller.get_green_time(NODE_A, 0) - 3
     for _ in range(20):
         controller.update([bus])
-        if controller.get_node_status(300)["priority_state"] == "TSP_EXTENDING":
+        if controller.get_node_status(NODE_A)["priority_state"] == "TSP_EXTENDING":
             break
-    assert controller.get_node_status(300)["priority_state"] == "TSP_EXTENDING"
-    assert controller.get_all_signals()[300]["EB"] == "GREEN"
-    assert controller.get_all_signals()[300]["WB"] == "GREEN"
+    assert controller.get_node_status(NODE_A)["priority_state"] == "TSP_EXTENDING"
+    assert controller.get_all_signals()[NODE_A]["EB"] == "GREEN"
+    assert controller.get_all_signals()[NODE_A]["WB"] == "GREEN"
 
     request_discharge(controller, config, [bus], "Node A Southbound")
 
-    assert controller.get_all_signals()[300] == {
+    assert controller.get_all_signals()[NODE_A] == {
         "EB": "YELLOW", "WB": "YELLOW", "NB": "RED", "SB": "RED"
     }
     advance_until(
@@ -634,7 +634,7 @@ def test_active_priority_green_transitions_to_yellow_before_discharge_all_red():
         ),
     )
     if controller.discharge_state != DISCHARGE_ACTIVE:
-        assert set(controller.get_all_signals()[300].values()) == {"RED"}
+        assert set(controller.get_all_signals()[NODE_A].values()) == {"RED"}
 
 
 def test_auto_recovery_reduces_a_saturated_network_without_collisions():
@@ -653,10 +653,10 @@ def test_auto_recovery_reduces_a_saturated_network_without_collisions():
     sources = {
         "EB": ("EB", -20, [H_Y - 0.5 * LANE, H_Y - 1.5 * LANE, H_Y - 2.5 * LANE]),
         "WB": ("WB", WIDTH + 20, [H_Y + 0.5 * LANE, H_Y + 1.5 * LANE, H_Y + 2.5 * LANE]),
-        "A_NB": ("NB", HEIGHT + 20, [300 - 0.5 * LANE, 300 - 1.5 * LANE, 300 - 2.5 * LANE]),
-        "A_SB": ("SB", -20, [300 + 0.5 * LANE, 300 + 1.5 * LANE, 300 + 2.5 * LANE]),
-        "B_NB": ("NB", HEIGHT + 20, [700 - 0.5 * LANE, 700 - 1.5 * LANE, 700 - 2.5 * LANE]),
-        "B_SB": ("SB", -20, [700 + 0.5 * LANE, 700 + 1.5 * LANE, 700 + 2.5 * LANE]),
+        "A_NB": ("NB", HEIGHT + 20, [NODE_A - 0.5 * LANE, NODE_A - 1.5 * LANE, NODE_A - 2.5 * LANE]),
+        "A_SB": ("SB", -20, [NODE_A + 0.5 * LANE, NODE_A + 1.5 * LANE, NODE_A + 2.5 * LANE]),
+        "B_NB": ("NB", HEIGHT + 20, [NODE_B - 0.5 * LANE, NODE_B - 1.5 * LANE, NODE_B - 2.5 * LANE]),
+        "B_SB": ("SB", -20, [NODE_B + 0.5 * LANE, NODE_B + 1.5 * LANE, NODE_B + 2.5 * LANE]),
     }
     peak_config = {
         "model": main.CONGESTION_MODEL,

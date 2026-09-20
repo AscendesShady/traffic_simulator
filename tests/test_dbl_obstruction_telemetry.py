@@ -12,11 +12,11 @@ from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
 from src.core.signal_controller import SignalController
 from src.telemetry.telemetry_exporter import TelemetryExporter
 from src.core.vehicle import DBL_LANE_INDEX, Vehicle
-from tests.helpers import make_bus_for_leg
+from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 
 
 ROUTE_ID = "R3_EB_ONLY"
-NODE_A = 300
+
 
 
 def lane_center_y(lane_index, direction="EB"):
@@ -115,7 +115,7 @@ def test_minimap_surfaces_dbl_usability():
                 "bus_id": "BLOCKED_DBL_BUS",
                 "route_id": "R1_EB_A_NB",
                 "direction": "EB",
-                "route_leg": {"node_x": 300, "movement": "LEFT"},
+                "route_leg": {"node_x": NODE_A, "movement": "LEFT"},
                 "leg_state": "APPROACHING",
                 "distance_to_stop_bar_px": 120.0,
                 "eta_to_stop_bar_sec_freeflow": 2.0,
@@ -241,12 +241,12 @@ def test_controller_never_arms_dbl_with_stopped_queue_ahead():
 
 def test_queue_ahead_veto_covers_every_route_and_both_directions():
     first_nodes = {
-        "R1_EB_A_NB": 300,
-        "R2_EB_B_NB": 300,
-        "R3_EB_ONLY": 300,
-        "R4_WB_A_SB": 700,
-        "R5_WB_B_SB": 700,
-        "R6_WB_ONLY": 700,
+        "R1_EB_A_NB": NODE_A,
+        "R2_EB_B_NB": NODE_A,
+        "R3_EB_ONLY": NODE_A,
+        "R4_WB_A_SB": NODE_B,
+        "R5_WB_B_SB": NODE_B,
+        "R6_WB_ONLY": NODE_B,
     }
     for route_id, node_x in first_nodes.items():
         route = control_panel.bus_routes_config[route_id]

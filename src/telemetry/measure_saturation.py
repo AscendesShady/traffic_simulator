@@ -42,7 +42,7 @@ from src.core.signal_controller import SignalController  # noqa: E402
 
 FPS = 60
 MEASURED_APPROACH = "EB"
-MEASURED_NODE = canvas.INT_X[0]          # Node A, x = 300
+MEASURED_NODE = canvas.INT_X[0]          # Node A
 # main.py injects at x=-20, but the road from there to the stop bar only
 # holds about eight cars, which caps the standing queue far too short to get a
 # stable headway sample. Injecting further upstream (off-canvas, physics is

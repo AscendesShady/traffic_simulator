@@ -253,6 +253,9 @@ def _config_regime_hash(config):
         "global": {key: config.get(key) for key in _CONFIG_HASH_GLOBAL_KEYS},
         "approach_configs": control_panel.approach_configs,
         "bus_routes_config": control_panel.bus_routes_config,
+        # Geometry is part of the regime: rows from a different network
+        # length must never pair with these.
+        "geometry": [canvas.WIDTH, canvas.HEIGHT, canvas.H_Y, list(canvas.INT_X)],
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
@@ -526,8 +529,8 @@ def calculate_startup_window_layout(screen_width, screen_height):
     telemetry_y = canvas_top + canvas.HEIGHT + gap
     telemetry_height = usable_bottom - telemetry_y
 
-    if right_width >= canvas.WIDTH and telemetry_height >= 400:
-        telemetry_width = min(max(900, canvas.WIDTH), right_width)
+    if right_width >= CANVAS_DISPLAY_WIDTH and telemetry_height >= 400:
+        telemetry_width = min(max(900, CANVAS_DISPLAY_WIDTH), right_width)
         return {
             "mode": "tiled",
             "canvas_position": (right_x, canvas_top),
@@ -544,7 +547,7 @@ def calculate_startup_window_layout(screen_width, screen_height):
     # Keep every window wholly on-screen and use a predictable cascade instead.
     telemetry_width = min(900, screen_width - 2 * margin)
     telemetry_height = min(430, usable_height)
-    canvas_x = max(margin, (screen_width - canvas.WIDTH) // 2)
+    canvas_x = max(margin, (screen_width - CANVAS_DISPLAY_WIDTH) // 2)
     control_x = max(margin, screen_width - control_width - margin)
     telemetry_x = max(margin, (screen_width - telemetry_width) // 2)
     return {
@@ -1375,7 +1378,7 @@ def write_unit_conversions_sheet(sheet, telemetry=None):
 
 # Bumped whenever a column is added/removed/redefined. append_experiment_summary_row
 # rotates the CSV (never appends ragged) when either this or config_hash changes.
-EXPERIMENT_SUMMARY_SCHEMA_VERSION = 4
+EXPERIMENT_SUMMARY_SCHEMA_VERSION = 5
 
 # PRIMARY DV: total_person_hours_travel_delay_steady, compared as a paired
 # per-seed difference against the baseline arm (pair_against_baseline ->
@@ -1478,17 +1481,39 @@ EXPERIMENT_SUMMARY_HEADERS = (
     "latency_ms_max", "latency_to_cycle_ratio_p50",
     "latency_to_cycle_ratio_p95", "input_tokens_total",
     "output_tokens_total", "tokens_per_sec_mean", "cost_usd_estimate",
-    # Independent-controller breakdown (section K).
-    "node_300_mean_delay_sec", "node_300_throughput_veh",
-    "node_300_tsp_grants", "node_300_cycle_sec_mean",
-    "node_300_phase_failures", "node_300_max_queue_len",
-    "node_700_mean_delay_sec", "node_700_throughput_veh",
-    "node_700_tsp_grants", "node_700_cycle_sec_mean",
-    "node_700_phase_failures", "node_700_max_queue_len",
+    # Independent-controller breakdown (section K): node_A_* / node_B_*,
+    # named by letter so the header survives a geometry change.
+    *(
+        f"node_{name}_{metric}"
+        for name in ("A", "B")
+        for metric in (
+            "mean_delay_sec", "throughput_veh", "tsp_grants", "cycle_sec_mean",
+            "phase_failures", "max_queue_len",
+        )
+    ),
     # Data-quality flags (section L): computed by the exporter, not the analyst.
     "qa_null_columns_json", "qa_baseline_contaminated", "qa_unbalanced_seed",
     "qa_duration_deviation_sec", "qa_flags_count",
 )
+
+
+def _node_breakdown_columns(config, controller_metrics):
+    """Section K per node: Node A = INT_X[0], Node B = INT_X[1]."""
+    out = {}
+    cycles = config.get("cycle_time_sec", {}) or {}
+    for name, node_x in zip(("A", "B"), canvas.INT_X):
+        key = str(node_x)
+        served = run_metrics["node_throughput_veh"][key]
+        out[f"node_{name}_mean_delay_sec"] = (
+            round(run_metrics["node_stopped_vehicle_frames"][key] / 60.0 / served, 3)
+            if served else None
+        )
+        out[f"node_{name}_throughput_veh"] = served
+        out[f"node_{name}_tsp_grants"] = controller_metrics["node_tsp_grants"].get(key, 0)
+        out[f"node_{name}_cycle_sec_mean"] = cycles.get(node_x) or cycles.get(key)
+        out[f"node_{name}_phase_failures"] = run_metrics["node_phase_failures"][key]
+        out[f"node_{name}_max_queue_len"] = run_metrics["node_max_queue_len"][key]
+    return out
 
 
 def _time_to_converge_sec(telemetry_rows, checkpoint_seconds):
@@ -2321,34 +2346,7 @@ def build_experiment_summary_row(
             )
         ),
         **reliability,
-        "node_300_mean_delay_sec": (
-            round(
-                run_metrics["node_stopped_vehicle_frames"]["300"]
-                / 60.0 / run_metrics["node_throughput_veh"]["300"], 3
-            ) if run_metrics["node_throughput_veh"]["300"] else None
-        ),
-        "node_300_throughput_veh": run_metrics["node_throughput_veh"]["300"],
-        "node_300_tsp_grants": controller_metrics["node_tsp_grants"].get("300", 0),
-        "node_300_cycle_sec_mean": (
-            config.get("cycle_time_sec", {}).get(300)
-            or config.get("cycle_time_sec", {}).get("300")
-        ),
-        "node_300_phase_failures": run_metrics["node_phase_failures"]["300"],
-        "node_300_max_queue_len": run_metrics["node_max_queue_len"]["300"],
-        "node_700_mean_delay_sec": (
-            round(
-                run_metrics["node_stopped_vehicle_frames"]["700"]
-                / 60.0 / run_metrics["node_throughput_veh"]["700"], 3
-            ) if run_metrics["node_throughput_veh"]["700"] else None
-        ),
-        "node_700_throughput_veh": run_metrics["node_throughput_veh"]["700"],
-        "node_700_tsp_grants": controller_metrics["node_tsp_grants"].get("700", 0),
-        "node_700_cycle_sec_mean": (
-            config.get("cycle_time_sec", {}).get(700)
-            or config.get("cycle_time_sec", {}).get("700")
-        ),
-        "node_700_phase_failures": run_metrics["node_phase_failures"]["700"],
-        "node_700_max_queue_len": run_metrics["node_max_queue_len"]["700"],
+        **_node_breakdown_columns(config, controller_metrics),
         "qa_baseline_contaminated": False,  # would have raised above otherwise
         "qa_unbalanced_seed": _qa_unbalanced_seed(
             campaign_id, model, config.get("test_seed")
@@ -3521,7 +3519,7 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
             spawn_coord = -40 if direction == "EB" else canvas.WIDTH + 40
             
             waypoints = r_cfg.get("waypoints", {})
-            first_node_x = 300 if direction == "EB" else 700
+            first_node_x = canvas.INT_X[0] if direction == "EB" else canvas.INT_X[-1]
             first_node_turn = waypoints.get(first_node_x, "STRAIGHT")
             lane_idx = 2 if first_node_turn == "LEFT" else 1
 
@@ -3590,6 +3588,10 @@ MAX_TELEMETRY_PANE_WIDTH = 420
 # the canvas plus this gutter -- any wider and the fixed-size network just
 # floats in empty background.
 SIMULATION_PANE_GUTTER = control_panel.SPACE_MD
+# The window is laid out for this display width of the physics surface; a
+# wider surface is smoothscaled down into it (see build_simulation_canvas)
+# rather than forcing a wider window.
+CANVAS_DISPLAY_WIDTH = min(canvas.WIDTH, 1000)
 
 
 def control_pane_width_for(screen_width):
@@ -3617,7 +3619,7 @@ def main_window_width_for(screen_width):
     fitted = (
         control_pane_width_for(screen_width)
         + telemetry_pane_width_for(screen_width)
-        + canvas.WIDTH + 2 * SIMULATION_PANE_GUTTER
+        + CANVAS_DISPLAY_WIDTH + 2 * SIMULATION_PANE_GUTTER
     )
     return max(900, min(screen_width - 60, fitted))
 
@@ -3668,7 +3670,7 @@ def large_window_geometry_for(screen_width, screen_height):
     """
     min_width = (
         MAX_CONTROL_PANE_WIDTH + MAX_TELEMETRY_PANE_WIDTH
-        + canvas.WIDTH + 2 * SIMULATION_PANE_GUTTER
+        + CANVAS_DISPLAY_WIDTH + 2 * SIMULATION_PANE_GUTTER
     )
     width = min(
         screen_width - 60,
@@ -3687,22 +3689,29 @@ def large_window_geometry_for(screen_width, screen_height):
     return width, height, x, y
 
 
-def fit_canvas_size(available_width, available_height):
-    """Largest 5:3 integer canvas size that fits the available area.
+# Width step that keeps the scaled height an exact integer at the surface's
+# aspect ratio (5 for 1000x600, 4 for 2400x600).
+CANVAS_ASPECT_STEP = canvas.WIDTH // math.gcd(canvas.WIDTH, canvas.HEIGHT)
 
-    The width is a multiple of 5 so the 5:3 height is an exact integer, and
-    never below a quarter of native so a transiently tiny pane (mid-resize)
-    cannot request a degenerate image.
+
+def fit_canvas_size(available_width, available_height):
+    """Largest integer canvas size at the surface's aspect ratio that fits
+    the available area.
+
+    The width is a multiple of CANVAS_ASPECT_STEP so the height is an exact
+    integer, and never below a quarter of native so a transiently tiny pane
+    (mid-resize) cannot request a degenerate image.
     """
-    floor_width = canvas.WIDTH // 4 - (canvas.WIDTH // 4) % 5
+    step = CANVAS_ASPECT_STEP
+    floor_width = canvas.WIDTH // 4 - (canvas.WIDTH // 4) % step
     scale = min(
         max(0.0, float(available_width)) / canvas.WIDTH,
         max(0.0, float(available_height)) / canvas.HEIGHT,
     )
     width = int(canvas.WIDTH * scale)
-    width -= width % 5
+    width -= width % step
     width = max(floor_width, width)
-    return width, width * 3 // 5
+    return width, width * canvas.HEIGHT // canvas.WIDTH
 
 
 def classify_window_shape(state, width, height, compact_size):

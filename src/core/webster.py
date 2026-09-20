@@ -23,6 +23,8 @@ Webster's optimum cycle collapses toward the lost time when Y is small, so the
 used cycle is floored at MIN_CYCLE_SEC, the usual practical minimum.
 """
 
+from src.ui.canvas_gemini import INT_X
+
 FPS = 60
 OVERSATURATED_CYCLE_CAP_SEC = 120.0
 MIN_CYCLE_SEC = 40.0
@@ -144,7 +146,7 @@ def compute_all_nodes(
 
     east_west = max(veh_per_hour("EB"), veh_per_hour("WB"))
     return {
-        300: compute_node_green_splits(
+        INT_X[0]: compute_node_green_splits(
             {
                 "EW": east_west,
                 "NS": max(veh_per_hour("A_NB"), veh_per_hour("A_SB")),
@@ -156,7 +158,7 @@ def compute_all_nodes(
             oversaturated_cycle_cap_sec,
             min_cycle_sec,
         ),
-        700: compute_node_green_splits(
+        INT_X[1]: compute_node_green_splits(
             {
                 "EW": east_west,
                 "NS": max(veh_per_hour("B_NB"), veh_per_hour("B_SB")),

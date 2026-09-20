@@ -12,7 +12,7 @@ import src.ui.control_panel as control_panel
 import src.core.guard as guard
 import src.core.main as main
 from src.core.signal_controller import SignalController
-from tests.helpers import make_bus_for_leg
+from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 
 
 @pytest.fixture(autouse=True)
@@ -114,10 +114,10 @@ def test_position_one_tsp_reaches_merge_and_signal_controller(
     assert main.merge_ai_decision(decision_path) is True
     assert control_panel.bus_routes_config[route_id]["tsp_enabled"] is True
 
-    bus = make_bus_for_leg(route_id, node_x=300, bus_id="POSITIONAL_TSP")
+    bus = make_bus_for_leg(route_id, node_x=NODE_A, bus_id="POSITIONAL_TSP")
     controller = SignalController(control_panel.global_config)
     controller.update([bus])
-    request = controller.get_node_status(300)["active_request"]
+    request = controller.get_node_status(NODE_A)["active_request"]
 
     assert request is not None
     assert request["route_id"] == route_id
@@ -638,7 +638,7 @@ def test_minimap_uses_only_approaching_unfinished_bus_legs():
         "bus_id": "ACTIONABLE",
         "route_id": "R1_EB_A_NB",
         "direction": "NB",
-        "route_leg": {"node_x": 300, "movement": "LEFT"},
+        "route_leg": {"node_x": NODE_A, "movement": "LEFT"},
         "leg_state": "APPROACHING",
         "distance_to_stop_bar_px": 120.0,
         "eta_to_stop_bar_sec_freeflow": 2.0,
@@ -674,7 +674,7 @@ def test_minimap_uses_only_approaching_unfinished_bus_legs():
             "passengers_per_minute_recent": 120.0,
         },
         "network_summary": {"queues_passengers_est": {"EB": 20}},
-        "signal_state": {"nodes": {"300": {"phase": "EW_GREEN"}}},
+        "signal_state": {"nodes": {str(NODE_A): {"phase": "EW_GREEN"}}},
         "active_buses": [completed, past_bar, actionable],
     }
     state = agent_state(telemetry=telemetry)
@@ -729,7 +729,7 @@ def test_minimap_still_has_routes_and_nodes():
         "network_summary": {"queues_passengers_est": {"EB": 20, "WB": 12}},
         "signal_state": {
             "nodes": {
-                "300": {"phase": "EW_GREEN", "signals": {"EB": "GREEN"}},
+                str(NODE_A): {"phase": "EW_GREEN", "signals": {"EB": "GREEN"}},
                 "780": {"phase": "NS_GREEN", "signals": {"NB": "GREEN"}},
             }
         },
@@ -743,7 +743,7 @@ def test_minimap_still_has_routes_and_nodes():
     assert "passengers_per_minute_recent=95.0" in minimap
     assert 'queues_passengers_est={"EB": 20, "WB": 12}' in minimap
     assert "NODE_SUMMARY:" in minimap
-    assert "NODE 300: phase=EW_GREEN" in minimap
+    assert f"NODE {NODE_A}: phase=EW_GREEN" in minimap
     assert "NODE 780: phase=NS_GREEN" in minimap
     assert "ROUTES:" in minimap
     for position, route_id in enumerate(guard.ROUTE_ORDER, start=1):
@@ -765,7 +765,7 @@ def test_minimap_node_summary_has_approach_queues_and_actionable_bus():
         "network_summary": {"queues_passengers_est": {}},
         "signal_state": {
             "nodes": {
-                "300": {
+                str(NODE_A): {
                     "phase": "NS_GREEN",
                     "signals": {
                         "EB": "RED", "WB": "RED", "NB": "GREEN", "SB": "GREEN"
@@ -774,7 +774,7 @@ def test_minimap_node_summary_has_approach_queues_and_actionable_bus():
                         "EB": 48, "WB": 32, "NB": 12, "SB": 8
                     },
                 },
-                "700": {
+                str(NODE_B): {
                     "phase": "EW_GREEN",
                     "signals": {
                         "EB": "GREEN", "WB": "GREEN", "NB": "RED", "SB": "RED"
@@ -791,7 +791,7 @@ def test_minimap_node_summary_has_approach_queues_and_actionable_bus():
                 "route_id": "R1_EB_A_NB",
                 "direction": "EB",
                 "route_leg": {
-                    "node_x": 300,
+                    "node_x": NODE_A,
                     "approach": "EB",
                     "movement": "LEFT",
                 },
@@ -808,10 +808,10 @@ def test_minimap_node_summary_has_approach_queues_and_actionable_bus():
         agent_state(telemetry=telemetry, decision_lag_sec=8.0)
     )["minimap"]
     node_300 = next(
-        line for line in minimap.splitlines() if line.startswith("- NODE 300:")
+        line for line in minimap.splitlines() if line.startswith(f"- NODE {NODE_A}:")
     )
     node_700 = next(
-        line for line in minimap.splitlines() if line.startswith("- NODE 700:")
+        line for line in minimap.splitlines() if line.startswith(f"- NODE {NODE_B}:")
     )
 
     assert "waiting_pax: EB=48 WB=32 NB=12 SB=8 (total=100)" in node_300
@@ -835,7 +835,7 @@ def test_minimap_node_summary_shows_queue_length_and_downstream_space():
         "network_summary": {"queues_passengers_est": {}},
         "signal_state": {
             "nodes": {
-                "300": {
+                str(NODE_A): {
                     "phase": "NS_GREEN",
                     "signals": {
                         "EB": "RED", "WB": "RED", "NB": "GREEN", "SB": "GREEN"
@@ -853,7 +853,7 @@ def test_minimap_node_summary_shows_queue_length_and_downstream_space():
                         "EB": False, "WB": False, "NB": False, "SB": True
                     },
                 },
-                "700": {
+                str(NODE_B): {
                     "phase": "EW_GREEN",
                     "signals": {
                         "EB": "GREEN", "WB": "GREEN", "NB": "RED", "SB": "RED"
@@ -884,7 +884,7 @@ def test_minimap_node_summary_shows_queue_length_and_downstream_space():
             line for line in minimap.splitlines()
             if line.startswith(f"- NODE {node_x}:")
         )
-        for node_x in ("300", "700")
+        for node_x in (str(NODE_A), str(NODE_B))
     }
 
     for line in node_lines.values():
@@ -895,21 +895,21 @@ def test_minimap_node_summary_shows_queue_length_and_downstream_space():
         assert line.index("waiting_pax:") < line.index("queue_len_m:")
         assert line.index("queue_len_m:") < line.index("downstream_free_m:")
 
-    assert "queue_len_m: EB=18.8 WB=7.5 NB=0.0 SB=3.8" in node_lines["300"]
+    assert "queue_len_m: EB=18.8 WB=7.5 NB=0.0 SB=3.8" in node_lines[str(NODE_A)]
     assert (
         "downstream_free_m: EB=67.0 WB=58.5 NB=40.2 SB=3.0(BLOCKED)"
-        in node_lines["300"]
+        in node_lines[str(NODE_A)]
     )
-    assert "queue_len_m: EB=0.0 WB=45.0 NB=12.0 SB=0.0" in node_lines["700"]
+    assert "queue_len_m: EB=0.0 WB=45.0 NB=12.0 SB=0.0" in node_lines[str(NODE_B)]
     assert (
         "downstream_free_m: EB=58.5 WB=0.0(BLOCKED) NB=58.5 SB=58.5"
-        in node_lines["700"]
+        in node_lines[str(NODE_B)]
     )
     # Unblocked approaches never carry the marker.
-    assert "EB=67.0(BLOCKED)" not in node_lines["300"]
+    assert "EB=67.0(BLOCKED)" not in node_lines[str(NODE_A)]
     # The existing per-node content is untouched.
-    assert "waiting_pax: EB=48 WB=32 NB=12 SB=8 (total=100)" in node_lines["300"]
-    assert "actionable_bus: none" in node_lines["300"]
+    assert "waiting_pax: EB=48 WB=32 NB=12 SB=8 (total=100)" in node_lines[str(NODE_A)]
+    assert "actionable_bus: none" in node_lines[str(NODE_A)]
 
     # Telemetry written before these fields existed still renders a NODE
     # line, with the new values marked unknown rather than crashing.
@@ -920,7 +920,7 @@ def test_minimap_node_summary_shows_queue_length_and_downstream_space():
         agent_state(telemetry=telemetry, decision_lag_sec=8.0)
     )["minimap"]
     legacy_300 = next(
-        line for line in legacy.splitlines() if line.startswith("- NODE 300:")
+        line for line in legacy.splitlines() if line.startswith(f"- NODE {NODE_A}:")
     )
     assert "queue_len_m: EB=? WB=? NB=? SB=?" in legacy_300
     assert "downstream_free_m: EB=? WB=? NB=? SB=?" in legacy_300
@@ -1014,10 +1014,10 @@ def test_minimap_route_line_carries_arrival_test_fields():
     telemetry = {
         "simulation_time_seconds": 10.0,
         "routes": {"R1_EB_A_NB": {"active": True, "tsp_enabled": True}},
-        "signal_state": {"nodes": {"300": {"phase": "EW_GREEN", "signals": {}}}},
+        "signal_state": {"nodes": {str(NODE_A): {"phase": "EW_GREEN", "signals": {}}}},
         "active_buses": [{
             "bus_id": "B1", "route_id": "R1_EB_A_NB", "leg_state": "APPROACHING",
-            "route_leg": {"node_x": 300, "approach": "EB"},
+            "route_leg": {"node_x": NODE_A, "approach": "EB"},
             "distance_to_stop_bar_px": 120.0, "eta_to_stop_bar_sec_freeflow": 12.0,
             "passengers": 45, "signal_colour_ahead": "GREEN", "residual_green_sec": 4.5,
             "would_have_stopped": True, "cross_traffic_pax": 17,
@@ -1088,7 +1088,7 @@ def test_approaching_grant_still_locks():
     bus = {
         "bus_id": "APPROACHING",
         "route_id": "R4_WB_A_SB",
-        "route_leg": {"node_x": 300, "movement": "LEFT"},
+        "route_leg": {"node_x": NODE_A, "movement": "LEFT"},
         "leg_state": "APPROACHING",
         "distance_to_stop_bar_px": 80.0,
         "eta_to_stop_bar_sec_freeflow": 1.5,

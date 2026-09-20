@@ -15,7 +15,7 @@ import src.core.main as main
 from src.telemetry.bus_event_log import BUS_EVENT_HEADERS, BusEventTracker, flatten_bus_event
 from src.ui.canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
 from src.core.signal_controller import TSP_ACTION_EXTENDING, TSP_ACTION_NONE, SignalController
-from tests.helpers import make_bus_for_leg
+from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 
 
 GREEN_FRAMES = 100
@@ -76,7 +76,7 @@ def test_bus_event_logged_on_completion(tmp_path):
     controller = make_controller()
     controller.phase = 0
     controller.timer = 0
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "DONE_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "DONE_BUS")
 
     record, completion_frame = run_bus_to_completion(bus, controller, tracker)
 
@@ -92,7 +92,7 @@ def test_bus_event_logged_on_completion(tmp_path):
     assert row["completion_frame"] == completion_frame
     assert row["completion_sim_time"] == pytest.approx(completion_frame / 60)
     assert row["completion_frame"] > row["spawn_frame"]
-    assert [node["node_x"] for node in row["nodes"]] == [300]
+    assert [node["node_x"] for node in row["nodes"]] == [NODE_A]
     node = row["nodes"][0]
     assert node["arrival_frame"] == 1
     assert node["stop_bar_cross_frame"] is not None
@@ -116,11 +116,11 @@ def test_tsp_treated_bus_flagged(tmp_path):
     controller = make_controller()
     controller.phase = 0
     controller.timer = GREEN_FRAMES - 3
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "TREATED_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "TREATED_BUS")
 
     record, _ = run_bus_to_completion(bus, controller, tracker)
 
-    history = controller.get_node_status(300)["terminal_history"]
+    history = controller.get_node_status(NODE_A)["terminal_history"]
     assert history[-1]["tsp_action"] == TSP_ACTION_EXTENDING
     node = record["nodes"][0]
     assert node["tsp_treated"] is True
@@ -141,7 +141,7 @@ def test_untreated_bus_flagged(tmp_path):
     controller = make_controller()
     controller.phase = 0
     controller.timer = GREEN_FRAMES - 3
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "PLAIN_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "PLAIN_BUS")
 
     record, _ = run_bus_to_completion(bus, controller, tracker)
 
@@ -167,14 +167,14 @@ def test_wait_frames_accumulate(tmp_path):
     free_controller.timer = 0
     # Use the signal-controlled straight route; permissive left turns are no
     # longer a valid fixture for red-signal waiting telemetry.
-    free_bus = make_bus_for_leg("R3_EB_ONLY", 300, "FREE_BUS")
+    free_bus = make_bus_for_leg("R3_EB_ONLY", NODE_A, "FREE_BUS")
     free_record, _ = run_bus_to_completion(free_bus, free_controller, tracker)
 
     # Held: NS green has just started, so the EB bus must wait at the bar.
     held_controller = make_controller()
     held_controller.phase = 3
     held_controller.timer = 0
-    held_bus = make_bus_for_leg("R3_EB_ONLY", 300, "HELD_BUS")
+    held_bus = make_bus_for_leg("R3_EB_ONLY", NODE_A, "HELD_BUS")
     held_record, _ = run_bus_to_completion(held_bus, held_controller, tracker)
 
     assert free_record["first_stop_frame"] is None
@@ -197,7 +197,7 @@ def test_bus_events_cleared_on_reset(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "TELEMETRY_LOG_PATH", tmp_path / "telemetry.jsonl")
     monkeypatch.setattr(main, "AGENT_TURN_LOG_PATH", tmp_path / "turns.jsonl")
     # An in-flight record must not survive RESET either.
-    stale_bus = make_bus_for_leg("R1_EB_A_NB", 300, "STALE_BUS")
+    stale_bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "STALE_BUS")
     main.bus_event_tracker.observe([stale_bus], 5, None)
     assert main.bus_event_tracker.active_record("STALE_BUS") is not None
 
@@ -220,7 +220,7 @@ def test_bus_events_in_export(tmp_path, monkeypatch):
     controller = make_controller()
     controller.phase = 0
     controller.timer = GREEN_FRAMES - 3
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "EXPORT_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "EXPORT_BUS")
     record, _ = run_bus_to_completion(bus, controller, tracker)
 
     monkeypatch.setattr(main, "BUS_EVENTS_LOG_PATH", bus_log)
@@ -249,7 +249,7 @@ def test_bus_events_in_export(tmp_path, monkeypatch):
 
 def test_tracker_never_raises_on_bad_input(tmp_path):
     tracker = BusEventTracker(tmp_path / "missing_dir" / "bus_events.jsonl")
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "ROBUST_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "ROBUST_BUS")
     # Bad frame, missing controller, unwritable path: all swallowed.
     tracker.observe([bus, object()], "not-a-frame", None)
     tracker.observe([bus], 1, None)

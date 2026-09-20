@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A desktop traffic and transit simulation of two connected signalized intersections (Node A at x=300, Node B at x=700), built on Pygame (rendered offscreen into a Tk canvas), Tkinter, and an optional separate-process LLM supervisor (LangGraph over local Ollama or the Gemini API). It models demand generation, six fixed bus routes with Transit Signal Priority (TSP) and a Dynamic Bus Lane (DBL), Webster-derived signal timing, conflict-safe intersection entry, and gridlock discharge/recovery. This is a simulation and research tool, not a certified traffic-signal controller — never treat it as one.
+A desktop traffic and transit simulation of two connected signalized intersections (Node A at x=800, Node B at x=1600 on a 2400×600 px physics surface — `canvas_gemini.INT_X`; the Tk pane smoothscales the surface, so the world size is independent of the window), built on Pygame (rendered offscreen into a Tk canvas), Tkinter, and an optional separate-process LLM supervisor (LangGraph over local Ollama or the Gemini API). It models demand generation, six fixed bus routes with Transit Signal Priority (TSP) and a Dynamic Bus Lane (DBL), Webster-derived signal timing, conflict-safe intersection entry, and gridlock discharge/recovery. This is a simulation and research tool, not a certified traffic-signal controller — never treat it as one.
 
 ## Commands
 
@@ -100,7 +100,7 @@ A DBL request/grant is additionally vetoed whenever `vehicle.dbl_lane_is_obstruc
 
 ### Early-green arrival gate, warm-up discard, baseline arm
 
-`SignalController._early_green_is_feasible` gates every red truncation: the cut must exceed `yellow + all_red`, and the bus's predicted stop-bar crossing (`max(eta, green start)`, ETA from the shared `vehicle.eta_frames_to_stop_bar` — current speed, floored, the same estimator telemetry publishes) must fall inside the green the cut brings forward. A withheld request stays `ARMED` and is re-checked each frame; a bus that crosses untreated finishes `DENIED` with the gate reason. `priority_eligibility_px` is clamped to the 400 px link between nodes. See `docs/audits/2026-09-20-tsp-early-green-mistiming.md` — and note that comparing `early_green` crossings against `none` crossings is a selection artefact (red-arrivals vs green-arrivals); compare arms on paired seeds instead. `src/experiments/headless_run.py` replays the fixed-step loop without Tk for that purpose (`TSP_BATCH_TESTS=1` enables the seed-batch regression).
+`SignalController._early_green_is_feasible` gates every red truncation: the cut must exceed `yellow + all_red`, and the bus's predicted stop-bar crossing (`max(eta, green start)`, ETA from the shared `vehicle.eta_frames_to_stop_bar` — current speed, floored, the same estimator telemetry publishes) must fall inside the green the cut brings forward. A withheld request stays `ARMED` and is re-checked each frame; a bus that crosses untreated finishes `DENIED` with the gate reason. `priority_eligibility_px` is clamped to the link between nodes (`INT_X[1] - INT_X[0]`, 800 px = 200 m at 0.25 m/px). See `docs/audits/2026-09-20-tsp-early-green-mistiming.md` — and note that comparing `early_green` crossings against `none` crossings is a selection artefact (red-arrivals vs green-arrivals); compare arms on paired seeds instead. `src/experiments/headless_run.py` replays the fixed-step loop without Tk for that purpose (`TSP_BATCH_TESTS=1` enables the seed-batch regression).
 
 Every steady-state DV in `experiment_summary.csv` (`pax_per_min_steady`, `*_delay_steady`, `converged`) discards `global_config["warmup_discard_frames"]` (default 7200 = 120 s) via the snapshot `main.snapshot_warmup_baseline` takes once per run; the cumulative columns stay as they were. Default benchmark duration is 60 min. A summary CSV whose header no longer matches is rotated, never appended to ragged.
 
@@ -147,7 +147,7 @@ Every AI or rule turn is recorded to an **"AI Decision Audit"** sheet (`main.wri
 
 ## Working in this codebase
 
-- Nodes are independent (`self.nodes[node_x]`) — never merge Node A/B state back into a shared clock.
+- Nodes are independent (`self.nodes[node_x]`) — never merge Node A/B state back into a shared clock. Never hard-code a node's x: use `canvas.INT_X[0]/[1]` (`control_panel.NODE_A_X/NODE_B_X`, `tests.helpers.NODE_A/NODE_B`); route waypoints, discharge plans, Webster splits, CSV `node_A_*/node_B_*` columns and the tests all derive from it, and `config_hash` includes the geometry so rows from different network lengths never pair.
 - Change signal/right-of-way behavior only in `signal_controller.py`, together with the `vehicle.py` request contract; never let a vehicle or the LLM path set green directly.
 - Change LLM-facing schema in `agent.py` and `guard.py` together, and check whether `rule_controller.py` needs the same change to stay a valid comparator. Keep `decision.json`'s internal route-ID-keyed format canonical.
 - Change telemetry fields in `telemetry_exporter.py`, `telemetry_dashboard.py`, the agent minimap, and export mappings together, bumping `schema_version` for breaking changes.

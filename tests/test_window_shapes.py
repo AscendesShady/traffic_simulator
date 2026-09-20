@@ -13,24 +13,28 @@ import src.ui.control_panel as control_panel
 import src.core.main as main
 
 
-def test_fit_canvas_size_keeps_5_3_with_integer_pixels():
-    assert main.fit_canvas_size(1000, 600) == (1000, 600)
-    for available in ((1146, 900), (2500, 700), (1500, 2000), (1780, 1068)):
+def test_fit_canvas_size_keeps_surface_aspect_with_integer_pixels():
+    step = main.CANVAS_ASPECT_STEP
+    assert main.fit_canvas_size(canvas.WIDTH, canvas.HEIGHT) == (canvas.WIDTH, canvas.HEIGHT)
+    for available in ((1146, 900), (2500, 700), (1500, 2000), (1780, 1068), (1000, 600)):
         width, height = main.fit_canvas_size(*available)
-        assert width * 3 == height * 5
+        assert width * canvas.HEIGHT == height * canvas.WIDTH
         assert width <= available[0] and height <= available[1]
-        assert width % 5 == 0
+        assert width % step == 0
     # Width-limited and height-limited cases land on the tight dimension.
-    assert main.fit_canvas_size(1146, 900) == (1145, 687)
-    assert main.fit_canvas_size(2500, 700) == (1165, 699)
+    width, height = main.fit_canvas_size(1146, 3000)
+    assert 1146 - step < width <= 1146
+    width, height = main.fit_canvas_size(9000, 450)
+    assert height <= 450 and height + canvas.HEIGHT // canvas.WIDTH * step + 1 >= 450
     # A transiently tiny pane never yields a degenerate image.
-    assert main.fit_canvas_size(0, 0) == (250, 150)
+    floor = canvas.WIDTH // 4 - (canvas.WIDTH // 4) % step
+    assert main.fit_canvas_size(0, 0) == (floor, floor * canvas.HEIGHT // canvas.WIDTH)
 
 
 def test_large_window_geometry_is_centered_and_never_narrower_than_the_panes():
     min_width = (
         main.MAX_CONTROL_PANE_WIDTH + main.MAX_TELEMETRY_PANE_WIDTH
-        + canvas.WIDTH + 2 * main.SIMULATION_PANE_GUTTER
+        + main.CANVAS_DISPLAY_WIDTH + 2 * main.SIMULATION_PANE_GUTTER
     )
     width, height, x, y = main.large_window_geometry_for(1920, 1080)
     assert width == min_width == 1764
@@ -202,7 +206,7 @@ def test_push_frame_halves_its_rate_above_the_pixel_threshold(monkeypatch):
     try:
         simulation_canvas, push_frame = build_canvas(host)
         surface = pygame.Surface((canvas.WIDTH, canvas.HEIGHT))
-        big = main.fit_canvas_size(3000, 1800)     # 5x native pixels
+        big = main.fit_canvas_size(canvas.WIDTH * 3, canvas.HEIGHT * 3)  # 9x native pixels
         simulation_canvas.set_target_size(*big)
         for _ in range(4):
             push_frame(surface)

@@ -11,11 +11,11 @@ import src.ui.control_panel as control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
 from src.core.signal_controller import SignalController
 from src.core.vehicle import DBL_LANE_INDEX, Vehicle
-from tests.helpers import make_bus_for_leg, rectangles_overlap
+from tests.helpers import make_bus_for_leg, rectangles_overlap, NODE_A, NODE_B
 
 
-NODE_A = 300
-NODE_B = 700
+NODE_A = NODE_A
+NODE_B = NODE_B
 STOP_BAR_X = NODE_A - ROAD_W / 2 - STOP
 ALL_GREEN = {
     node: {direction: "GREEN" for direction in ("EB", "WB", "NB", "SB")}

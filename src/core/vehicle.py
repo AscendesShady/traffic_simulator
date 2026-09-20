@@ -1,6 +1,8 @@
 # vehicle.py
 import pygame
 
+from src.ui.canvas_gemini import INT_X
+
 
 CAR_PASSENGERS = 4
 TRUCK_PASSENGERS = 1
@@ -643,7 +645,7 @@ class Bus(Vehicle):
     def __init__(
         self, x, y, direction, route_info, bus_id="BUS_01", max_speed=1.0
     ):
-        first_node_x = 300 if direction == "EB" else 700
+        first_node_x = INT_X[0] if direction == "EB" else INT_X[-1]
         target_turn = route_info.get("waypoints", {}).get(first_node_x, "STRAIGHT")
         super().__init__(
             x=x,

@@ -9,10 +9,10 @@ import src.ui.control_panel as control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE
 from src.core.signal_controller import SignalController
 from src.core.vehicle import DBL_LANE_INDEX, DBL_MERGE_ABANDON_FRAMES, Vehicle
-from tests.helpers import make_bus_for_leg
+from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 
 
-NODE_A = 300
+NODE_A = NODE_A
 
 
 def lane_center_y(lane_index, direction="EB"):
@@ -162,7 +162,7 @@ def test_abandon_resets_on_new_leg():
     vehicles.remove(blocker)
     run(controller, bus, vehicles, 1)
 
-    assert bus.get_active_route_leg(INT_X)["node_x"] == 700
+    assert bus.get_active_route_leg(INT_X)["node_x"] == NODE_B
     assert bus.dbl_merge_abandoned_for_leg is False
     assert bus.dbl_merge_hold_frames == 0
 

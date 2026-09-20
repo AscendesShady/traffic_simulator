@@ -9,6 +9,7 @@ import src.core.main as main
 import src.core.webster as webster
 from src.core.signal_controller import SignalController
 from src.telemetry.telemetry_exporter import TelemetryExporter
+from tests.helpers import NODE_A, NODE_B
 
 
 # ---------------------------------------------------------------- Part A
@@ -93,9 +94,9 @@ def test_per_node_cycles_can_differ():
     # S low enough that both nodes' optima clear the 40 s floor.
     splits = webster.compute_all_nodes(flows, s=600.0, lost_time_sec=4.0)
 
-    assert splits[300]["cycle_time_sec"] != splits[700]["cycle_time_sec"]
-    assert splits[300]["cycle_source"] == "webster_optimal"
-    assert splits[700]["cycle_source"] == "webster_optimal"
+    assert splits[NODE_A]["cycle_time_sec"] != splits[NODE_B]["cycle_time_sec"]
+    assert splits[NODE_A]["cycle_source"] == "webster_optimal"
+    assert splits[NODE_B]["cycle_source"] == "webster_optimal"
 
 
 def test_critical_lane_fraction_matches_spawn_lane_choice():
@@ -118,7 +119,7 @@ def test_webster_uses_per_lane_flows_against_per_lane_s():
     than the 155 s the whole-approach mismatch used to produce."""
     flows = {key: dict(value) for key, value in control_panel.approach_configs.items()}
     splits = webster.compute_all_nodes(flows, s=1291.0, lost_time_sec=4.0)
-    node = splits[300]
+    node = splits[NODE_A]
     ew_lane = webster.critical_lane_fraction(flows["EB"]["turn_split"])
     ns_lane = webster.critical_lane_fraction(flows["A_NB"]["turn_split"])
     ew_flow = flows["EB"]["rate"] * 60 * ew_lane          # 720 x 0.40 = 288
@@ -153,7 +154,7 @@ def test_symmetric_flows_equal_nodes():
 
     splits = webster.compute_all_nodes(flows, s=1800.0, lost_time_sec=4.0)
 
-    assert splits[300] == splits[700]
+    assert splits[NODE_A] == splits[NODE_B]
 
 
 def test_lost_time_counts_both_phase_changes():
@@ -181,7 +182,7 @@ def test_calibration_runs_before_frame_zero(monkeypatch):
 
     assert frame == 0
     assert control_panel.global_config["measured_saturation_flow"] > 0
-    assert set(control_panel.global_config["webster_splits"]) == {300, 700}
+    assert set(control_panel.global_config["webster_splits"]) == {NODE_A, NODE_B}
     # The flag is always cleared, so the run is never left waiting.
     assert control_panel.global_config["calibrating"] is False
 
@@ -259,16 +260,16 @@ def test_calibration_is_deterministic_for_a_seed():
 def test_controller_serves_per_node_per_phase_green(monkeypatch):
     """Phase 0 gets the EW split and phase 3 the NS split, per node."""
     splits = {
-        300: {"EW_green_frames": 900, "NS_green_frames": 300},
-        700: {"EW_green_frames": 600, "NS_green_frames": 1200},
+        NODE_A: {"EW_green_frames": 900, "NS_green_frames": 300},
+        NODE_B: {"EW_green_frames": 600, "NS_green_frames": 1200},
     }
     monkeypatch.setitem(control_panel.global_config, "webster_splits", splits)
     controller = calibrating_controller()
 
-    assert controller.get_green_time(300, 0) == 900
-    assert controller.get_green_time(300, 3) == 300
-    assert controller.get_green_time(700, 0) == 600
-    assert controller.get_green_time(700, 3) == 1200
+    assert controller.get_green_time(NODE_A, 0) == 900
+    assert controller.get_green_time(NODE_A, 3) == 300
+    assert controller.get_green_time(NODE_B, 0) == 600
+    assert controller.get_green_time(NODE_B, 3) == 1200
 
 
 def test_controller_falls_back_without_calibration(monkeypatch):
@@ -276,7 +277,7 @@ def test_controller_falls_back_without_calibration(monkeypatch):
     monkeypatch.setitem(control_panel.global_config, "green_time", 240)
     controller = calibrating_controller()
 
-    assert controller.get_green_time(300, 0) == 240
+    assert controller.get_green_time(NODE_A, 0) == 240
 
 
 def test_no_cycle_or_green_time_input_exists():
@@ -306,7 +307,7 @@ def test_panel_reports_calibration_state(monkeypatch):
         control_panel.global_config,
         "webster_splits",
         {
-            300: {
+            NODE_A: {
                 "cycle_time_sec": 55.0,
                 "webster_optimal_cycle_sec": 55.0,
                 "EW_green_sec": 30.0,
@@ -316,7 +317,7 @@ def test_panel_reports_calibration_state(monkeypatch):
                 "Y": 0.75,
                 "oversaturated": False,
             },
-            700: {
+            NODE_B: {
                 "cycle_time_sec": 48.0,
                 "webster_optimal_cycle_sec": 48.0,
                 "EW_green_sec": 25.0,
@@ -330,10 +331,10 @@ def test_panel_reports_calibration_state(monkeypatch):
     )
     text, state = control_panel.describe_webster_timing()
     assert state == "READY"
-    assert "NODE 300 (A):  S=1366 veh/hr" in text
+    assert f"NODE {NODE_A} (A):  S=1366 veh/hr" in text
     assert "Y=0.75  cycle=55s (optimal)" in text
     assert "EW green 30.0s | NS green 21.0s" in text
-    assert "NODE 700 (B):  S=1366 veh/hr" in text
+    assert f"NODE {NODE_B} (B):  S=1366 veh/hr" in text
     assert "Y=0.70  cycle=48s (optimal)" in text
 
 
@@ -346,7 +347,7 @@ def test_panel_builds_clear_per_node_timing_summary(monkeypatch):
         control_panel.global_config,
         "webster_splits",
         {
-            300: {
+            NODE_A: {
                 "cycle_time_sec": 55.0,
                 "EW_green_sec": 30.0,
                 "NS_green_sec": 21.0,
@@ -355,7 +356,7 @@ def test_panel_builds_clear_per_node_timing_summary(monkeypatch):
                 "Y": 0.75,
                 "oversaturated": False,
             },
-            700: {
+            NODE_B: {
                 "cycle_time_sec": 120.0,
                 "EW_green_sec": 70.0,
                 "NS_green_sec": 46.0,
@@ -388,7 +389,7 @@ def test_panel_warns_for_oversaturated_node(monkeypatch):
         control_panel.global_config,
         "webster_splits",
         {
-            300: {
+            NODE_A: {
                 "cycle_time_sec": 120.0,
                 "EW_green_sec": 70.0,
                 "NS_green_sec": 46.0,
@@ -397,7 +398,7 @@ def test_panel_warns_for_oversaturated_node(monkeypatch):
                 "Y": 1.25,
                 "oversaturated": True,
             },
-            700: {
+            NODE_B: {
                 "cycle_time_sec": 40.0,
                 "EW_green_sec": 22.0,
                 "NS_green_sec": 14.0,
@@ -424,7 +425,7 @@ def test_export_records_s_and_per_node_cycle(monkeypatch):
     monkeypatch.setitem(
         control_panel.global_config,
         "webster_splits",
-        {300: {
+        {NODE_A: {
             "EW_green_sec": 30.0,
             "NS_green_sec": 26.0,
             "cycle_time_sec": 60.0,
@@ -445,12 +446,12 @@ def test_export_records_s_and_per_node_cycle(monkeypatch):
         ("Signal timing", "measured_saturation_flow_veh_per_hr")
     ] == 1366
     assert ("Signal timing", "cycle_time_sec") not in recorded
-    assert recorded[("Signal timing: node 300", "EW_green_sec")] == 30.0
-    assert recorded[("Signal timing: node 300", "cycle_time_sec")] == 60.0
-    assert recorded[("Signal timing: node 300", "cycle_source")] == (
+    assert recorded[(f"Signal timing: node {NODE_A}", "EW_green_sec")] == 30.0
+    assert recorded[(f"Signal timing: node {NODE_A}", "cycle_time_sec")] == 60.0
+    assert recorded[(f"Signal timing: node {NODE_A}", "cycle_source")] == (
         "webster_optimal"
     )
-    assert recorded[("Signal timing: node 300", "Y")] == 0.8
+    assert recorded[(f"Signal timing: node {NODE_A}", "Y")] == 0.8
 
 
 def test_telemetry_records_used_cycle_per_node(tmp_path, monkeypatch):

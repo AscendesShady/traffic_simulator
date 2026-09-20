@@ -782,11 +782,11 @@ class TelemetryDashboard:
             1, weight=1, uniform="intersection_node_columns"
         )
         self.node_title_labels = []
-        self.node_a_canvas = self.create_node_canvas(diagram_frame, "NODE A (x=300)")
+        self.node_a_canvas = self.create_node_canvas(diagram_frame, f"NODE A (x={control_panel.NODE_A_X})")
         self.node_a_canvas.master.grid(
             row=0, column=0, sticky="nsew", padx=(0, 5)
         )
-        self.node_b_canvas = self.create_node_canvas(diagram_frame, "NODE B (x=700)")
+        self.node_b_canvas = self.create_node_canvas(diagram_frame, f"NODE B (x={control_panel.NODE_B_X})")
         self.node_b_canvas.master.grid(
             row=0, column=1, sticky="nsew", padx=(5, 0)
         )
@@ -1394,7 +1394,7 @@ class TelemetryDashboard:
         # One stacked sub-card per node: side-by-side columns would force
         # "EW 0.30 · NS 0.20 · Total 0.50" to wrap in this narrow pane.
         self.webster_node_cards = {}
-        for node_x, node_name in ((300, "A"), (700, "B")):
+        for node_x, node_name in ((control_panel.NODE_A_X, "A"), (control_panel.NODE_B_X, "B")):
             node_card = tk.Frame(
                 card,
                 bg=COLOR_CARD_ALT,
@@ -2076,8 +2076,8 @@ class TelemetryDashboard:
         )
 
         nodes = signal_state.get("nodes", {})
-        node_a_signals = nodes.get("300", {}).get("signals", {})
-        node_b_signals = nodes.get("700", {}).get("signals", {})
+        node_a_signals = nodes.get(str(control_panel.NODE_A_X), {}).get("signals", {})
+        node_b_signals = nodes.get(str(control_panel.NODE_B_X), {}).get("signals", {})
         live_states = {
             "EW": self.aggregate_signal_state(
                 (
@@ -2139,8 +2139,8 @@ class TelemetryDashboard:
         signal_state = data.get("signal_state", {})
         nodes = signal_state.get("nodes", {})
         fallback = signal_state.get("current_phase", "UNKNOWN")
-        node_a = nodes.get("300", {})
-        node_b = nodes.get("700", {})
+        node_a = nodes.get(str(control_panel.NODE_A_X), {})
+        node_b = nodes.get(str(control_panel.NODE_B_X), {})
         self.draw_intersection(
             self.node_a_canvas,
             "A",
@@ -2226,7 +2226,7 @@ class TelemetryDashboard:
                 refs["note"].config(text="")
                 refs["note"].pack_forget()
 
-        for node_x, canvas in ((300, self.node_a_canvas), (700, self.node_b_canvas)):
+        for node_x, canvas in ((control_panel.NODE_A_X, self.node_a_canvas), (control_panel.NODE_B_X, self.node_b_canvas)):
             label = getattr(canvas, "green_time_label", None)
             if label is None:
                 continue

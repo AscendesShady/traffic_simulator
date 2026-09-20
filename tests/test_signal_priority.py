@@ -23,7 +23,7 @@ from src.core.signal_controller import (
 )
 from src.core.vehicle import DBL_LANE_INDEX, Vehicle
 from src.core.signal_controller import PRIORITY_ELIGIBILITY_MAX_PX
-from tests.helpers import make_bus_for_leg
+from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 
 
 GREEN_FRAMES = 100
@@ -40,12 +40,12 @@ def make_controller(min_green_frames=30, **kwargs):
     )
 
 
-def tsp_bus(route_id="R1_EB_A_NB", node_x=300, bus_id="TSP_BUS"):
+def tsp_bus(route_id="R1_EB_A_NB", node_x=NODE_A, bus_id="TSP_BUS"):
     control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
     return make_bus_for_leg(route_id, node_x, bus_id)
 
 
-def step(controller, vehicles, node_x=300, move_bus=False):
+def step(controller, vehicles, node_x=NODE_A, move_bus=False):
     """One frame: optionally move the vehicles, then update the signals."""
     if move_bus:
         signals = controller.get_all_signals(INT_X)
@@ -81,8 +81,8 @@ def assert_no_conflicting_green(signals):
 
 def test_nodes_own_independent_state_despite_legacy_broadcast_setters():
     controller = make_controller()
-    node_a = controller.nodes[300]
-    node_b = controller.nodes[700]
+    node_a = controller.nodes[NODE_A]
+    node_b = controller.nodes[NODE_B]
 
     assert node_a is not node_b
 
@@ -94,38 +94,38 @@ def test_nodes_own_independent_state_despite_legacy_broadcast_setters():
     node_a.phase = 3
     node_a.timer = 1
     assert (node_b.phase, node_b.timer) == (2, 7)
-    assert controller.get_all_signals()[300] != controller.get_all_signals()[700]
+    assert controller.get_all_signals()[NODE_A] != controller.get_all_signals()[NODE_B]
 
 
 def test_node_local_clearance_can_diverge_initially_aligned_clocks():
     controller = make_controller()
     controller.phase = 2
     controller.timer = 1
-    node_a_blocker = Vehicle(300, H_Y, "NB")
+    node_a_blocker = Vehicle(NODE_A, H_Y, "NB")
 
     controller.update([node_a_blocker])
 
-    assert controller.get_node_status(300)["phase_index"] == 2
-    assert controller.get_node_status(700)["phase_index"] == 3
-    assert set(controller.get_all_signals()[300].values()) == {"RED"}
-    assert controller.get_all_signals()[700] == {
+    assert controller.get_node_status(NODE_A)["phase_index"] == 2
+    assert controller.get_node_status(NODE_B)["phase_index"] == 3
+    assert set(controller.get_all_signals()[NODE_A].values()) == {"RED"}
+    assert controller.get_all_signals()[NODE_B] == {
         "EB": "RED", "WB": "RED", "NB": "GREEN", "SB": "GREEN"
     }
 
 
 def test_normal_green_begins_only_after_all_red_box_clearance():
     controller = make_controller()
-    controller.nodes[300].phase = 2
-    controller.nodes[300].timer = 1
-    blocker = Vehicle(300, H_Y, "NB")
+    controller.nodes[NODE_A].phase = 2
+    controller.nodes[NODE_A].timer = 1
+    blocker = Vehicle(NODE_A, H_Y, "NB")
 
     controller.update([blocker])
-    assert controller.get_node_status(300)["phase_index"] == 2
-    assert set(controller.get_all_signals(INT_X)[300].values()) == {"RED"}
+    assert controller.get_node_status(NODE_A)["phase_index"] == 2
+    assert set(controller.get_all_signals(INT_X)[NODE_A].values()) == {"RED"}
 
     controller.update([])
-    assert controller.get_node_status(300)["phase_index"] == 3
-    assert controller.get_all_signals(INT_X)[300] == {
+    assert controller.get_node_status(NODE_A)["phase_index"] == 3
+    assert controller.get_all_signals(INT_X)[NODE_A] == {
         "EB": "RED", "WB": "RED", "NB": "GREEN", "SB": "GREEN"
     }
 
@@ -133,8 +133,8 @@ def test_normal_green_begins_only_after_all_red_box_clearance():
 def test_dbl_eligibility_succeeds_after_early_migration(signal_system):
     config = control_panel.bus_routes_config["R2_EB_B_NB"]
     config["dbl_enabled"] = True
-    bus = make_bus_for_leg("R2_EB_B_NB", 300)
-    bus.x = 100
+    bus = make_bus_for_leg("R2_EB_B_NB", NODE_A)
+    bus.x = NODE_A - 200
     bus.y = H_Y - 1.5 * LANE
     all_red = {
         node: {direction: "RED" for direction in ("EB", "WB", "NB", "SB")}
@@ -142,7 +142,7 @@ def test_dbl_eligibility_succeeds_after_early_migration(signal_system):
     }
 
     assert bus.lane_index == 1
-    assert not signal_system.is_bus_dbl_eligible(bus, 300)
+    assert not signal_system.is_bus_dbl_eligible(bus, NODE_A)
 
     for _ in range(60):
         bus.update(all_red, INT_X, H_Y, ROAD_W, STOP, LANE, [bus], signal_system)
@@ -150,19 +150,19 @@ def test_dbl_eligibility_succeeds_after_early_migration(signal_system):
             break
 
     assert bus.lane_index == DBL_LANE_INDEX
-    assert signal_system.is_bus_dbl_eligible(bus, 300)
+    assert signal_system.is_bus_dbl_eligible(bus, NODE_A)
     heavy_car = Vehicle(bus.x, bus.y, "EB", is_heavy=True, lane_index=1)
-    assert not signal_system.is_bus_dbl_eligible(heavy_car, 300)
+    assert not signal_system.is_bus_dbl_eligible(heavy_car, NODE_A)
 
 
 def test_simultaneous_requests_are_deterministically_ordered():
     for route_id in ("R1_EB_A_NB", "R2_EB_B_NB"):
         control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
-    bus_b = make_bus_for_leg("R1_EB_A_NB", 300, "BUS_B")
-    bus_a = make_bus_for_leg("R2_EB_B_NB", 300, "BUS_A")
+    bus_b = make_bus_for_leg("R1_EB_A_NB", NODE_A, "BUS_B")
+    bus_a = make_bus_for_leg("R2_EB_B_NB", NODE_A, "BUS_A")
     controller = make_controller()
     controller.update([bus_b, bus_a])
-    status = controller.get_node_status(300)
+    status = controller.get_node_status(NODE_A)
     assert status["active_request"]["bus_id"] == "BUS_A"
     assert status["active_request"]["state"] == ARMED
     assert [item["bus_id"] for item in status["queued_requests"]] == ["BUS_B"]
@@ -177,25 +177,25 @@ def test_duplicate_eligible_frames_do_not_consume_request_ids():
     for _ in range(6):
         controller.update([bus])
         request_ids.append(
-            controller.get_node_status(300)["active_request"]["request_id"]
+            controller.get_node_status(NODE_A)["active_request"]["request_id"]
         )
 
     assert request_ids == ["PRIORITY_000001"] * 6
     assert controller._request_sequence == 1
-    assert controller.get_node_status(300)["active_request"]["wait_frames"] == 5
+    assert controller.get_node_status(NODE_A)["active_request"]["wait_frames"] == 5
 
 
 def test_queued_timeout_is_terminal_and_cannot_renew_in_place():
     for route_id in ("R1_EB_A_NB", "R2_EB_B_NB"):
         control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
-    first = make_bus_for_leg("R1_EB_A_NB", 300, "BUS_A")
-    queued = make_bus_for_leg("R2_EB_B_NB", 300, "BUS_B")
+    first = make_bus_for_leg("R1_EB_A_NB", NODE_A, "BUS_A")
+    queued = make_bus_for_leg("R2_EB_B_NB", NODE_A, "BUS_B")
     controller = make_controller(priority_request_timeout=5)
 
     for _ in range(9):
         controller.update([first, queued])
 
-    status = controller.get_node_status(300)
+    status = controller.get_node_status(NODE_A)
     timed_out = [
         item for item in status["terminal_history"] if item["bus_id"] == "BUS_B"
     ]
@@ -211,10 +211,10 @@ def test_queued_timeout_is_terminal_and_cannot_renew_in_place():
 
     queued.x = -controller.get_priority_eligibility_px()
     controller.update([first, queued])
-    queued.x = 190
+    queued.x = NODE_A - 110
     controller.update([first, queued])
     # BUS_A's armed request timed out too, so the retry may arm directly.
-    status = controller.get_node_status(300)
+    status = controller.get_node_status(NODE_A)
     candidates = list(status["queued_requests"])
     if status["active_request"]:
         candidates.append(status["active_request"])
@@ -242,19 +242,19 @@ def test_extension_holds_green_for_bus():
         status = step(controller, vehicles, move_bus=True)
         observed.append(status["priority_state"])
         assert_no_conflicting_green(status["signals"])
-        if 300 in bus.passed_nodes and status["active_request"] is None:
+        if NODE_A in bus.passed_nodes and status["active_request"] is None:
             break
 
     assert TSP_EXTENDING in observed
     assert observed[-1] == NORMAL
-    history = controller.get_node_status(300)["terminal_history"]
+    history = controller.get_node_status(NODE_A)["terminal_history"]
     assert history[-1]["bus_id"] == bus.bus_id
     assert history[-1]["state"] == COMPLETED
     assert history[-1]["tsp_action"] == TSP_ACTION_EXTENDING
     assert 1 <= history[-1]["tsp_adjust_frames"] <= CAP_FRAMES
     # The extension ended the moment the bus cleared, not at the cap.
     assert history[-1]["tsp_adjust_frames"] < CAP_FRAMES
-    node = controller.nodes[300]
+    node = controller.nodes[NODE_A]
     assert node.last_tsp_action == TSP_ACTION_EXTENDING
     assert node.last_tsp_adjust_frames == history[-1]["tsp_adjust_frames"]
 
@@ -279,7 +279,7 @@ def test_extension_capped():
 
     assert extending_frames == CAP_FRAMES
     assert ew_green_frames == GREEN_FRAMES + CAP_FRAMES
-    status = controller.get_node_status(300)
+    status = controller.get_node_status(NODE_A)
     assert status["priority_state"] == NORMAL
     assert status["tsp_last_action"] == TSP_ACTION_EXTENDING
     assert status["tsp_last_adjust_frames"] == CAP_FRAMES
@@ -310,14 +310,14 @@ def test_tsp_extends_whole_phase_not_exclusive():
 
 
 def test_extension_from_westbound_bus_also_holds_both_directions():
-    bus = tsp_bus("R6_WB_ONLY", 700, "WB_TSP_BUS")
+    bus = tsp_bus("R6_WB_ONLY", NODE_B, "WB_TSP_BUS")
     controller = make_controller()
     controller.phase = 0
     controller.timer = GREEN_FRAMES - 2
 
     seen_extension = False
     for _ in range(CAP_FRAMES + 5):
-        status = step(controller, [bus], node_x=700)
+        status = step(controller, [bus], node_x=NODE_B)
         if status["priority_state"] == TSP_EXTENDING:
             seen_extension = True
             assert status["signals"]["EB"] == "GREEN"
@@ -353,7 +353,7 @@ def test_early_green_truncates_conflicting():
     assert ns_green_frames == GREEN_FRAMES - CAP_FRAMES
     # Proper sequence: NS green -> NS yellow -> all-red -> EW green.
     assert phases.index(4) < phases.index(5) < phases.index(0)
-    status = controller.get_node_status(300)
+    status = controller.get_node_status(NODE_A)
     assert status["tsp_last_action"] == TSP_ACTION_EARLY_GREEN
     assert status["tsp_last_adjust_frames"] == CAP_FRAMES
     assert status["active_request"]["state"] == ARMED
@@ -395,7 +395,7 @@ def test_early_green_respects_min_green():
 
     assert states == {NORMAL}
     assert ns_green_frames == GREEN_FRAMES
-    status = controller.get_node_status(300)
+    status = controller.get_node_status(NODE_A)
     assert status["tsp_last_action"] == TSP_ACTION_NONE
     assert status["active_request"]["state"] == ARMED
     assert status["active_request"]["tsp_action"] == TSP_ACTION_NONE
@@ -416,7 +416,7 @@ def test_early_green_floor_bounds_partial_cut():
             break
 
     assert ns_green_frames == GREEN_FRAMES - 7
-    assert controller.get_node_status(300)["tsp_last_adjust_frames"] == 7
+    assert controller.get_node_status(NODE_A)["tsp_last_adjust_frames"] == 7
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +441,7 @@ def test_no_full_restart_after_tsp():
             phase_runs.append([phase, 1])
 
     # Extension happened on the first EW green (bus never clears).
-    assert controller.nodes[300].last_tsp_action == TSP_ACTION_EXTENDING
+    assert controller.nodes[NODE_A].last_tsp_action == TSP_ACTION_EXTENDING
     sequence = [phase for phase, _frames in phase_runs]
     # Strict cyclic order, no phase repeated back-to-back and no skip to 0.
     for previous, current in zip(sequence, sequence[1:]):
@@ -470,7 +470,7 @@ def test_no_conflicting_green_during_tsp():
             vehicles = [tsp_bus(bus_id="TSP_B")]
         status = step(controller, vehicles)
         assert_no_conflicting_green(status["signals"])
-        assert_no_conflicting_green(controller.get_all_signals(INT_X)[700])
+        assert_no_conflicting_green(controller.get_all_signals(INT_X)[NODE_B])
         if status["tsp_last_action"] not in actions:
             actions.append(status["tsp_last_action"])
     assert TSP_ACTION_EXTENDING in actions
@@ -487,7 +487,7 @@ def test_infeasible_bus_no_tsp(wrong_lane, must_hold_for_lane):
     and no early green."""
     route_id = "R4_WB_A_SB"
     control_panel.bus_routes_config[route_id]["tsp_enabled"] = True
-    bus = make_bus_for_leg(route_id, 300, "INFEASIBLE_BUS")
+    bus = make_bus_for_leg(route_id, NODE_A, "INFEASIBLE_BUS")
     if wrong_lane:
         bus.lane_index = 1
         bus.y = H_Y + 1.5 * LANE
@@ -519,9 +519,9 @@ def test_infeasible_bus_no_tsp(wrong_lane, must_hold_for_lane):
         if status["phase_index"] == 0:
             break
     assert ns_green_frames == GREEN_FRAMES
-    assert controller.get_node_status(300)["tsp_last_action"] == TSP_ACTION_NONE
+    assert controller.get_node_status(NODE_A)["tsp_last_action"] == TSP_ACTION_NONE
     assert (
-        controller.get_node_status(300)["active_request"]["tsp_action"]
+        controller.get_node_status(NODE_A)["active_request"]["tsp_action"]
         == TSP_ACTION_NONE
     )
 
@@ -611,7 +611,7 @@ def test_dbl_only_reserves_lane_without_touching_signals():
     config = control_panel.bus_routes_config["R1_EB_A_NB"]
     config["dbl_enabled"] = True
     config["tsp_enabled"] = False
-    bus = make_bus_for_leg("R1_EB_A_NB", 300, "DBL_BUS")
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "DBL_BUS")
     bus.lane_index = DBL_LANE_INDEX
     bus.y = H_Y - (DBL_LANE_INDEX + 0.5) * LANE
     controller = make_controller(min_green_frames=30)
@@ -621,14 +621,14 @@ def test_dbl_only_reserves_lane_without_touching_signals():
     for _ in range(200):
         status = step(controller, [bus])
         assert status["priority_state"] == NORMAL
-        assert controller.get_active_dbl_request(300, "EB")["bus_id"] == "DBL_BUS"
-        assert controller.is_dbl_active_for_approach(300, "EB")
+        assert controller.get_active_dbl_request(NODE_A, "EB")["bus_id"] == "DBL_BUS"
+        assert controller.is_dbl_active_for_approach(NODE_A, "EB")
         if status["phase_index"] == 3:
             ns_green_frames += 1
         if status["phase_index"] == 0:
             break
     assert ns_green_frames == GREEN_FRAMES
-    assert controller.get_all_dbl_states()[300]["EB"] == "ACTIVE"
+    assert controller.get_all_dbl_states()[NODE_A]["EB"] == "ACTIVE"
     assert status["active_request"]["tsp_action"] == TSP_ACTION_NONE
 
 
@@ -655,7 +655,7 @@ def test_node_status_exposes_tsp_measurement_fields():
 
 def place_bus(bus, distance_px, speed):
     """Put an EB bus ``distance_px`` short of Node A's stop bar at ``speed``."""
-    stop_bar_x = 300 - ROAD_W // 2 - STOP
+    stop_bar_x = NODE_A - ROAD_W // 2 - STOP
     bus.x = stop_bar_x - distance_px - bus.length / 2.0
     bus.speed = speed
 
@@ -685,7 +685,7 @@ def test_t1_far_slow_bus_does_not_trigger_early_green():
     states, _ = run_conflicting_green(controller, bus, frames=60)
 
     assert TSP_EARLY_TRUNCATE not in states
-    request = controller.get_node_status(300)["active_request"]
+    request = controller.get_node_status(NODE_A)["active_request"]
     assert request["state"] == ARMED
     assert request["tsp_action"] == TSP_ACTION_NONE
     assert request["tsp_gate_reason"] == TSP_DENY_ETA_WINDOW
@@ -712,13 +712,13 @@ def test_t2_near_bus_gets_early_green_and_crosses_inside_it():
         if green_window and green_window[1] is None and status["phase_index"] == 1:
             green_window[1] = index
         if cross_frame is None and not bus.is_front_bumper_upstream(
-            300, H_Y, ROAD_W, STOP
+            NODE_A, H_Y, ROAD_W, STOP
         ):
             cross_frame = index
         if cross_frame is not None and green_window and green_window[1]:
             break
 
-    assert controller.get_node_status(300)["tsp_last_action"] == TSP_ACTION_EARLY_GREEN
+    assert controller.get_node_status(NODE_A)["tsp_last_action"] == TSP_ACTION_EARLY_GREEN
     assert green_window[0] <= cross_frame <= green_window[1], (
         cross_frame, green_window
     )
@@ -736,28 +736,28 @@ def test_t3_cut_below_clearance_is_denied_with_reason():
         signals = controller.get_all_signals(INT_X)
         bus.update(signals, INT_X, H_Y, ROAD_W, STOP, LANE, [bus], controller)
         status = step(controller, [bus])
-        if 300 in bus.passed_nodes:
+        if NODE_A in bus.passed_nodes:
             break
-    assert 300 in bus.passed_nodes
+    assert NODE_A in bus.passed_nodes
 
     assert status["tsp_last_action"] == TSP_ACTION_NONE
-    terminal = controller.get_latest_terminal_status_for_bus(bus, 300)
+    terminal = controller.get_latest_terminal_status_for_bus(bus, NODE_A)
     assert terminal["state"] == DENIED
     assert terminal["tsp_action"] == TSP_ACTION_NONE
     assert terminal["denial_or_cancel_reason"] == TSP_DENY_NET_BENEFIT
 
 
 def test_t4_eligibility_is_clamped_to_link_length(caplog):
-    assert PRIORITY_ELIGIBILITY_MAX_PX == INT_X[1] - INT_X[0] == 400
+    assert PRIORITY_ELIGIBILITY_MAX_PX == INT_X[1] - INT_X[0] == 800
     with caplog.at_level("WARNING", logger="src.core.signal_controller"):
         controller = SignalController(
-            {"green_time": GREEN_FRAMES, "priority_eligibility_px": 800}
+            {"green_time": GREEN_FRAMES, "priority_eligibility_px": 1200}
         )
-    assert controller.get_priority_eligibility_px() == 400
+    assert controller.get_priority_eligibility_px() == 800
     assert "clamped" in caplog.text
 
     bus = tsp_bus()
-    place_bus(bus, distance_px=450, speed=0.5)
-    assert not controller.is_bus_tsp_eligible(bus, 300)
-    place_bus(bus, distance_px=390, speed=0.5)
-    assert controller.is_bus_tsp_eligible(bus, 300)
+    place_bus(bus, distance_px=850, speed=0.5)
+    assert not controller.is_bus_tsp_eligible(bus, NODE_A)
+    place_bus(bus, distance_px=790, speed=0.5)
+    assert controller.is_bus_tsp_eligible(bus, NODE_A)

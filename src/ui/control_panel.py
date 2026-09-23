@@ -224,9 +224,38 @@ global_config = {
     # been released toward (the controller clamps and logs anything above).
     "priority_eligibility_px": 400,
     "vehicle_speed_scale": 0.5,      # Pending scale, applied on START/reset
-    # Car-following/lane-change engine, applied on START/reset: "legacy"
-    # (the pinned engine) or "idm" (physically calibrated; vehicle.py).
-    "movement_model": "legacy",
+    # Car-following/lane-change engine, applied on START/reset: "idm"
+    # (physically calibrated, the default; vehicle.py) or "legacy" (the
+    # former gap/speed rule, kept for comparison only).
+    "movement_model": "idm",
+    # Signal change intervals, applied on START/reset: "ite" computes yellow
+    # and all-red from the ITE kinematic formulas at the configured speed
+    # (main.signal_change_intervals); "legacy" keeps the former 1 s + 1 s.
+    "signal_change_intervals": "ite",
+    # "coordinated": both nodes run one common cycle with a progression
+    # offset and lock to it every cycle; "independent": each node runs its
+    # own Webster cycle from phase 0 (the former behaviour, whose relative
+    # offset drifts). Progression is timed for this direction.
+    "signal_coordination": "coordinated",
+    "coordination_direction": "EB",
+    # Bus dwell at each route stop (bus_routes_config[...]["stops"]), per the
+    # Transit Capacity and Quality of Service Manual, 3rd ed. (TCRP Report
+    # 165, 2013), Ch. 6: dwell = door open/close time + passenger service,
+    # boarding and alighting through separate doors (the longer governs).
+    # Values sit inside the TCQSM ranges and are scenario defaults to be
+    # calibrated for a real corridor. Boardings and alightings are equal in
+    # expectation, so bus occupancy stays BUS_PASSENGERS (a declared
+    # simplification: the passenger DVs keep their fixed bus weight).
+    # Floating-car-data sampling period, sim seconds; 0 = off (main._sample_fcd).
+    "fcd_period_s": 0,
+    "bus_dwell": {
+        "door_time_sec": 4.0,
+        "board_sec_per_pax": 3.0,
+        "alight_sec_per_pax": 2.0,
+        "mean_boardings": 4.0,
+        "mean_alightings": 4.0,
+        "doors": 2,
+    },
     "_active_vehicle_speed_scale": 0.5,  # Runtime snapshot for this episode
     "reset_triggered": False,# Flag to wipe canvas vehicles
     "start_requested": False,# START requests a fresh run from frame zero
@@ -1091,7 +1120,8 @@ bus_routes_config = {
         "headway_sec": 30,
         "tsp_enabled": False,
         "dbl_enabled": False,
-        "manual_dispatch": False
+        "manual_dispatch": False,
+        "stops": [{"node": NODE_A_X, "side": "far"}]
     },
     "R2_EB_B_NB": {
         "name": "EB \u2192 Node B (NB)",
@@ -1103,7 +1133,8 @@ bus_routes_config = {
         "headway_sec": 45,
         "tsp_enabled": False,
         "dbl_enabled": False,
-        "manual_dispatch": False
+        "manual_dispatch": False,
+        "stops": [{"node": NODE_A_X, "side": "far"}]
     },
     "R3_EB_ONLY": {
         "name": "EB Corridor (Straight)",
@@ -1115,7 +1146,8 @@ bus_routes_config = {
         "headway_sec": 90,
         "tsp_enabled": False,
         "dbl_enabled": False,
-        "manual_dispatch": False
+        "manual_dispatch": False,
+        "stops": [{"node": NODE_A_X, "side": "far"}]
     },
     "R4_WB_A_SB": {
         "name": "WB \u2192 Node A (SB)",
@@ -1127,7 +1159,8 @@ bus_routes_config = {
         "headway_sec": 30,
         "tsp_enabled": False,
         "dbl_enabled": False,
-        "manual_dispatch": False
+        "manual_dispatch": False,
+        "stops": [{"node": NODE_B_X, "side": "far"}]
     },
     "R5_WB_B_SB": {
         "name": "WB \u2192 Node B (SB)",
@@ -1139,7 +1172,8 @@ bus_routes_config = {
         "headway_sec": 45,
         "tsp_enabled": False,
         "dbl_enabled": False,
-        "manual_dispatch": False
+        "manual_dispatch": False,
+        "stops": [{"node": NODE_B_X, "side": "far"}]
     },
     "R6_WB_ONLY": {
         "name": "WB Corridor (Straight)",
@@ -1151,7 +1185,8 @@ bus_routes_config = {
         "headway_sec": 90,
         "tsp_enabled": False,
         "dbl_enabled": False,
-        "manual_dispatch": False
+        "manual_dispatch": False,
+        "stops": [{"node": NODE_B_X, "side": "far"}]
     }
 }
 

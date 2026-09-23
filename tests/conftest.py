@@ -56,6 +56,8 @@ def isolate_runtime_files(tmp_path_factory, monkeypatch):
         (main, "AGENT_TURN_LOG_PATH", logs / "agent_turn_log.jsonl"),
         (main, "TELEMETRY_LOG_PATH", logs / "telemetry_log.jsonl"),
         (main, "BUS_EVENTS_LOG_PATH", logs / "bus_events.jsonl"),
+        (main, "TRIPINFO_LOG_PATH", logs / "tripinfo.jsonl"),
+        (main, "FCD_LOG_PATH", logs / "fcd.csv"),
         (main, "EXCEL_EXPORT_DIR", results),
         (main, "EXPERIMENT_SUMMARY_PATH", results / "experiment_summary.csv"),
         (main, "INSTANCE_LOCK_PATH", data / "simulator.lock"),

@@ -14,6 +14,7 @@ from src.core.vehicle import (
     dbl_lane_is_obstructed,
     dbl_lane_queue_ahead,
     eta_frames_to_stop_bar,
+    bus_eta_frames,
     receiving_space_px,
     SAFE_GAP_PX,
 )
@@ -325,7 +326,7 @@ class TelemetryExporter:
         )
         free_flow_speed = max(getattr(bus, "max_speed", 1.0), 1e-6)
         eta_frames_freeflow = distance / free_flow_speed if distance > 0 else 0.0
-        eta_frames_live = eta_frames_to_stop_bar(distance, bus.speed)
+        eta_frames_live = bus_eta_frames(bus, distance)
         live_cfg = control_panel.bus_routes_config.get(bus.route_id, bus.route_info)
         priority = signal_controller.get_priority_status_for_bus(bus, target_node)
         latest_terminal = signal_controller.get_latest_terminal_status_for_bus(bus)
@@ -360,6 +361,10 @@ class TelemetryExporter:
             "leg_state": bus.leg_state,
             "receiving_space_m": round(units.px_to_m(receiving_px), 1),
             "receiving_blocked": receiving_px < bus.length + SAFE_GAP_PX,
+            # Standing at a stop, not in a queue (vehicle.Bus._update_stop);
+            # a near-side stop still to serve at this node withholds TSP.
+            "dwelling": bool(getattr(bus, "dwelling", False)),
+            "near_side_stop_pending": getattr(bus, "near_side_stop_pending", None) == target_node,
             "tsp_enabled": bool(live_cfg.get("tsp_enabled", False)),
             "dbl_enabled": bool(live_cfg.get("dbl_enabled", False)),
             "priority_requested": priority is not None,
@@ -775,7 +780,10 @@ class TelemetryExporter:
                 dir=self.filename.parent,
                 delete=False,
             ) as temp_file:
-                json.dump(payload, temp_file, indent=2)
+                # Compact, one-shot: json.dump with indent runs the pure-Python
+                # encoder, 14 ms for the ~180 KB payload at 200 vehicles
+                # against 2 ms here, on the Tk tick that paces the sim.
+                temp_file.write(json.dumps(payload, separators=(",", ":")))
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
                 temp_name = Path(temp_file.name)

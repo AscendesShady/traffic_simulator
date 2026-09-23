@@ -832,12 +832,17 @@ def test_summary_row_has_travel_delay_but_no_per_run_net_saved(monkeypatch):
 
 
 def test_pair_against_baseline_is_baseline_minus_arm_on_the_same_seed():
-    def row(model, seed, travel, bus, car, stopped, converged="True", uuid_=""):
+    def row(model, seed, travel, bus, car, stopped, converged="True", uuid_="", entry=0.0):
+        # The primary DV adds the wait of demand held at the boundary
+        # (entry) to on-road travel delay; the on-road figure stays reported.
         return {
             "campaign_id": "C", "model": model, "seed": str(seed), "run_uuid": uuid_,
             "total_person_hours_travel_delay_steady": str(travel),
             "bus_person_hours_travel_delay_steady": str(bus),
             "car_person_hours_travel_delay_steady": str(car),
+            "total_person_hours_delay_incl_entry_steady": str(travel + entry),
+            "bus_person_hours_delay_incl_entry_steady": str(bus),
+            "car_person_hours_delay_incl_entry_steady": str(car + entry),
             "total_person_hours_delay_steady": str(stopped),
             "converged": converged,
         }
@@ -865,13 +870,35 @@ def test_pair_against_baseline_is_baseline_minus_arm_on_the_same_seed():
     assert second["converged_both"] is False
 
 
+def test_paired_dv_counts_demand_held_at_the_boundary():
+    """An arm that looks better on the road by holding traffic outside the
+    model is charged for that wait: campaign 2026-09-22 served 58-62 % of
+    its offered vehicles and none of the rest's wait reached the DV."""
+    def row(model, travel, entry, uuid_):
+        return {
+            "campaign_id": "C", "model": model, "seed": "1", "run_uuid": uuid_,
+            "total_person_hours_travel_delay_steady": str(travel),
+            "total_person_hours_delay_incl_entry_steady": str(travel + entry),
+            "converged": "True",
+        }
+    pairs, _, _ = main.pair_against_baseline([
+        row("None", 10.0, 2.0, "b"),
+        row("rule", 9.5, 4.0, "a"),   # 0.5 h better on the road, 2 h worse at entry
+    ])
+    (pair,) = pairs
+    assert pair["net_person_hours_saved_on_road"] == pytest.approx(0.5)
+    assert pair["net_person_hours_saved"] == pytest.approx(-1.5)   # the sign flips
+
+
 def test_paired_dv_csv_written_with_declared_header(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "EXPERIMENT_SUMMARY_PATH", tmp_path / "experiment_summary.csv")
     pairs, _, _ = main.pair_against_baseline([
         {"campaign_id": "C", "model": "None", "seed": "1", "run_uuid": "b",
-         "total_person_hours_travel_delay_steady": "3", "converged": "True"},
+         "total_person_hours_travel_delay_steady": "3",
+         "total_person_hours_delay_incl_entry_steady": "3", "converged": "True"},
         {"campaign_id": "C", "model": "rule", "seed": "1", "run_uuid": "a",
-         "total_person_hours_travel_delay_steady": "2", "converged": "True"},
+         "total_person_hours_travel_delay_steady": "2",
+         "total_person_hours_delay_incl_entry_steady": "2", "converged": "True"},
     ])
     path = main.write_paired_dv_csv("C", pairs)
     with path.open(newline="") as handle:

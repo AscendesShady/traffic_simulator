@@ -145,8 +145,15 @@ def compute_node_green_splits(
     fps=FPS,
     oversaturated_cycle_cap_sec=OVERSATURATED_CYCLE_CAP_SEC,
     min_cycle_sec=MIN_CYCLE_SEC,
+    displayed_green_offset_sec=0.0,
 ):
     """Derive one node's Webster cycle and split it between EW and NS.
+
+    ``displayed_green_offset_sec`` is HCM's l1 - e: the displayed green that
+    yields effective green g is G = g + l1 - e (HCM 7th ed., Ch. 19), so the
+    controller's real cycle -- displayed greens plus two change intervals --
+    comes out at exactly the cycle Webster chose. Zero when l1 = e, which is
+    HCM's default pair (2.0 s each).
 
     `critical_flows` maps "EW" and "NS" to the critical (heaviest) lane
     flow for that phase, in veh/hr/lane. `s` is the measured saturation flow
@@ -190,6 +197,8 @@ def compute_node_green_splits(
     else:
         green_ew = (y_ew / total_y) * effective_green
         green_ns = (y_ns / total_y) * effective_green
+    green_ew = max(green_ew + float(displayed_green_offset_sec), 1.0 / fps)
+    green_ns = max(green_ns + float(displayed_green_offset_sec), 1.0 / fps)
     return {
         "EW_green_frames": max(1, int(round(green_ew * fps))),
         "NS_green_frames": max(1, int(round(green_ns * fps))),
@@ -221,8 +230,18 @@ def compute_all_nodes(
     oversaturated_cycle_cap_sec=OVERSATURATED_CYCLE_CAP_SEC,
     min_cycle_sec=MIN_CYCLE_SEC,
     turn_options=None,
+    displayed_green_offset_sec=0.0,
+    common_cycle=False,
 ):
-    """Derive independent Webster cycles and splits for both nodes.
+    """Derive Webster cycles and splits for both nodes.
+
+    ``common_cycle`` runs both nodes on one cycle -- the longest either
+    node needs -- re-splitting each node's green by its own flow ratios.
+    Coordinated signals share a cycle length (NCHRP Report 812, Signal
+    Timing Manual, 2nd ed., coordination chapter); two nodes on different
+    cycles have a relative offset that drifts every cycle, so progression on
+    the link between them sweeps from good to bad over a run. Each node's
+    own optimum is kept as ``node_webster_cycle_sec``.
 
     Approach rates are configured in veh/min; each node's phase is
     represented by its heaviest lane from the movement matrix
@@ -233,20 +252,84 @@ def compute_all_nodes(
     different cycle lengths.
     """
     lane_flows = movement_lane_flows(approach_configs, turn_options)
-    return {
-        node_x: compute_node_green_splits(
+
+    def split(node_x, cycle):
+        return compute_node_green_splits(
             critical_lane_flows(lane_flows, node_x),
             s,
-            cycle_sec,
+            cycle,
             lost_time_sec,
             fps,
             oversaturated_cycle_cap_sec,
             min_cycle_sec,
+            displayed_green_offset_sec,
         )
-        for node_x in INT_X
-    }
+
+    independent = {node_x: split(node_x, cycle_sec) for node_x in INT_X}
+    if not common_cycle or cycle_sec is not None:
+        return independent
+    common = max(result["cycle_time_sec"] for result in independent.values())
+    coordinated = {}
+    for node_x, own in independent.items():
+        result = split(node_x, common)
+        result["cycle_source"] = f"common_cycle ({own['cycle_source']})"
+        result["node_webster_cycle_sec"] = own["cycle_time_sec"]
+        # A node whose own optimum is undefined stays reported as such.
+        result["oversaturated"] = own["oversaturated"]
+        result["webster_optimal_cycle_sec"] = own["webster_optimal_cycle_sec"]
+        coordinated[node_x] = result
+    return coordinated
 
 
-def lost_time_seconds(yellow_frames, red_clearance_frames, fps=FPS):
-    """Total lost time per cycle: two phase changes of yellow plus all-red."""
-    return 2.0 * (yellow_frames + red_clearance_frames) / fps
+# HCM 7th ed. (TRB, 2022), Ch. 19 default values: start-up lost time l1 and
+# extension of effective green e. main measures l1 per regime and overrides.
+HCM_STARTUP_LOST_TIME_SEC = 2.0
+HCM_EFFECTIVE_GREEN_EXTENSION_SEC = 2.0
+
+
+def lost_time_seconds(
+    yellow_frames, red_clearance_frames, fps=FPS,
+    startup_lost_sec=HCM_STARTUP_LOST_TIME_SEC,
+    extension_sec=HCM_EFFECTIVE_GREEN_EXTENSION_SEC,
+):
+    """Total lost time per cycle, two phases of HCM's t_L = l1 + l2.
+
+    l2 = Y + AR - e is the clearance lost time; l1 the start-up lost time
+    (HCM 7th ed., Ch. 19). At the former 1 s yellow / 1 s all-red with HCM's
+    defaults this is the same 4 s the old formula gave, so the change adds
+    the start-up term rather than moving any existing result by itself.
+    """
+    change = (yellow_frames + red_clearance_frames) / fps
+    clearance_lost = max(0.0, change - float(extension_sec))
+    return 2.0 * (max(0.0, float(startup_lost_sec)) + clearance_lost)
+
+
+# ITE, "Guidelines for Determining Traffic Signal Change and Clearance
+# Intervals" (Recommended Practice, 2020): Y = t + v / (2a + 2Gg) and
+# R = (W + L) / v, with t = 1.0 s perception-reaction, a = 3.05 m/s^2
+# (10 ft/s^2), L = 6.1 m (20 ft) and v the 85th-percentile approach speed.
+# MUTCD (2009 ed., Sec. 4D.26) guidance bounds yellow to 3-6 s and red
+# clearance to at most 6 s.
+ITE_REACTION_SEC = 1.0
+ITE_DECEL_MPS2 = 3.05
+ITE_VEHICLE_LENGTH_M = 6.1
+GRAVITY_MPS2 = 9.81
+MUTCD_YELLOW_MIN_SEC = 3.0
+MUTCD_YELLOW_MAX_SEC = 6.0
+MUTCD_RED_CLEARANCE_MAX_SEC = 6.0
+
+
+def _round_up(value, step=0.1):
+    import math
+    return math.ceil(round(value / step, 6)) * step
+
+
+def ite_change_intervals(approach_speed_mps, intersection_width_m, grade=0.0):
+    """(yellow_sec, all_red_sec) per the ITE kinematic formulas, bounded by
+    MUTCD guidance and rounded up to 0.1 s."""
+    v = max(0.1, float(approach_speed_mps))
+    yellow = ITE_REACTION_SEC + v / (2.0 * ITE_DECEL_MPS2 + 2.0 * GRAVITY_MPS2 * float(grade))
+    all_red = (float(intersection_width_m) + ITE_VEHICLE_LENGTH_M) / v
+    yellow = min(MUTCD_YELLOW_MAX_SEC, max(MUTCD_YELLOW_MIN_SEC, _round_up(yellow)))
+    all_red = min(MUTCD_RED_CLEARANCE_MAX_SEC, max(0.0, _round_up(all_red)))
+    return round(yellow, 1), round(all_red, 1)

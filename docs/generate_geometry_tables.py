@@ -39,16 +39,17 @@ def render():
 
 def render_routes():
     lines = [
-        "| Route ID | Name | Origin to destination | Waypoints | Lanes | Active | Headway | TSP | DBL | Manual dispatch |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| Route ID | Name | Origin to destination | Waypoints | Lanes | Stops | Active | Headway | TSP | DBL | Manual dispatch |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for route_id, route in control_panel.bus_routes_config.items():
         waypoints = ", ".join(f"{x}: {move}" for x, move in route.get("waypoints", {}).items())
         lanes = ", ".join(f"{x}: {lane}" for x, lane in route.get("lanes", {}).items())
+        stops = ", ".join(f"{stop['node']}: {stop.get('side', 'far')}-side" for stop in route.get("stops", []) or []) or "none"
         yes_no = lambda value: "Yes" if value else "No"
         lines.append(
             f"| `{route_id}` | {route['name']} | {route['origin']} to {route['destination']} "
-            f"| {waypoints} | {lanes} | {yes_no(route['active'])} | {route['headway_sec']}s "
+            f"| {waypoints} | {lanes} | {stops} | {yes_no(route['active'])} | {route['headway_sec']}s "
             f"| {yes_no(route['tsp_enabled'])} | {yes_no(route['dbl_enabled'])} "
             f"| {yes_no(route['manual_dispatch'])} |"
         )

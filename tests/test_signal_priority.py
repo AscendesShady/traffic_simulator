@@ -3,6 +3,8 @@ green (red truncation) that nudge the running Webster cycle, never an
 exclusive single-approach green and never a full cycle restart."""
 import pytest
 
+import src.core.vehicle as vehicle_module
+
 import src.ui.control_panel as control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
 from src.core.signal_controller import (
@@ -144,7 +146,8 @@ def test_dbl_eligibility_succeeds_after_early_migration(signal_system):
     assert bus.lane_index == 1
     assert not signal_system.is_bus_dbl_eligible(bus, NODE_A)
 
-    for _ in range(60):
+    # One full lane change of the active engine, plus slack.
+    for _ in range(int(LANE / vehicle_module.lane_change_step_px(LANE)) + 60):
         bus.update(all_red, INT_X, H_Y, ROAD_W, STOP, LANE, [bus], signal_system)
         if bus.lane_index == DBL_LANE_INDEX:
             break
@@ -729,11 +732,20 @@ def test_t2_near_bus_gets_early_green_and_crosses_inside_it():
     """A bus whose ETA lands inside the brought-forward green is served by
     it: the truncation fires and the bus crosses during that green."""
     bus = tsp_bus()
-    place_bus(bus, distance_px=120, speed=0.45)  # ETA ~267 frames
+    # Cruising, 100 px out. (This test once started the bus at 0.45 px/frame
+    # 120 px out and relied on the legacy engine's 45 m/s^2 ramp to reach
+    # full speed in 11 frames; a bus accelerates at ~1.2 m/s^2, so that bus
+    # genuinely arrives after the brought-forward green and the gate is right
+    # to withhold it -- see test_t2b.)
+    place_bus(bus, distance_px=100, speed=bus.max_speed)
     # 100-frame greens, 20-frame cap: served 60 leaves 20 truncated frames,
     # then 4 of clearance, so the bus green spans frames [24, 124] from now.
     controller = make_controller(min_green_frames=30)
     start_green(controller, 3, served_frames=60)
+    # The premise, from the shared estimator: the bus arrives inside it.
+    assert 24 <= vehicle_module.bus_eta_frames(
+        bus, controller.distance_to_node_stop_bar(bus, NODE_A)
+    ) <= 124
 
     cross_frame = None
     green_window = None
@@ -756,6 +768,27 @@ def test_t2_near_bus_gets_early_green_and_crosses_inside_it():
     assert green_window[0] <= cross_frame <= green_window[1], (
         cross_frame, green_window
     )
+
+
+def test_t2b_slow_bus_that_cannot_reach_the_early_green_is_withheld():
+    """The converse of T2, and the case T2 used to be: a bus 120 px out at
+    0.45 px/frame needs ~200 frames at a bus's acceleration, well past the
+    brought-forward green that ends at frame 124, so the truncation is
+    withheld on the arrival window rather than spent on a bus it misses."""
+    if not vehicle_module.is_idm():
+        pytest.skip("the legacy engine reaches full speed in 11 frames")
+    bus = tsp_bus()
+    place_bus(bus, distance_px=120, speed=0.45)
+    controller = make_controller(min_green_frames=30)
+    start_green(controller, 3, served_frames=60)
+    for _ in range(10):
+        signals = controller.get_all_signals(INT_X)
+        bus.update(signals, INT_X, H_Y, ROAD_W, STOP, LANE, [bus], controller)
+        step(controller, [bus])
+    request = controller.nodes[NODE_A].active_request
+    assert request is not None
+    assert request.tsp_gate_reason == "TSP_ETA_OUTSIDE_GREEN_WINDOW"
+    assert controller.get_node_status(NODE_A)["tsp_last_action"] != TSP_ACTION_EARLY_GREEN
 
 
 def test_t3_cut_below_clearance_is_denied_with_reason():

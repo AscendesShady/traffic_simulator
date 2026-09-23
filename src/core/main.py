@@ -13,6 +13,7 @@ import hashlib
 import statistics
 import datetime
 import copy
+import shutil
 from collections import deque
 import tkinter as tk
 from tkinter import ttk
@@ -77,6 +78,9 @@ def _new_spawner_state():
         "arrivals": deque(),
         "frames_since_spawn": 999,
         "pending_arrivals": 0,
+        # Passengers aboard the arrivals queued here (car 4, truck 1): the
+        # latent-demand exposure accumulate_frame_metrics integrates.
+        "pending_pax": 0.0,
         "congestion_cycle_frame": 0,
         "peak_active": False,
         "effective_rate_vpm": 0.0,
@@ -132,6 +136,26 @@ network_throughput = {
     # frames lost below own free-flow speed over the whole route (HCM
     # control delay summed over the nodes the vehicle crossed). Float.
     "completed_control_delay_frames": 0.0,
+    # Source wait of completed vehicles (entry_delay_frames), vehicle-weighted.
+    "completed_entry_delay_frames": 0,
+    # Latent demand: passenger-frames spent waiting at a source because the
+    # entry was full -- offered arrivals not yet on the road (car 4 / truck 1
+    # pax each) and bus trips due but not yet dispatched (BUS_PASSENGERS).
+    # Exposure, like the travel-delay counters: every frame, finished or not.
+    # Campaign 2026-09-22 served only 58-62 % of the vehicles it offered and
+    # none of this wait was in any DV; a controller that admits less traffic
+    # looked better per vehicle. See total_person_hours_delay_incl_entry_steady.
+    "car_passenger_entry_wait_frames": 0.0,
+    "bus_passenger_entry_wait_frames": 0.0,
+    "vehicles_waiting_entry_frames": 0,
+    # Surrogate-safety counters mirrored from vehicle.SAFETY_COUNTERS each
+    # frame, so warm-up discard gives them steady-state values too.
+    "ssm_emergency_decel_frames": 0,
+    "ssm_emergency_decel_events": 0,
+    "ssm_leader_clamp_frames": 0,
+    "ssm_stop_line_clamp_frames": 0,
+    "ssm_ttc_conflict_frames": 0,
+    "ssm_ttc_conflicts": 0,
     # Congestion sampled once per simulated frame, for a run-long mean/max.
     "vehicles_in_network_frame_sum": 0,
     "vehicles_in_network_sample_count": 0,
@@ -185,6 +209,9 @@ def _new_run_metrics():
         "node_phase_failures": {str(node_x): 0 for node_x in canvas.INT_X},
         "node_max_queue_len": {str(node_x): 0 for node_x in canvas.INT_X},
         "last_node_phases": {},
+        # turn -> (frame of the telemetry snapshot the decider saw, frame the
+        # decision first took effect here); see _record_decision_applied.
+        "decision_applied": {},
     }
 
 
@@ -231,6 +258,19 @@ _demand_draw_state = {"offers": []}
 # how much CPU a local model is taking. Headless leaves this at zero (it is
 # not paced against a clock) and the column is then empty.
 _pace_state = {"wall_seconds": 0.0}
+
+# In-network saturation-flow check (validation, not calibration). Every
+# straight stop-bar crossing on a green is logged per lane; within one green,
+# headways from the 5th crossing on that are no longer than
+# CALIBRATION_INTERRUPTION_FACTOR x the calibrated saturation headway are
+# saturation headways in HCM's sense (7th ed., Ch. 31: from the fifth queued
+# vehicle, uninterrupted discharge). Their mean gives the saturation flow the
+# network actually achieves, reported beside the calibrated S. Campaign
+# 2026-09-22 reported v/c 0.78-0.91 while serving 58-62 % of its demand:
+# the single-lane calibration was not the network's capacity, and nothing
+# said so.
+_discharge_state = {"last": {}, "headways": []}
+NETWORK_S_MIN_SAMPLES = 30
 DEMAND_MODEL_SIGNATURE = "per_source_streams_queued_v2"
 VEHICLE_COLORS = [(50, 150, 250), (250, 100, 50), (250, 200, 50), (150, 50, 250), (50, 200, 150)]
 
@@ -265,6 +305,13 @@ def seed_demand_streams(seed):
         state["rng"].seed(None if seed is None else f"{seed}:{approach_key}")
 
 
+# Desired free-flow speed, px/frame before the speed scale, drawn uniformly
+# per arrival. Named because signal timing reads them too: the ITE change
+# interval is set from the 85th-percentile approach speed.
+CAR_DESIRED_SPEED_RANGE = (1.0, 1.4)
+TRUCK_DESIRED_SPEED_RANGE = (0.8, 1.1)
+
+
 def _draw_arrival(approach_key, state, approach_cfg):
     rng = state["rng"]
     direction = approach_key.rsplit("_", 1)[-1]
@@ -291,7 +338,7 @@ def _draw_arrival(approach_key, state, approach_cfg):
             target_turn = "LEFT"
             lane_idx = DBL_LANE_INDEX
     is_heavy = rng.random() < approach_cfg.get("heavy_ratio", 0.10)
-    base_speed = rng.uniform(0.8, 1.1) if is_heavy else rng.uniform(1.0, 1.4)
+    base_speed = rng.uniform(*TRUCK_DESIRED_SPEED_RANGE) if is_heavy else rng.uniform(*CAR_DESIRED_SPEED_RANGE)
     color = (120, 120, 140) if is_heavy else rng.choice(VEHICLE_COLORS)
     return {
         "frame": state["clock"], "target_turn": target_turn, "left_nodes": left_nodes,
@@ -313,6 +360,7 @@ def _record_demand_offer(approach_key, state, count=1, approach_cfg=None):
         arrival = _draw_arrival(approach_key, state, approach_cfg)
         state["requested_arrivals"] += 1
         state["offered_passengers"] += 1.0 if arrival["is_heavy"] else 4.0
+        arrival["identity"] = f"{approach_key}:{state['requested_arrivals']}"
         _demand_draw_state["offers"].append((
             int(arrival["frame"]),
             f"{approach_key}|{state['requested_arrivals']}|{arrival['frame']}|"
@@ -321,6 +369,7 @@ def _record_demand_offer(approach_key, state, count=1, approach_cfg=None):
         ))
         if state["pending_arrivals"] < MAX_PENDING_ARRIVALS:
             state["pending_arrivals"] += 1
+            state["pending_pax"] += 1.0 if arrival["is_heavy"] else 4.0
             state["arrivals"].append(arrival)
         else:
             state["overflow_arrivals"] += 1
@@ -363,6 +412,8 @@ def _git_info():
 _CONFIG_HASH_GLOBAL_KEYS = (
     "vehicle_speed_scale", "priority_eligibility_px", "measured_saturation_flow",
     "warmup_discard_frames", "cycle_time_sec", "test_duration_sim_seconds",
+    "signal_change_intervals", "signal_coordination", "coordination_direction",
+    "_signal_timing",
 )
 _ROUTE_TREATMENT_KEYS = ("tsp_enabled", "dbl_enabled", "manual_dispatch")
 
@@ -430,6 +481,9 @@ def _record_completed_vehicle_delay(vehicle):
     network_throughput["completed_stopped_vehicle_frames"] += stopped_frames
     network_throughput["completed_control_delay_frames"] += float(
         getattr(vehicle, "_experiment_travel_delay_frames", 0.0)
+    )
+    network_throughput["completed_entry_delay_frames"] += int(
+        getattr(vehicle, "entry_delay_frames", 0) or 0
     )
     network_throughput[
         "completed_bus_passenger_delay_frames" if isinstance(vehicle, Bus)
@@ -532,6 +586,10 @@ def accumulate_frame_metrics(vehicles, signal_controller=None):
             upstream = v.is_front_bumper_upstream(
                 target_node, canvas.H_Y, canvas.ROAD_W, canvas.STOP
             )
+            previous = getattr(v, "_bar_state", None)
+            v._bar_state = (target_node, upstream)
+            if previous and previous[1] and previous[0] == target_node and not upstream:
+                _record_stop_bar_crossing(v, target_node, signal_controller)
             if upstream and v.is_spillback_blocked(
                 target_node, canvas.H_Y, canvas.ROAD_W, vehicles
             ):
@@ -550,6 +608,17 @@ def accumulate_frame_metrics(vehicles, signal_controller=None):
     network_throughput["vehicles_in_network_sample_count"] += 1
     if len(vehicles) > network_throughput["vehicles_in_network_max"]:
         network_throughput["vehicles_in_network_max"] = len(vehicles)
+    waiting_pax = 0.0
+    waiting_vehicles = 0
+    for state in spawner_states.values():
+        waiting_pax += float(state.get("pending_pax", 0.0) or 0.0)
+        waiting_vehicles += int(state.get("pending_arrivals", 0) or 0)
+    pending_trips = sum(len(trips) for trips in bus_pending_trips.values())
+    network_throughput["car_passenger_entry_wait_frames"] += waiting_pax
+    network_throughput["bus_passenger_entry_wait_frames"] += pending_trips * BUS_PASSENGERS
+    network_throughput["vehicles_waiting_entry_frames"] += waiting_vehicles + pending_trips
+    for key, value in vehicle_module.SAFETY_COUNTERS.items():
+        network_throughput["ssm_" + key] = value
     run_metrics["vehicles_in_network_current"] = len(vehicles)
     if network_throughput_at_warmup:
         run_metrics["vehicles_in_network_steady_sum"] += len(vehicles)
@@ -604,6 +673,10 @@ TELEMETRY_LOG_PATH = LOGS_DIR / "telemetry_log.jsonl"
 # each run workbook as <workbook>_gridlock.xlsx.
 gridlock_monitor = GridlockMonitor()
 BUS_EVENTS_LOG_PATH = LOGS_DIR / "bus_events.jsonl"
+# One record per vehicle leaving the network (SUMO's tripinfo) and optional
+# 1 Hz-style trajectories (SUMO's FCD), both reset per run.
+TRIPINFO_LOG_PATH = LOGS_DIR / "tripinfo.jsonl"
+FCD_LOG_PATH = LOGS_DIR / "fcd.csv"
 EXCEL_EXPORT_DIR = RESULTS_DIR
 # The master cross-run comparison dataset: one row per checkpoint of every
 # run, appended forever. Never cleared by RESET -- only the operator deleting
@@ -740,7 +813,8 @@ def reset_session_logs():
     global _last_telemetry_log_frame
     _last_telemetry_log_frame = None
     bus_event_tracker.reset()
-    for path in (TELEMETRY_LOG_PATH, AGENT_TURN_LOG_PATH, BUS_EVENTS_LOG_PATH):
+    for path in (TELEMETRY_LOG_PATH, AGENT_TURN_LOG_PATH, BUS_EVENTS_LOG_PATH,
+                 TRIPINFO_LOG_PATH, FCD_LOG_PATH):
         try:
             path.unlink()
         except FileNotFoundError:
@@ -942,6 +1016,10 @@ AI_DECISION_AUDIT_HEADERS = [
     "outcome_network_throughput_json",
     "outcome_observed_tsp_routes",
     "outcome_observed_dbl_routes",
+    # Sim-time control delay, measured here rather than inferred from the
+    # wall-clock latency: snapshot frame -> first merge frame.
+    "applied_frame",
+    "control_delay_sim_s",
 ]
 
 
@@ -1155,7 +1233,17 @@ def _audit_row(decision, telemetry, outcome=None):
         _compact_json(outcome.get("network_throughput", {})),
         _route_list(outcome_routes, lambda state: bool(state.get("tsp_enabled"))),
         _route_list(outcome_routes, lambda state: bool(state.get("dbl_enabled"))),
+        *_applied_columns(decision.get("turn")),
     ]
+
+
+def _applied_columns(turn):
+    applied = run_metrics.get("decision_applied", {}).get(turn)
+    if not applied:
+        return [None, None]
+    snapshot_frame, applied_frame = applied
+    delay = (applied_frame - snapshot_frame) / 60.0 if snapshot_frame is not None else None
+    return [applied_frame, round(delay, 3) if delay is not None else None]
 
 
 def write_ai_decision_audit_sheet(
@@ -1568,14 +1656,19 @@ def write_unit_conversions_sheet(sheet, telemetry=None):
 
 # Bumped whenever a column is added/removed/redefined. append_experiment_summary_row
 # rotates the CSV (never appends ragged) when either this or config_hash changes.
-EXPERIMENT_SUMMARY_SCHEMA_VERSION = 8
+EXPERIMENT_SUMMARY_SCHEMA_VERSION = 9
 
-# PRIMARY DV: total_person_hours_travel_delay_steady, compared as a paired
-# per-seed difference against the baseline arm (pair_against_baseline ->
-# paired_dv_<campaign>.csv: net_person_hours_saved = baseline - arm). It is
+# PRIMARY DV: total_person_hours_delay_incl_entry_steady, compared as a
+# paired per-seed difference against the baseline arm (pair_against_baseline
+# -> paired_dv_<campaign>.csv: net_person_hours_saved = baseline - arm). It is
 # passenger-weighted time below each vehicle's own free-flow speed after the
-# warm-up discard, bus occupancy fixed at BUS_PASSENGERS. Turn/merge
-# slow-downs count as delay in every arm alike and cancel in the pairing.
+# warm-up discard, PLUS the time offered demand waited at the network
+# boundary for the entry to clear -- without that term a controller that
+# holds traffic outside the model is credited for the delay it exported
+# (FHWA Traffic Analysis Toolbox Vol. III: account for demand unable to
+# enter). The on-road-only figure stays as
+# total_person_hours_travel_delay_steady. Turn/merge slow-downs count as
+# delay in every arm alike and cancel in the pairing.
 # The stopped-delay triple (speed < 0.25) is the robustness measure. No
 # per-run column can be "net saved": the baseline is another run.
 
@@ -1624,6 +1717,9 @@ EXPERIMENT_SUMMARY_HEADERS = (
     # LLM meta
     "mean_decision_latency_ms", "guard_reject_rate", "total_decisions",
     "decision_lag_sec_used",
+    # Measured on the sim clock: snapshot frame -> frame the decision took
+    # effect (see _record_decision_applied).
+    "decisions_applied", "control_delay_sim_sec_median", "control_delay_sim_sec_p95",
     # Decision exposure (section C): the fixed-schedule confound fix -- offered
     # opportunities vs. issued decisions, so decision frequency stops being a
     # free variable correlated with model speed.
@@ -1649,6 +1745,22 @@ EXPERIMENT_SUMMARY_HEADERS = (
     "car_person_hours_delay_steady",
     "total_person_hours_travel_delay_steady", "bus_person_hours_travel_delay_steady",
     "car_person_hours_travel_delay_steady",
+    # PRIMARY DV since schema 9: on-road travel delay plus the wait of demand
+    # held at the network boundary (latent demand).
+    "total_person_hours_delay_incl_entry_steady",
+    "bus_person_hours_delay_incl_entry_steady", "car_person_hours_delay_incl_entry_steady",
+    "person_hours_entry_wait_steady", "vehicles_waiting_entry_at_end",
+    # Capacity validation: in-network HCM saturation flow vs the calibrated
+    # S, and GEH of entered vs offered volume per source.
+    "network_saturation_flow_veh_hr_lane", "network_saturation_headway_samples",
+    "network_to_calibrated_s_ratio", "geh_entry_max", "geh_entry_share_below_5",
+    # Signal timing actually used (ITE intervals, HCM lost time, coordination).
+    "signal_timing_json",
+    "latent_demand_share_at_end", "mean_entry_delay_sec_per_vehicle",
+    # Surrogate safety (FHWA SSAM TTC threshold) and the braking-bound record.
+    "ssm_ttc_conflicts_per_veh_hr_steady", "ssm_emergency_decel_per_veh_hr_steady",
+    "ssm_clamp_events_per_veh_hr_steady", "ssm_ttc_conflicts_total",
+    "ssm_leader_clamp_frames_total", "ssm_stop_line_clamp_frames_total", "missed_turns_total",
     "mean_bus_passenger_delay_sec_steady", "mean_car_passenger_delay_sec_steady",
     "delay_sec_per_pax_served_steady",
     "bus_passenger_delay_sec_p50", "bus_passenger_delay_sec_p90",
@@ -1746,6 +1858,166 @@ def _time_to_converge_sec(telemetry_rows, checkpoint_seconds):
     return round(rows[converge_at]["sim_time_s"], 1)
 
 
+def _record_stop_bar_crossing(vehicle, node_x, signal_controller):
+    """Log one front-bumper stop-bar crossing for the network S check."""
+    if signal_controller is None or getattr(vehicle, "target_turn", "STRAIGHT") != "STRAIGHT":
+        return
+    node = getattr(signal_controller, "nodes", {}).get(node_x)
+    phase = 0 if vehicle.direction in ("EB", "WB") else 3
+    if node is None or node.phase != phase:
+        return  # not on its own green (a yellow go, a discharge stage)
+    frame = int(getattr(signal_controller, "frame_number", 0))
+    green_start = frame - int(node.timer)
+    key = (node_x, vehicle.direction, vehicle.lane_index)
+    last = _discharge_state["last"].get(key)
+    if last is None or last[1] != green_start:
+        _discharge_state["last"][key] = (frame, green_start, 1)
+        return
+    position = last[2] + 1
+    _discharge_state["last"][key] = (frame, green_start, position)
+    s_cal = float(control_panel.global_config.get("measured_saturation_flow") or 0)
+    if position >= 5 and s_cal > 0:
+        headway = (frame - last[0]) / 60.0
+        if 0 < headway <= CALIBRATION_INTERRUPTION_FACTOR * 3600.0 / s_cal:
+            _discharge_state["headways"].append(headway)
+
+
+def _geh(model, count):
+    """GEH statistic for hourly flows (FHWA Traffic Analysis Toolbox Vol. III)."""
+    if model + count <= 0:
+        return 0.0
+    return math.sqrt(2.0 * (model - count) ** 2 / (model + count))
+
+
+def _network_validation_columns(checkpoint_seconds):
+    headways = _discharge_state["headways"]
+    s_cal = float(control_panel.global_config.get("measured_saturation_flow") or 0)
+    s_net = (
+        3600.0 / (sum(headways) / len(headways))
+        if len(headways) >= NETWORK_S_MIN_SAMPLES else None
+    )
+    hours = max(checkpoint_seconds, 1e-9) / 3600.0
+    gehs = []
+    for state in spawner_states.values():
+        offered = int(state.get("requested_arrivals", 0) or 0)
+        if offered:
+            gehs.append(_geh(int(state.get("admitted_arrivals", 0) or 0) / hours, offered / hours))
+    return {
+        "network_saturation_flow_veh_hr_lane": round(s_net, 1) if s_net else None,
+        "network_saturation_headway_samples": len(headways),
+        "network_to_calibrated_s_ratio": round(s_net / s_cal, 3) if s_net and s_cal else None,
+        "geh_entry_max": round(max(gehs), 2) if gehs else None,
+        "geh_entry_share_below_5": (
+            round(sum(1 for g in gehs if g < 5.0) / len(gehs), 3) if gehs else None
+        ),
+    }
+
+
+TRIPINFO_FIELDS = (
+    "vehicle", "type", "route_id", "origin", "credited", "unfinished",
+    "depart_s", "arrival_s", "duration_s", "time_loss_s", "waiting_time_s",
+    "depart_delay_s", "dwell_s", "passengers", "nodes_passed",
+)
+
+
+def tripinfo_record(vehicle, frame_number, finished):
+    """One vehicle's trip, as SUMO's tripinfo reports it: departure (entry to
+    the network), arrival, duration, time lost below its own free-flow speed
+    (timeLoss), time standing (waitingTime) and the wait before it could
+    enter at all (departDelay). ``credited`` is the throughput rule --
+    left the network having cleared at least one node's conflict box."""
+    depart = getattr(vehicle, "depart_frame", None)
+    passed = sorted(getattr(vehicle, "passed_nodes", ()) or ())
+    kind = "bus" if isinstance(vehicle, Bus) else ("truck" if vehicle.is_heavy else "car")
+    return {
+        "vehicle": getattr(vehicle, "serial", None),
+        "type": kind,
+        "route_id": getattr(vehicle, "route_id", "") or "",
+        "origin": getattr(vehicle, "spawn_direction", vehicle.direction),
+        "credited": bool(passed) and finished,
+        "unfinished": not finished,
+        "depart_s": round(depart / 60.0, 2) if depart is not None else None,
+        "arrival_s": round(frame_number / 60.0, 2) if finished else None,
+        "duration_s": round((frame_number - depart) / 60.0, 2) if depart is not None else None,
+        "time_loss_s": round(float(getattr(vehicle, "_experiment_travel_delay_frames", 0.0)) / 60.0, 2),
+        "waiting_time_s": round(int(getattr(vehicle, "_experiment_stopped_frames", 0)) / 60.0, 2),
+        "depart_delay_s": round(int(getattr(vehicle, "entry_delay_frames", 0) or 0) / 60.0, 2),
+        "dwell_s": round(int(getattr(vehicle, "dwell_frames_total", 0) or 0) / 60.0, 2),
+        "passengers": int(getattr(vehicle, "passengers", 0) or 0),
+        "nodes_passed": len(passed),
+    }
+
+
+def _write_tripinfo(record):
+    try:
+        TRIPINFO_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with TRIPINFO_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        print(f"Trip info log warning: {exc}")
+
+
+FCD_FIELDS = ("time_s", "vehicle", "type", "x_m", "y_m", "speed_mps", "direction", "lane")
+
+
+def _sample_fcd(vehicles, frame_number):
+    """Every ``fcd_period_s`` of sim time, every vehicle's position (m) and
+    speed (m/s) -- SUMO's floating-car-data output. Off (0) by default; a
+    60-minute run at 1 s is ~800k rows."""
+    period = float(control_panel.global_config.get("fcd_period_s", 0) or 0)
+    if period <= 0 or frame_number % max(1, int(round(period * 60))):
+        return
+    m = vehicle_module.METERS_PER_PX
+    mps = m * vehicle_module.FPS
+    try:
+        FCD_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        new = not FCD_LOG_PATH.exists()
+        with FCD_LOG_PATH.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            if new:
+                writer.writerow(FCD_FIELDS)
+            t = round(frame_number / 60.0, 2)
+            for v in vehicles:
+                kind = "bus" if isinstance(v, Bus) else ("truck" if v.is_heavy else "car")
+                writer.writerow((t, v.serial, kind, round(v.x * m, 2), round(v.y * m, 2),
+                                 round(v.speed * mps, 3), v.direction, v.lane_index))
+    except OSError as exc:
+        print(f"FCD log warning: {exc}")
+
+
+def write_tripinfo_sheet(sheet, frame_number=None):
+    """Finished trips from the log, then every vehicle still on the road as
+    an unfinished trip (SUMO's --tripinfo-output.write-unfinished)."""
+    sheet.append(list(TRIPINFO_FIELDS))
+    for record in _read_jsonl_rows(TRIPINFO_LOG_PATH):
+        sheet.append([record.get(key) for key in TRIPINFO_FIELDS])
+    frame = _current_frame["n"] if frame_number is None else frame_number
+    for vehicle in list(_live_vehicles or []):
+        record = tripinfo_record(vehicle, frame, finished=False)
+        sheet.append([record.get(key) for key in TRIPINFO_FIELDS])
+
+
+def _latent_demand_and_safety_columns():
+    """End-of-window latent demand and the run's safety totals."""
+    waiting = sum(int(st.get("pending_arrivals", 0) or 0) for st in spawner_states.values())
+    waiting += sum(len(trips) for trips in bus_pending_trips.values())
+    offered = sum(int(st.get("requested_arrivals", 0) or 0) for st in spawner_states.values())
+    offered += int(run_metrics.get("bus_trips_scheduled", 0) or 0)
+    served = int(network_throughput.get("vehicles_served_total", 0) or 0)
+    return {
+        "vehicles_waiting_entry_at_end": waiting,
+        "latent_demand_share_at_end": round(waiting / offered, 4) if offered else None,
+        "mean_entry_delay_sec_per_vehicle": (
+            round(network_throughput["completed_entry_delay_frames"] / 60.0 / served, 2)
+            if served else None
+        ),
+        "ssm_ttc_conflicts_total": int(network_throughput.get("ssm_ttc_conflicts", 0)),
+        "ssm_leader_clamp_frames_total": int(network_throughput.get("ssm_leader_clamp_frames", 0)),
+        "ssm_stop_line_clamp_frames_total": int(network_throughput.get("ssm_stop_line_clamp_frames", 0)),
+        "missed_turns_total": int(network_throughput.get("ssm_missed_turns", 0)),
+    }
+
+
 def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
     """Post-warm-up DVs from the warm-up snapshot, plus a convergence flag:
     cumulative pax/min within 5% between 0.8T and T *and* vehicles in the
@@ -1776,6 +2048,13 @@ def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
         "total_person_hours_travel_delay_steady": None,
         "bus_person_hours_travel_delay_steady": None,
         "car_person_hours_travel_delay_steady": None,
+        "person_hours_entry_wait_steady": None,
+        "total_person_hours_delay_incl_entry_steady": None,
+        "bus_person_hours_delay_incl_entry_steady": None,
+        "car_person_hours_delay_incl_entry_steady": None,
+        "ssm_ttc_conflicts_per_veh_hr_steady": None,
+        "ssm_emergency_decel_per_veh_hr_steady": None,
+        "ssm_clamp_events_per_veh_hr_steady": None,
         "mean_bus_passenger_delay_sec_steady": None,
         "mean_car_passenger_delay_sec_steady": None,
         "delay_sec_per_pax_served_steady": None,
@@ -1791,6 +2070,26 @@ def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
         car_done_sec = delta("completed_car_passenger_delay_frames") / 60.0
         bus_travel_h = delta("bus_passenger_travel_delay_frames") / 60.0 / 3600.0
         car_travel_h = delta("car_passenger_travel_delay_frames") / 60.0 / 3600.0
+        bus_entry_h = delta("bus_passenger_entry_wait_frames") / 60.0 / 3600.0
+        car_entry_h = delta("car_passenger_entry_wait_frames") / 60.0 / 3600.0
+        veh_h = delta("vehicles_in_network_frame_sum") / 60.0 / 3600.0
+
+        def per_veh_hr(count):
+            return round(count / veh_h, 3) if veh_h > 0 else None
+
+        out.update({
+            "person_hours_entry_wait_steady": round(bus_entry_h + car_entry_h, 4),
+            "total_person_hours_delay_incl_entry_steady": round(
+                bus_travel_h + car_travel_h + bus_entry_h + car_entry_h, 4
+            ),
+            "bus_person_hours_delay_incl_entry_steady": round(bus_travel_h + bus_entry_h, 4),
+            "car_person_hours_delay_incl_entry_steady": round(car_travel_h + car_entry_h, 4),
+            "ssm_ttc_conflicts_per_veh_hr_steady": per_veh_hr(delta("ssm_ttc_conflicts")),
+            "ssm_emergency_decel_per_veh_hr_steady": per_veh_hr(delta("ssm_emergency_decel_events")),
+            "ssm_clamp_events_per_veh_hr_steady": per_veh_hr(
+                delta("ssm_leader_clamp_frames") + delta("ssm_stop_line_clamp_frames")
+            ),
+        })
         out.update({
             "pax_per_min_steady": round(
                 delta("passengers_served_total") / (steady_sec / 60.0), 2
@@ -2515,6 +2814,7 @@ def build_experiment_summary_row(
         "decision_lag_sec_used": (
             round(mean_latency_ms / 1000.0, 3) if mean_latency_ms is not None else None
         ),
+        **_control_delay_columns(),
         "decision_opportunities": schedule["decision_opportunities"],
         "decisions_issued": schedule["decisions_issued"],
         "decisions_skipped_slow": schedule["decisions_skipped_slow"],
@@ -2552,6 +2852,9 @@ def build_experiment_summary_row(
             mean_control_delay_sec_per_vehicle
         ),
         **steady,
+        **_latent_demand_and_safety_columns(),
+        **_network_validation_columns(checkpoint_seconds),
+        "signal_timing_json": json.dumps(config.get("_signal_timing") or {}, sort_keys=True),
         "pax_per_min_cumulative": round(
             total_served / max(checkpoint_seconds / 60.0, 1e-9), 2
         ),
@@ -2802,6 +3105,7 @@ def export_test_workbook(
         write_bus_events_sheet(workbook.create_sheet("Bus Events"), bus_events)
         write_unit_conversions_sheet(workbook.create_sheet("Unit Conversions"))
         write_experiment_summary_sheet(workbook.create_sheet("Experiment Summary"))
+        write_tripinfo_sheet(workbook.create_sheet("Trip Info"))
 
         if destination is None:
             destination = EXCEL_EXPORT_DIR / build_test_export_filename(
@@ -2813,6 +3117,8 @@ def export_test_workbook(
         workbook.save(destination)
         workbook.close()
         gridlock_monitor.write_workbook(report_path_for(destination))
+        if FCD_LOG_PATH.exists():
+            shutil.copyfile(FCD_LOG_PATH, destination.with_name(destination.stem + "_fcd.csv"))
         global _run_exported_workbook
         _run_exported_workbook = True
         print(f"Timed test exported: {destination}")
@@ -3035,6 +3341,31 @@ def build_batch_runner():
     )
 
 
+# Two-sided 95 % Student t quantiles, df 1-30 (beyond: 1.96).
+_T95 = (12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+        2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+        2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042)
+# Tolerable error on a model's mean paired DV, as a fraction of that mean.
+REPLICATION_TOLERANCE_FRACTION = 0.10
+
+
+def required_replications(values, tolerance_fraction=REPLICATION_TOLERANCE_FRACTION):
+    """Runs needed so the mean is within +/- tolerance of itself at 95 %:
+    N = (t_{0.975, n-1} * s / e)^2 (FHWA, Traffic Analysis Toolbox Vol. III,
+    Guidelines for Applying Traffic Microsimulation Modeling Software, on the
+    number of simulation runs). None when fewer than two values or a zero
+    mean make it undefined."""
+    values = [float(v) for v in values if v is not None]
+    if len(values) < 2:
+        return None
+    mean = statistics.fmean(values)
+    tolerance = abs(mean) * tolerance_fraction
+    if tolerance <= 0:
+        return None
+    t = _T95[len(values) - 2] if len(values) - 1 <= len(_T95) else 1.96
+    return max(len(values), math.ceil((t * statistics.stdev(values) / tolerance) ** 2))
+
+
 def print_campaign_summary(campaign_id):
     """End-of-batch readout from the CSV's final-checkpoint rows of this
     campaign: what a reviewer would otherwise have to compute by hand
@@ -3082,6 +3413,7 @@ def print_campaign_summary(campaign_id):
             f"achieved pace: all {len(paces)} run(s) within {PACE_TOLERANCE:.0%} of 1.0"
         ),
     ]
+    lines.extend(_campaign_validity_flags(rows))
     pairs, unpaired, mismatched = pair_against_baseline(rows)
     if pairs:
         path = write_paired_dv_csv(campaign_id, pairs)
@@ -3091,14 +3423,54 @@ def print_campaign_summary(campaign_id):
             by_model.setdefault(pair["model"], []).append(pair["net_person_hours_saved"])
         for model_name, values in sorted(by_model.items()):
             sd = statistics.pstdev(values) if len(values) > 1 else 0.0
+            needed = required_replications(values)
+            adequacy = (
+                "" if needed is None else
+                f"  runs needed for +/-{REPLICATION_TOLERANCE_FRACTION:.0%} at 95 %: {needed}"
+                + ("" if needed <= len(values) else "  <-- UNDER-REPLICATED")
+            )
             lines.append(
-                f"  {model_name}: mean {statistics.fmean(values):+.4f} h  sd {sd:.4f}  n={len(values)}"
+                f"  {model_name}: mean {statistics.fmean(values):+.4f} h  sd {sd:.4f}  n={len(values)}{adequacy}"
             )
     if unpaired:
         lines.append(f"seeds without a baseline row (not paired): {unpaired}")
     if mismatched:
         lines.append(f"REFUSED (differs from baseline, not paired): {mismatched}")
     print("\n" + "\n".join(lines) + "\n")
+
+
+# Latent demand above this share of the offered vehicles means the network
+# boundary is truncating queues: FHWA Traffic Analysis Toolbox Vol. III asks
+# that demand unable to enter be accounted for, and the model extended until
+# it is negligible. GEH < 5 on at least 85 % of counts is the same guide's
+# volume acceptance target.
+LATENT_DEMAND_WARN_SHARE = 0.05
+NETWORK_S_WARN_RATIO = 0.9
+
+
+def _campaign_validity_flags(rows):
+    def floats(key):
+        out = []
+        for row in rows:
+            try:
+                out.append((f"{row['model']}/{row['seed']}", float(row.get(key))))
+            except (TypeError, ValueError):
+                pass
+        return out
+    lines = []
+    latent = [f"{n} {v:.0%}" for n, v in floats("latent_demand_share_at_end") if v > LATENT_DEMAND_WARN_SHARE]
+    lines.append(
+        f"latent demand > {LATENT_DEMAND_WARN_SHARE:.0%} of offered (queues cut off at the boundary): "
+        f"{len(latent)} {latent if latent else ''}"
+    )
+    s_low = [f"{n} {v:.2f}" for n, v in floats("network_to_calibrated_s_ratio") if v < NETWORK_S_WARN_RATIO]
+    lines.append(
+        f"in-network saturation flow < {NETWORK_S_WARN_RATIO:.0%} of calibrated S: "
+        f"{len(s_low)} {s_low if s_low else ''}"
+    )
+    geh = [f"{n} {v:.0%}" for n, v in floats("geh_entry_share_below_5") if v < 0.85]
+    lines.append(f"GEH<5 on fewer than 85 % of sources: {len(geh)} {geh if geh else ''}")
+    return lines
 
 
 # Columns a baseline and an arm row must agree on before their difference
@@ -3109,7 +3481,7 @@ PAIRING_MUST_MATCH = (
 PAIRED_DV_HEADERS = (
     "campaign_id", "seed", "model", "baseline_run_uuid", "arm_run_uuid",
     "net_person_hours_saved", "bus_person_hours_saved", "car_person_hours_saved",
-    "net_person_hours_saved_stopped", "converged_both",
+    "net_person_hours_saved_on_road", "net_person_hours_saved_stopped", "converged_both",
 )
 
 
@@ -3158,9 +3530,10 @@ def pair_against_baseline(rows):
             "model": row.get("model"),
             "baseline_run_uuid": base.get("run_uuid"),
             "arm_run_uuid": row.get("run_uuid"),
-            "net_person_hours_saved": diff("total_person_hours_travel_delay_steady"),
-            "bus_person_hours_saved": diff("bus_person_hours_travel_delay_steady"),
-            "car_person_hours_saved": diff("car_person_hours_travel_delay_steady"),
+            "net_person_hours_saved": diff("total_person_hours_delay_incl_entry_steady"),
+            "bus_person_hours_saved": diff("bus_person_hours_delay_incl_entry_steady"),
+            "car_person_hours_saved": diff("car_person_hours_delay_incl_entry_steady"),
+            "net_person_hours_saved_on_road": diff("total_person_hours_travel_delay_steady"),
             "net_person_hours_saved_stopped": diff("total_person_hours_delay_steady"),
             "converged_both": (
                 base.get("converged") == "True" and row.get("converged") == "True"
@@ -3351,6 +3724,12 @@ def _set_ai_flags(flags, signals=None):
         route_config["dbl_enabled"] = route_flags["dbl"]
 
 
+# The frame step_simulation is on, and its vehicle list: trip records stamp
+# departures with the first, and an export writes unfinished trips from the
+# second without the export path having to be handed the list.
+_current_frame = {"n": 0}
+_live_vehicles = None
+
 # The controller step_simulation last drove: merge_live_decision needs it to
 # apply (or withdraw) an AI Configured plan without changing the decide()
 # contract headless_run and the trainer share.
@@ -3363,6 +3742,38 @@ def _hold_all_off(signals):
     _set_ai_flags(guard.all_off_flags(), signals)
     if signals is not None:
         signals.clear_plan()
+
+
+def _record_decision_applied(decision, turn):
+    """First frame a turn's decision took effect, against the frame of the
+    snapshot it was made from. Their difference is the control delay in sim
+    time -- detection of the grid point, the model call and the 30-frame
+    merge -- measured on the sim clock, so it holds whatever the achieved
+    pace, where wall latency x pace is only an estimate."""
+    applied = run_metrics.setdefault("decision_applied", {})
+    if turn <= 0 or turn in applied:
+        return
+    try:
+        snapshot_frame = int(decision.get("telemetry_frame"))
+    except (TypeError, ValueError):
+        snapshot_frame = None
+    applied[turn] = (snapshot_frame, int(_current_frame["n"]))
+
+
+def _control_delay_columns():
+    delays = sorted(
+        (applied - snapshot) / 60.0
+        for snapshot, applied in run_metrics.get("decision_applied", {}).values()
+        if snapshot is not None and applied >= snapshot
+    )
+    if not delays:
+        return {"decisions_applied": 0, "control_delay_sim_sec_median": None,
+                "control_delay_sim_sec_p95": None}
+    return {
+        "decisions_applied": len(delays),
+        "control_delay_sim_sec_median": round(statistics.median(delays), 3),
+        "control_delay_sim_sec_p95": round(delays[min(len(delays) - 1, int(0.95 * len(delays)))], 3),
+    }
 
 
 def merge_ai_decision(path=None, signals=None):
@@ -3448,6 +3859,7 @@ def merge_ai_decision(path=None, signals=None):
                 # on every 30-frame merge of the same file.
                 signals.apply_plan(plan)
         runtime["last_turn"] = turn
+        _record_decision_applied(decision, turn)
         runtime["last_status"] = "OK" if plan is not None else "HELD_WEBSTER"
         return plan is not None
 
@@ -3458,6 +3870,7 @@ def merge_ai_decision(path=None, signals=None):
         return False
 
     runtime["last_turn"] = turn
+    _record_decision_applied(decision, turn)
     _set_ai_flags(flags, signals)
     decision_status = decision.get("status", "OK")
     runtime["last_status"] = (
@@ -3480,6 +3893,7 @@ def reset_all_spawner_states():
     bus_schedule_time_s = 0.0
     bus_sequence_counter = 0
     post_discharge_meter_frames_remaining = 0
+    _route_trip_index.clear()
 
 
 def reset_traffic_generation():
@@ -3492,7 +3906,10 @@ def reset_traffic_generation():
     """
     _demand_draw_state["offers"].clear()
     _pace_state["wall_seconds"] = 0.0
+    _discharge_state["last"].clear()
+    _discharge_state["headways"].clear()
     vehicle_module.reset_vehicle_serials()
+    vehicle_module.reset_safety_counters()
     reset_all_spawner_states()
     # Freeze motion tuning for the episode. Slider changes made during a run
     # therefore cannot change the speed of only later arrivals.
@@ -3514,6 +3931,9 @@ CALIBRATION_TARGET_QUEUE = 30       # Measured: 12 gives sd +/-920 veh/hr
 CALIBRATION_BUILD_LIMIT_SEC = 180.0
 CALIBRATION_DISCHARGE_LIMIT_SEC = 120.0
 CALIBRATION_STARTUP_VEHICLES = 4    # Startup lost time, excluded per HCM
+# A discharge headway above this multiple of the median is a stalled queue,
+# not a saturation headway, and is left out of S (see calibrate_saturation_flow).
+CALIBRATION_INTERRUPTION_FACTOR = 2.5
 CALIBRATION_BUILD_VEH_PER_MIN = 120
 CALIBRATION_SEED_FALLBACK = 20260909
 DEFAULT_SATURATION_FLOW = 1366.0    # Only used if a calibration run yields none
@@ -3533,7 +3953,8 @@ def _calibration_signals(green):
 
 
 def calibrate_saturation_flow(
-    speed_scale, heavy_ratio, seed=None, target_queue=CALIBRATION_TARGET_QUEUE
+    speed_scale, heavy_ratio, seed=None, target_queue=CALIBRATION_TARGET_QUEUE,
+    details=False,
 ):
     """Measure saturation flow (veh/hr/lane) by discharging a standing queue.
 
@@ -3639,12 +4060,46 @@ def calibrate_saturation_flow(
         (later - earlier) / 60.0
         for earlier, later in zip(crossing_frames, crossing_frames[1:])
     ][CALIBRATION_STARTUP_VEHICLES:]
-    if not headways:
-        return DEFAULT_SATURATION_FLOW
-    mean_headway = sum(headways) / len(headways)
-    if mean_headway <= 0:
-        return DEFAULT_SATURATION_FLOW
-    return 3600.0 / mean_headway
+    excluded = 0
+    startup_source = "hcm_default"
+    startup_lost = webster.HCM_STARTUP_LOST_TIME_SEC
+    if not headways or sum(headways) <= 0:
+        saturation = DEFAULT_SATURATION_FLOW
+    else:
+        # Saturation headways come from an uninterrupted queue discharge
+        # (HCM 7th ed., Ch. 31 field procedure). A gap several times the
+        # median is the queue having stopped discharging, not a headway:
+        # the legacy engine's absolute 0.5 px/frame "standing" threshold
+        # makes a slow truck ahead read as spillback and stalls the queue
+        # behind it for up to 20 s, which averaged into S and made l1 14 s.
+        median = statistics.median(headways)
+        clean = [h for h in headways if h <= CALIBRATION_INTERRUPTION_FACTOR * median]
+        excluded = len(headways) - len(clean)
+        mean_headway = sum(clean) / len(clean)
+        saturation = 3600.0 / mean_headway
+        # HCM start-up lost time: the time the first four queued vehicles
+        # take beyond four saturation headways, measured from green onset
+        # (HCM 7th ed., Ch. 19; field method in Ch. 31). Measured on the
+        # engine that drives, like S, so Webster's lost time describes it --
+        # unless those first four were themselves interrupted, in which case
+        # the HCM default is used and the source says so.
+        n = CALIBRATION_STARTUP_VEHICLES
+        if len(crossing_frames) >= n:
+            first = [crossing_frames[0] / 60.0] + [
+                (later - earlier) / 60.0
+                for earlier, later in zip(crossing_frames[: n - 1], crossing_frames[1:n])
+            ]
+            if max(first) <= CALIBRATION_INTERRUPTION_FACTOR * max(median, mean_headway):
+                startup_lost = max(0.0, crossing_frames[n - 1] / 60.0 - n * mean_headway)
+                startup_source = "measured"
+    if details:
+        return {
+            "saturation_flow": saturation,
+            "startup_lost_sec": round(startup_lost, 2),
+            "startup_lost_source": startup_source,
+            "excluded_headways": excluded,
+        }
+    return saturation
 
 
 def representative_heavy_ratio():
@@ -3670,8 +4125,46 @@ def _calibration_key(config):
     )
 
 
+def signal_change_intervals(config):
+    """(yellow_frames, all_red_frames) for this run.
+
+    "ite": ITE (2020) kinematic change and clearance intervals at the
+    85th-percentile desired speed of the car stream, over the stop line to
+    far-side box edge, bounded by MUTCD guidance (webster.ite_change_intervals).
+    "legacy": the former fixed 1 s + 1 s, kept so pinned results reproduce.
+    """
+    if config.get("signal_change_intervals", "ite") == "legacy":
+        return 60, 60
+    lo, hi = CAR_DESIRED_SPEED_RANGE
+    v85_px = (lo + 0.85 * (hi - lo)) * float(config.get("vehicle_speed_scale", 0.5) or 0.5)
+    v85_mps = v85_px * vehicle_module.METERS_PER_PX * vehicle_module.FPS
+    width_m = (canvas.ROAD_W + canvas.STOP) * vehicle_module.METERS_PER_PX
+    yellow, all_red = webster.ite_change_intervals(v85_mps, width_m)
+    return int(round(yellow * 60)), int(round(all_red * 60))
+
+
+def coordination_offsets_frames(config, splits):
+    """Offset of each node's EW-green start against the master cycle, frames.
+
+    The first node the progression direction reaches is the reference
+    (offset 0); the next starts one link travel time later at the mean car
+    desired speed, so a platoon released on its green arrives on green
+    (NCHRP Report 812, time-space / offset design).
+    """
+    lo, hi = CAR_DESIRED_SPEED_RANGE
+    speed_px = (lo + hi) / 2.0 * float(config.get("vehicle_speed_scale", 0.5) or 0.5)
+    link_px = abs(canvas.INT_X[1] - canvas.INT_X[0])
+    travel = int(round(link_px / max(speed_px, 1e-6)))
+    cycle = max(split["cycle_time_frames"] for split in splits.values())
+    first, second = (canvas.INT_X[0], canvas.INT_X[1])
+    if config.get("coordination_direction", "EB") == "WB":
+        first, second = second, first
+    return {first: 0, second: travel % cycle}, cycle
+
+
 def calibrate_and_apply_webster(signals, force=False):
-    """Measure S and publish Webster splits before the run clock starts.
+    """Measure S and start-up lost time, set the change intervals, and publish
+    Webster splits (and the coordination plan) before the run clock starts.
 
     S is cached per regime: it is a property of the speed scale, vehicle mix
     and movement engine, none of which vary within a sweep, so re-measuring
@@ -3686,32 +4179,66 @@ def calibrate_and_apply_webster(signals, force=False):
                 config.get("vehicle_speed_scale", 0.5),
                 representative_heavy_ratio(),
                 None,
+                details=True,
             )
-        saturation = _saturation_cache[key]
+        measured = _saturation_cache[key]
+        if isinstance(measured, dict):
+            saturation = float(measured["saturation_flow"])
+            startup_lost = float(measured["startup_lost_sec"])
+            startup_source = measured.get("startup_lost_source", "measured")
+            excluded = int(measured.get("excluded_headways", 0))
+        else:  # a stubbed calibrator returns S alone
+            saturation = float(measured)
+            startup_lost = webster.HCM_STARTUP_LOST_TIME_SEC
+            startup_source, excluded = "hcm_default", 0
         config["measured_saturation_flow"] = round(saturation, 0)
-        # Tolerate controllers that do not expose the interlock timings,
-        # falling back to the production defaults rather than failing a reset.
+
+        yellow, all_red = signal_change_intervals(config)
+        # Tolerate controllers that do not expose the interlock timings.
+        if hasattr(signals, "yellow_time"):
+            signals.yellow_time = yellow
+        if hasattr(signals, "red_clearance_time"):
+            signals.red_clearance_time = all_red
+        extension = webster.HCM_EFFECTIVE_GREEN_EXTENSION_SEC
         lost_time = webster.lost_time_seconds(
-            getattr(signals, "yellow_time", 60),
-            getattr(signals, "red_clearance_time", 60),
+            yellow, all_red, startup_lost_sec=startup_lost, extension_sec=extension
         )
+        coordinated = config.get("signal_coordination", "coordinated") == "coordinated"
         splits = webster.compute_all_nodes(
             control_panel.approach_configs,
             saturation,
             lost_time_sec=lost_time,
+            displayed_green_offset_sec=startup_lost - extension,
+            common_cycle=coordinated,
         )
         config["webster_splits"] = splits
         config["cycle_time_sec"] = {
             node_x: split["cycle_time_sec"] for node_x, split in splits.items()
+        }
+        offsets, cycle_frames = (
+            coordination_offsets_frames(config, splits) if coordinated else ({}, None)
+        )
+        if hasattr(signals, "set_coordination"):
+            signals.set_coordination(cycle_frames, offsets)
+        config["_signal_timing"] = {
+            "yellow_sec": round(yellow / 60.0, 2),
+            "all_red_sec": round(all_red / 60.0, 2),
+            "startup_lost_sec": round(startup_lost, 2),
+            "startup_lost_source": startup_source,
+            "calibration_excluded_headways": excluded,
+            "lost_time_sec": round(lost_time, 2),
+            "coordination": "coordinated" if coordinated else "independent",
+            "common_cycle_sec": round(cycle_frames / 60.0, 2) if cycle_frames else None,
+            "offsets_sec": {str(k): round(v / 60.0, 2) for k, v in offsets.items()},
         }
         cycle_summary = ", ".join(
             f"node {node_x}={split['cycle_time_sec']:.1f}s"
             for node_x, split in splits.items()
         )
         print(
-            f"[WEBSTER] S={saturation:.0f} veh/hr  "
-            f"cycles=({cycle_summary})  "
-            f"lost={lost_time:.1f}s  splits={splits}"
+            f"[WEBSTER] S={saturation:.0f} veh/hr  l1={startup_lost:.2f}s  "
+            f"Y={yellow / 60:.1f}s AR={all_red / 60:.1f}s  lost={lost_time:.1f}s  "
+            f"cycles=({cycle_summary})  offsets={config['_signal_timing']['offsets_sec']}"
         )
         return saturation, splits
     finally:
@@ -3825,8 +4352,10 @@ def step_simulation(vehicles, signals, frame_number, decide=merge_live_decision)
     called at the same point of the frame either way, so a headless
     experiment sees exactly what a windowed run would.
     """
-    global _discharge_was_active, _live_signals
+    global _discharge_was_active, _live_signals, _live_vehicles
     _live_signals = signals
+    _live_vehicles = vehicles
+    _current_frame["n"] = frame_number
     # Last frame's neighbour index is further out of date than its staleness
     # margin covers, and spawning is about to change the list anyway.
     vehicle_module.index_frame(None)
@@ -3880,12 +4409,14 @@ def step_simulation(vehicles, signals, frame_number, decide=merge_live_decision)
                 else:
                     network_throughput["passengers_served_car"] += passengers
                     network_throughput["cars_served"] += 1
+            _write_tripinfo(tripinfo_record(v, frame_number, finished=True))
             vehicles.remove(v)
             vehicle_module.drop_from_index(v)
     # Instrumentation only: samples post-update bus state and the
     # controller's live priority requests for this frame.
     bus_event_tracker.observe(vehicles, frame_number, signals)
     accumulate_frame_metrics(vehicles, signals)
+    _sample_fcd(vehicles, frame_number)
     snapshot_warmup_baseline(frame_number)
 
 
@@ -4050,34 +4581,56 @@ def try_spawn_vehicle(
         return
 
     state = spawner_states[approach_key]
-    arrival = state["arrivals"][0]
-    target_turn, left_nodes, lane_idx = (
-        arrival["target_turn"], arrival["left_nodes"], arrival["lane_idx"]
-    )
 
+    # Each lane admits its own arrivals, in order. One queue for the whole
+    # approach let the head arrival's blocked lane hold back arrivals bound
+    # for free lanes: at 0.6x demand the head was blocked on 100 % of pending
+    # frames and a free lane was wanted behind it 29-99 % of that time
+    # (2026-09-23 audit). Arrival attributes are fixed at offer time, so the
+    # offered schedule and common random numbers are untouched.
+    # Entry clearance: the lateral window is a vehicle width, not a
+    # lane-centre tolerance, so a vehicle mid-slide between lanes still
+    # blocks the lane it is straddling.
+    blocked = set()
+    for index, lane_coord in enumerate(lane_coords):
+        for v in vehicles:
+            if v.direction != direction:
+                continue
+            along, cross = (v.x, v.y) if direction in ("EB", "WB") else (v.y, v.x)
+            if abs(along - spawn_coord) < min_gap and abs(cross - lane_coord) < SPAWN_LATERAL_BLOCK_PX:
+                blocked.add(index)
+                break
+    if len(blocked) >= len(lane_coords):
+        return
     # The outer horizontal lane is the general left-turn lane and the DBL
     # lane. Once DBL is active it is reserved for the priority bus: retain a
     # new left-turn arrival at the source instead of immediately refilling a
     # lane that the controller is unconditionally clearing.
-    if target_turn == "LEFT" and direction in ("EB", "WB") and signal_controller:
+    hold_lefts = False
+    if direction in ("EB", "WB") and signal_controller:
         target_node_x = canvas.INT_X[0] if direction == "EB" else canvas.INT_X[-1]
-        if signal_controller.dbl_excludes_left_turns(target_node_x, direction):
-            return
-
+        hold_lefts = signal_controller.dbl_excludes_left_turns(target_node_x, direction)
+    # ponytail: linear scan of the source queue; long only when demand is
+    # already held at the boundary, and it stops at the first admissible one.
+    pick = next(
+        (
+            index for index, candidate in enumerate(state["arrivals"])
+            if candidate["lane_idx"] not in blocked
+            and not (hold_lefts and candidate["target_turn"] == "LEFT")
+        ),
+        None,
+    )
+    if pick is None:
+        return
+    arrival = state["arrivals"][pick]
+    del state["arrivals"][pick]
+    target_turn, left_nodes, lane_idx = (
+        arrival["target_turn"], arrival["left_nodes"], arrival["lane_idx"]
+    )
     target_lane_coord = lane_coords[lane_idx]
 
-    # Entry Clearance Check. The lateral window is a vehicle width, not a
-    # lane-centre tolerance, so a vehicle mid-slide between lanes still
-    # blocks the lane it is straddling.
-    for v in vehicles:
-        if v.direction == direction:
-            if direction in ("EB", "WB") and abs(v.x - spawn_coord) < min_gap and abs(v.y - target_lane_coord) < SPAWN_LATERAL_BLOCK_PX:
-                return
-            elif direction in ("NB", "SB") and abs(v.y - spawn_coord) < min_gap and abs(v.x - target_lane_coord) < SPAWN_LATERAL_BLOCK_PX:
-                return
-
-    state["arrivals"].popleft()
     state["pending_arrivals"] = max(0, state["pending_arrivals"] - 1)
+    state["pending_pax"] = max(0.0, state["pending_pax"] - (1.0 if arrival["is_heavy"] else 4.0))
     if model_type == CONGESTION_MODEL:
         state["frames_since_spawn"] = 0
     is_heavy, speed, color = arrival["is_heavy"], arrival["speed"], arrival["color"]
@@ -4096,7 +4649,69 @@ def try_spawn_vehicle(
             target_turn=target_turn, lane_index=lane_idx,
             assigned_node_x=assigned_node_x, left_nodes=left_nodes,
         ))
+    admitted = vehicles[-1]
+    admitted.depart_frame = _current_frame["n"]
+    admitted.behaviour_rng = behaviour_stream(arrival.get("identity", ""))
+    # Frames this vehicle waited at the source because the entry was full --
+    # SUMO's departDelay, reported per trip and in the delay DV.
+    admitted.entry_delay_frames = max(0, int(state["clock"]) - int(arrival["frame"]))
+    _settle_insertion_speed(admitted, vehicles)
     state["admitted_arrivals"] += 1
+
+
+def _settle_insertion_speed(vehicle, vehicles):
+    """Enter at the safe speed for the gap ahead, never full desired speed
+    into a queue (vehicle.safe_insertion_speed)."""
+    gap, leader = vehicle.get_lead_vehicle(vehicles)
+    vehicle.speed = min(vehicle.speed, vehicle_module.safe_insertion_speed(vehicle, gap, leader))
+
+
+# Trips dispatched per route this run. The k-th bus of a route is the k-th
+# scheduled trip whatever the controller did (trips leave in order), so its
+# dwell draw is keyed on it and every arm of a seed sees identical dwells.
+_route_trip_index = {}
+
+
+def _poisson(rng, mean):
+    """Knuth's Poisson sampler; small means only (boardings per stop)."""
+    limit, count, product = math.exp(-max(0.0, float(mean))), 0, rng.random()
+    while product > limit:
+        count += 1
+        product *= rng.random()
+    return count
+
+
+def dwell_frames_for(rng, params):
+    """TCQSM dwell: door time + passenger service (Ch. 6). With two or more
+    doors boarding and alighting run in parallel and the longer governs."""
+    boardings = _poisson(rng, params.get("mean_boardings", 4.0))
+    alightings = _poisson(rng, params.get("mean_alightings", 4.0))
+    board = boardings * float(params.get("board_sec_per_pax", 3.0))
+    alight = alightings * float(params.get("alight_sec_per_pax", 2.0))
+    service = max(board, alight) if int(params.get("doors", 2)) >= 2 else board + alight
+    return int(round((float(params.get("door_time_sec", 4.0)) + service) * 60))
+
+
+def behaviour_stream(identity):
+    """A vehicle's own behavioural random stream, keyed on (run seed,
+    exogenous identity) -- see Vehicle.behaviour_rng."""
+    seed = control_panel.global_config.get("random_seed")
+    return random.Random(f"{seed}:{identity}:behaviour")
+
+
+def draw_stop_plan(route_id, route_cfg):
+    """The dwell at every stop of this trip, drawn from a stream keyed on
+    (run seed, route, trip index): exogenous, like the demand streams."""
+    index = _route_trip_index.get(route_id, 0)
+    _route_trip_index[route_id] = index + 1
+    seed = control_panel.global_config.get("random_seed")
+    rng = random.Random(f"{seed}:{route_id}:{index}:dwell")
+    params = control_panel.global_config.get("bus_dwell") or {}
+    return [
+        {"node": int(stop["node"]), "side": stop.get("side", "far"),
+         "dwell_frames": dwell_frames_for(rng, params), "served": False, "dwelt": 0}
+        for stop in route_cfg.get("stops", []) or []
+    ]
 
 
 def check_and_dispatch_buses(vehicles, lane_options, dt):
@@ -4185,6 +4800,8 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
                 "source_delay_s": source_delay,
                 "pending_trips_at_departure": len(pending),
                 "missed_trips_to_date": run_metrics["bus_trips_missed"],
+                "trip_identity": f"{r_id}:{_route_trip_index.get(r_id, 0)}",
+                "stops": draw_stop_plan(r_id, r_cfg),
             }
 
             vehicles.append(Bus(
@@ -4192,6 +4809,10 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
                 route_info=route_info, bus_id=unique_bus_id,
                 max_speed=1.0 * get_active_vehicle_speed_scale(),
             ))
+            vehicles[-1].entry_delay_frames = int(round(source_delay * 60))
+            vehicles[-1].depart_frame = _current_frame["n"]
+            vehicles[-1].behaviour_rng = behaviour_stream(route_info["trip_identity"])
+            _settle_insertion_speed(vehicles[-1], vehicles)
             run_metrics["buses_spawned"] += 1
 
 
@@ -4880,9 +5501,34 @@ def acquire_instance_lock(path=None):
     return handle
 
 
+def raise_simulator_priority():
+    """Give the simulator's one thread first claim on a core.
+
+    The 60 Hz step and the Tk loop share one Python thread, and pace is only
+    1.0 while that thread gets a core whenever it is runnable. A local model
+    in Ollama runs at normal priority on every physical core it is allowed
+    (agent.OLLAMA_NUM_THREAD caps that), so above-normal here means the
+    scheduler hands this thread a core first instead of time-slicing it
+    against inference threads. Above-normal, not high: the desktop stays
+    responsive. The agent subprocess is created at normal priority, as
+    Windows does for children of an above-normal process."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+        return bool(kernel32.SetPriorityClass(
+            kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS
+        ))
+    except (AttributeError, OSError):
+        return False
+
+
 def main():
     global _active_signal_controller, _instance_lock
     _instance_lock = acquire_instance_lock()
+    raise_simulator_priority()
     # Seeding makes traffic generation reproducible, not LLM inference. The
     # valid benchmark is the same seed with one ARMED and one DISARMED run;
     # same-seed ARMED runs may diverge because model decisions can differ.

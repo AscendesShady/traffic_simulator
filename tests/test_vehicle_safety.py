@@ -8,7 +8,16 @@ from src.core.vehicle import (
     DBL_LANE_INDEX,
     ROUTE_MERGE_AREA_PX,
     Vehicle,
+    lane_change_step_px,
 )
+
+# These scenarios start a vehicle at full speed a few pixels from the thing it
+# must not pass. No road vehicle stops in one 1/60 s frame from 15 m/s (that
+# is ~90 g); the braking bound (vehicle.EMERGENCY_DECEL_MPS2) lets it slow at
+# most ~9 m/s^2 and the recovery layer keeps it short of the constraint. So
+# each test runs until the vehicle is standing and asserts the mechanism --
+# no reservation, no crossing, no entry -- over the whole approach.
+SETTLE_FRAMES = 180
 from tests.helpers import make_bus_for_leg, rectangles_overlap, NODE_A, NODE_B
 
 
@@ -137,8 +146,10 @@ def test_conflict_matrix_allows_same_green_axis_but_blocks_perpendicular_axis():
     assert controller.movements_conflict("EB", "LEFT", "EB", "LEFT")
 
 
-def test_unrestricted_left_turn_crosses_on_red_when_conflict_free():
-    """A general left turn yields for conflicts, not for its approach lamp."""
+def test_near_side_turn_waits_for_green_then_turns():
+    """Left-hand traffic: the near-side turn runs with its approach's green.
+    No turn on red at a signal without a filter arrow (TSRGD 2016), however
+    empty the box."""
     vehicle = Vehicle(
         NODE_A - 90,
         H_Y - 2.5 * LANE,
@@ -148,26 +159,21 @@ def test_unrestricted_left_turn_crosses_on_red_when_conflict_free():
     )
     controller = SignalController({"green_time": 999})
 
-    for _ in range(180):
-        vehicle.update(
-            signals_for("EB", "RED"),
-            INT_X,
-            H_Y,
-            ROAD_W,
-            STOP,
-            LANE,
-            [vehicle],
-            controller,
-        )
+    for _ in range(SETTLE_FRAMES):
+        vehicle.update(signals_for("EB", "RED"), INT_X, H_Y, ROAD_W, STOP, LANE, [vehicle], controller)
+        assert id(vehicle) not in controller.nodes[NODE_A].reservations
+        assert vehicle.distance_to_node_stop_bar(NODE_A, H_Y, ROAD_W, STOP) >= 0
+    assert vehicle.direction == "EB" and vehicle.speed == 0.0
+
+    for _ in range(600):
+        vehicle.update(signals_for("EB", "GREEN"), INT_X, H_Y, ROAD_W, STOP, LANE, [vehicle], controller)
         controller.update([vehicle])
         if vehicle.direction == "NB":
             break
-
     assert vehicle.direction == "NB"
-    assert vehicle.speed > 0.0
 
 
-def test_unrestricted_left_turn_yields_to_conflicting_reserved_movement():
+def test_near_side_turn_on_green_yields_to_a_conflicting_reservation():
     left_turner = Vehicle(
         NODE_A - 90,
         H_Y - 2.5 * LANE,
@@ -187,21 +193,14 @@ def test_unrestricted_left_turn_yields_to_conflicting_reserved_movement():
     vehicles = [crossing, left_turner]
     assert controller.request_intersection_entry(crossing, NODE_A, vehicles)
 
-    starting_x = left_turner.x
-    left_turner.update(
-        signals_for("EB", "RED"),
-        INT_X,
-        H_Y,
-        ROAD_W,
-        STOP,
-        LANE,
-        vehicles,
-        controller,
-    )
-
-    assert left_turner.x == starting_x
+    for _ in range(SETTLE_FRAMES):
+        left_turner.update(
+            signals_for("EB", "GREEN"), INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller,
+        )
+        assert id(left_turner) not in controller.nodes[NODE_A].reservations
+        assert left_turner.distance_to_node_stop_bar(NODE_A, H_Y, ROAD_W, STOP) >= 0
+        assert NODE_A not in left_turner.passed_nodes
     assert left_turner.speed == 0.0
-    assert id(left_turner) not in controller.nodes[NODE_A].reservations
 
 
 def test_r1_bus_follows_left_turner_before_entire_node_is_empty():
@@ -285,7 +284,8 @@ def test_left_turn_lane_change_still_works():
     bus.lane_index = 1
     controller = SignalController({"green_time": 999})
 
-    for _ in range(60):
+    # One full lane change of the active engine, plus slack.
+    for _ in range(int(LANE / lane_change_step_px(LANE)) + 60):
         bus.update(
             signals_for("EB", "RED"),
             INT_X,
@@ -388,23 +388,15 @@ def test_multileg_bus_reserves_next_lane_before_crossing_first_node():
     )
     blocker.passed_nodes.add(NODE_B)
     vehicles = [bus, blocker]
-    starting_x = bus.x
 
-    bus.update(
-        signals_for("WB", "GREEN"),
-        INT_X,
-        H_Y,
-        ROAD_W,
-        STOP,
-        LANE,
-        vehicles,
-        controller,
-    )
-
-    assert bus.route_exit_merge_blocked is True
-    assert bus.x == starting_x
+    for _ in range(SETTLE_FRAMES):
+        bus.update(
+            signals_for("WB", "GREEN"), INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller,
+        )
+        assert bus.route_exit_merge_blocked is True
+        assert NODE_B not in bus.passed_nodes
+        assert bus.distance_to_node_stop_bar(NODE_B, H_Y, ROAD_W, STOP) >= 0
     assert bus.speed == 0.0
-    assert NODE_B not in bus.passed_nodes
 
 
 def test_dbl_bus_already_in_next_lane_ignores_obsolete_merge_storage_gate(
@@ -492,29 +484,13 @@ def test_route_merge_target_lane_vehicle_behind_yields():
 
     # The bus publishes the deterministic merge request; the vehicle behind
     # then yields on its update while traffic ahead remains free to discharge.
-    bus.update(
-        signals_for("WB", "GREEN"),
-        INT_X,
-        H_Y,
-        ROAD_W,
-        STOP,
-        LANE,
-        vehicles,
-        controller,
-    )
-    follower.update(
-        signals_for("WB", "GREEN"),
-        INT_X,
-        H_Y,
-        ROAD_W,
-        STOP,
-        LANE,
-        vehicles,
-        controller,
-    )
+    start_speed = follower.speed
+    bus.update(signals_for("WB", "GREEN"), INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
+    follower.update(signals_for("WB", "GREEN"), INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
 
     assert bus.route_merge_active is True
-    assert follower.speed == 0.0
+    # It yields: braking from the first frame, not continuing at speed.
+    assert follower.speed < start_speed
 
 
 def test_unresolved_route_merge_holds_near_previous_node_not_node_a():
@@ -536,22 +512,15 @@ def test_unresolved_route_merge_holds_near_previous_node_not_node_a():
     blocker.passed_nodes.add(NODE_B)
     controller = SignalController({"green_time": 999})
     vehicles = [bus, blocker]
-    starting_x = bus.x
 
-    bus.update(
-        signals_for("WB", "GREEN"),
-        INT_X,
-        H_Y,
-        ROAD_W,
-        STOP,
-        LANE,
-        vehicles,
-        controller,
-    )
-
+    bus.update(signals_for("WB", "GREEN"), INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
     assert bus.route_merge_hold_active is True
+    for _ in range(SETTLE_FRAMES):
+        bus.update(signals_for("WB", "GREEN"), INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
+        if bus.speed == 0.0:
+            break
     assert bus.speed == 0.0
-    assert bus.x == starting_x
+    # Held on the link after node B, nowhere near node A's queue.
     assert bus.distance_to_node_stop_bar(NODE_A, H_Y, ROAD_W, STOP) > 35.0
 
 
@@ -641,11 +610,14 @@ def test_starved_left_turn_holds_new_through_entries_until_corner_drains():
     from src.core import signal_controller as sc
 
     controller = SignalController({"green_time": 999})
-    # A through car already in the corner sweep with a reservation.
+    # A through car already in the corner sweep with a reservation. The
+    # turner is a truck: only a vehicle longer than a lane is wide sweeps the
+    # neighbouring lane at the pivot.
     in_box = Vehicle(NODE_A - 2.5 * LANE, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
-    turning = Vehicle(NODE_A - 80, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2)
+    turning = Vehicle(NODE_A - 80, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2, is_heavy=True)
     follower = Vehicle(NODE_A - 100, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
-    vehicles = [in_box, turning, follower]
+    far_lane = Vehicle(NODE_A - 100, H_Y - 0.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=0)
+    vehicles = [in_box, turning, follower, far_lane]
     assert controller.request_intersection_entry(in_box, NODE_A, vehicles)
     assert not controller.request_intersection_entry(turning, NODE_A, vehicles)
     # A cancel (what a stopped vehicle issues every frame) must not erase the wait.
@@ -657,10 +629,13 @@ def test_starved_left_turn_holds_new_through_entries_until_corner_drains():
     assert controller.request_intersection_entry(follower, NODE_A, vehicles)
     controller.cancel_intersection_entry(follower, NODE_A)
 
-    # At the threshold, new through entries are held; the reserved one is not.
+    # At the threshold, new through entries in the swept lane are held; the
+    # reserved one is not, and the lane the truck does not reach keeps flowing.
     controller.frame_number += 1
     assert not controller.request_intersection_entry(follower, NODE_A, vehicles)
     assert id(in_box) in controller.nodes[NODE_A].reservations
+    assert controller.request_intersection_entry(far_lane, NODE_A, vehicles)
+    controller.cancel_intersection_entry(far_lane, NODE_A)
 
     # Corner drains: the through car leaves the sweep, the left turn is
     # granted, the wait clears and through traffic flows again.
@@ -678,7 +653,7 @@ def test_left_turn_wait_is_dropped_when_the_turner_is_gone():
 
     controller = SignalController({"green_time": 999})
     in_box = Vehicle(NODE_A - 2.5 * LANE, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
-    turning = Vehicle(NODE_A - 80, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2)
+    turning = Vehicle(NODE_A - 80, H_Y - 2.5 * LANE, "EB", target_turn="LEFT", lane_index=2, is_heavy=True)
     follower = Vehicle(NODE_A - 100, H_Y - 1.5 * LANE, "EB", target_turn="STRAIGHT", lane_index=1)
     assert controller.request_intersection_entry(in_box, NODE_A, [in_box, turning, follower])
     assert not controller.request_intersection_entry(turning, NODE_A, [in_box, turning, follower])

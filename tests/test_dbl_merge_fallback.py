@@ -8,7 +8,12 @@ configured lane instead of holding upstream indefinitely.
 import src.ui.control_panel as control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE
 from src.core.signal_controller import SignalController
-from src.core.vehicle import DBL_LANE_INDEX, DBL_MERGE_ABANDON_FRAMES, Vehicle
+from src.core.vehicle import DBL_LANE_INDEX, DBL_MERGE_ABANDON_FRAMES, Vehicle, lane_change_step_px
+
+# Frames one lane change takes on the active engine (3 s under IDM, 0.7 s
+# under legacy): budgets derive from it, never from a literal tuned to one.
+LANE_CHANGE_FRAMES = int(LANE / lane_change_step_px(LANE)) + 1
+
 from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
 
 
@@ -103,7 +108,7 @@ def test_dbl_merge_succeeds_when_clear():
     bus = make_bus_for_leg("R3_EB_ONLY", NODE_A, "CLEAR_MERGE_BUS")
     vehicles = [bus]
 
-    run(controller, bus, vehicles, 120)
+    run(controller, bus, vehicles, LANE_CHANGE_FRAMES + 60)
 
     assert bus.lane_index == DBL_LANE_INDEX
     assert bus.dbl_merge_abandoned_for_leg is False
@@ -166,5 +171,5 @@ def test_abandon_resets_on_new_leg():
     assert bus.dbl_merge_abandoned_for_leg is False
     assert bus.dbl_merge_hold_frames == 0
 
-    run(controller, bus, vehicles, 120)
+    run(controller, bus, vehicles, LANE_CHANGE_FRAMES + 60)
     assert bus.lane_index == DBL_LANE_INDEX

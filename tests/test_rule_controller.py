@@ -450,6 +450,7 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
             "LLM Performance", "LLM Summary",
             "Control Panel Inputs", "Control Panel Inputs (start)",
             "Bus Events", "Unit Conversions", "Experiment Summary",
+            "Trip Info",
         ]
         decisions = workbook["Decisions"]
         header = [c.value for c in decisions[1]]

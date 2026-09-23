@@ -229,6 +229,7 @@ def test_calibration_runs_before_frame_zero(monkeypatch):
 def test_cycle_is_autoset_to_optimal(monkeypatch):
     monkeypatch.setattr(main, "calibrate_saturation_flow", lambda *args, **kwargs: 1800.0)
     monkeypatch.setitem(control_panel.global_config, "cycle_time_sec", {300: 999})
+    monkeypatch.setitem(control_panel.global_config, "signal_coordination", "independent")
     signals = calibrating_controller()
 
     _saturation, splits = main.calibrate_and_apply_webster(signals)
@@ -240,6 +241,24 @@ def test_cycle_is_autoset_to_optimal(monkeypatch):
         assert split["cycle_time_sec"] == max(
             split["webster_optimal_cycle_sec"], webster.MIN_CYCLE_SEC
         )
+
+
+def test_coordinated_nodes_share_the_longest_node_cycle(monkeypatch):
+    """Coordinated signals run one cycle (NCHRP Report 812): the longer of
+    the two nodes' own Webster cycles, each node re-split on its own flow
+    ratios. Two nodes on different cycles drift against each other."""
+    monkeypatch.setattr(main, "calibrate_saturation_flow", lambda *args, **kwargs: 1800.0)
+    monkeypatch.setitem(control_panel.global_config, "signal_coordination", "coordinated")
+    signals = calibrating_controller()
+
+    _saturation, splits = main.calibrate_and_apply_webster(signals)
+
+    cycles = {split["cycle_time_sec"] for split in splits.values()}
+    assert len(cycles) == 1
+    (common,) = cycles
+    own = [max(split["node_webster_cycle_sec"], webster.MIN_CYCLE_SEC) for split in splits.values()]
+    assert common == pytest.approx(max(own))
+    assert signals.coordination["cycle"] == max(split["cycle_time_frames"] for split in splits.values())
 
 
 def test_countdown_waits_for_calibration(monkeypatch):
@@ -280,8 +299,10 @@ def test_s_recalibrates_on_speed_change(monkeypatch):
     slow = main.calibrate_saturation_flow(0.5, heavy, seed=43)
 
     assert fast > slow
-    # Halving the speed scale costs far more than a rounding wobble.
-    assert fast / slow > 1.5
+    # Halving the speed scale costs far more than a rounding wobble. (IDM's
+    # S rises ~28 % over this range; the legacy engine's instantaneous ramp
+    # scaled almost linearly with speed, which is not how queues discharge.)
+    assert fast / slow > 1.2
 
 
 def test_calibration_is_deterministic_for_a_seed():

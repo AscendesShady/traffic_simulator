@@ -17,6 +17,13 @@ Source: `control_panel.py` (as of the current working tree). These are the defau
 | `discharge_selection` | `DISCHARGE_AUTO` | Default discharge-mode corridor selection |
 | `discharge_start_requested` | `False` | Discharge-mode start flag |
 | `discharge_stop_requested` | `False` | Discharge-mode stop flag |
+| `vehicle_speed_scale` | `0.5` | Desired-speed multiplier applied on START; sets the ITE change intervals too |
+| `movement_model` | `"idm"` | Car-following/lane-change engine: `"idm"` (calibrated, default) or `"legacy"` (comparison only) |
+| `signal_change_intervals` | `"ite"` | Yellow/all-red from the ITE (2020) formulas at the 85th-percentile desired speed, MUTCD-bounded; `"legacy"` = 1 s + 1 s |
+| `signal_coordination` | `"coordinated"` | Common cycle + progression offset + per-cycle transition; `"independent"` = own Webster cycle per node |
+| `coordination_direction` | `"EB"` | Direction the Node A to Node B offset progresses |
+| `bus_dwell` | door 4.0 s, board 3.0 s/pax, alight 2.0 s/pax, mean 4 on / 4 off, 2 doors | TCQSM 3rd ed. Ch. 6 dwell model at each route stop |
+| `fcd_period_s` | `0` | Floating-car-data sampling period (sim s); `0` = off |
 
 ### `discharge_runtime` (nested)
 
@@ -36,7 +43,7 @@ Source: `control_panel.py` (as of the current working tree). These are the defau
 |---|---|
 | `armed` | `False` |
 | `model` | `"None"` |
-| `tick_seconds` | `5` |
+| `tick_seconds` | `60` (`DEFAULT_TICK_SECONDS`; floor for no skipped decisions `MIN_UNSKIPPED_TICK_SECONDS` = 50) |
 | `last_status` | `"INACTIVE"` |
 | `last_turn` | `0` |
 
@@ -71,14 +78,14 @@ Field definitions:
 6 fixed routes, each with a scheduled dispatch headway and fixed waypoint/lane geometry through the two signal nodes (Node A and Node B as listed in NETWORK_GEOMETRY.md).
 
 <!-- BEGIN GENERATED ROUTES -->
-| Route ID | Name | Origin to destination | Waypoints | Lanes | Active | Headway | TSP | DBL | Manual dispatch |
-|---|---|---|---|---|---|---|---|---|---|
-| `R1_EB_A_NB` | EB → Node A (NB) | EB to NODE_A_NB | 800: LEFT | 800: 2 | Yes | 30s | No | No | No |
-| `R2_EB_B_NB` | EB → Node B (NB) | EB to NODE_B_NB | 800: STRAIGHT, 1600: LEFT | 800: 1, 1600: 2 | Yes | 45s | No | No | No |
-| `R3_EB_ONLY` | EB Corridor (Straight) | EB to EB_CORRIDOR | 800: STRAIGHT, 1600: STRAIGHT | 800: 1, 1600: 1 | Yes | 90s | No | No | No |
-| `R4_WB_A_SB` | WB → Node A (SB) | WB to NODE_A_SB | 1600: STRAIGHT, 800: LEFT | 1600: 1, 800: 2 | Yes | 30s | No | No | No |
-| `R5_WB_B_SB` | WB → Node B (SB) | WB to NODE_B_SB | 1600: LEFT | 1600: 2 | Yes | 45s | No | No | No |
-| `R6_WB_ONLY` | WB Corridor (Straight) | WB to WB_CORRIDOR | 1600: STRAIGHT, 800: STRAIGHT | 1600: 1, 800: 1 | No | 90s | No | No | No |
+| Route ID | Name | Origin to destination | Waypoints | Lanes | Stops | Active | Headway | TSP | DBL | Manual dispatch |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `R1_EB_A_NB` | EB → Node A (NB) | EB to NODE_A_NB | 800: LEFT | 800: 2 | 800: far-side | Yes | 30s | No | No | No |
+| `R2_EB_B_NB` | EB → Node B (NB) | EB to NODE_B_NB | 800: STRAIGHT, 1600: LEFT | 800: 1, 1600: 2 | 800: far-side | Yes | 45s | No | No | No |
+| `R3_EB_ONLY` | EB Corridor (Straight) | EB to EB_CORRIDOR | 800: STRAIGHT, 1600: STRAIGHT | 800: 1, 1600: 1 | 800: far-side | Yes | 90s | No | No | No |
+| `R4_WB_A_SB` | WB → Node A (SB) | WB to NODE_A_SB | 1600: STRAIGHT, 800: LEFT | 1600: 1, 800: 2 | 1600: far-side | Yes | 30s | No | No | No |
+| `R5_WB_B_SB` | WB → Node B (SB) | WB to NODE_B_SB | 1600: LEFT | 1600: 2 | 1600: far-side | Yes | 45s | No | No | No |
+| `R6_WB_ONLY` | WB Corridor (Straight) | WB to WB_CORRIDOR | 1600: STRAIGHT, 800: STRAIGHT | 1600: 1, 800: 1 | 1600: far-side | No | 90s | No | No | No |
 <!-- END GENERATED ROUTES -->
 
 Field definitions:

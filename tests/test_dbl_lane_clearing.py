@@ -13,12 +13,15 @@ import pytest
 import src.ui.control_panel as control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
 from src.core.signal_controller import SignalController
-from src.core.vehicle import DBL_LANE_INDEX, Vehicle
+from src.core.vehicle import DBL_LANE_INDEX, Vehicle, lane_change_step_px
 from tests.helpers import make_bus_for_leg, rectangles_overlap, NODE_A, NODE_B
 
 
 NODE_A = NODE_A
 NODE_B = NODE_B
+# Frames one lane change takes on the active engine (3 s under IDM, 0.7 s
+# under legacy): budgets derive from it, never from a literal tuned to one.
+LANE_CHANGE_FRAMES = int(LANE / lane_change_step_px(LANE)) + 1
 STOP_BAR_X = NODE_A - ROAD_W / 2 - STOP
 ALL_GREEN = {
     node: {direction: "GREEN" for direction in ("EB", "WB", "NB", "SB")}
@@ -110,7 +113,7 @@ def test_car_ahead_of_dbl_bus_moves_out_of_the_lane():
     controller.update(vehicles)
     assert controller.get_active_dbl_request(NODE_A, "EB")["bus_id"] == "DBL_BUS"
 
-    run(controller, vehicles, 120, ALL_GREEN)
+    run(controller, vehicles, LANE_CHANGE_FRAMES + 60, ALL_GREEN)
 
     assert blocker.lane_index in (0, 1)
     assert blocker.lane_index != DBL_LANE_INDEX
@@ -125,14 +128,19 @@ def test_car_ahead_far_from_bus_is_cleared_without_proximity_gate():
     enable_dbl()
     controller = make_controller()
     bus = dbl_bus(dist_to_stop_bar=390)  # inside the link-length eligibility cap
-    far_car = car(bus.x + bus.length / 2 + 9 + 260, DBL_LANE_INDEX)
+    # At the default speed scale (0.6 px/frame): a lane change takes a fixed
+    # time, so the run-out a car needs grows with speed, and at 1.0 px/frame
+    # under IDM this car would (correctly) refuse a change it could not
+    # finish before the stop bar.
+    bus.max_speed = bus.speed = 0.6
+    far_car = car(bus.x + bus.length / 2 + 9 + 260, DBL_LANE_INDEX, max_speed=0.6)
     vehicles = [bus, far_car]
     controller.update(vehicles)
     assert controller.get_active_dbl_request(NODE_A, "EB")
 
     # Both drive at the same speed so the old 200px gate would never have
     # fired. The unconditional reservation still clears the car.
-    run(controller, vehicles, 120, ALL_GREEN)
+    run(controller, vehicles, LANE_CHANGE_FRAMES + 60, ALL_GREEN)
 
     assert far_car.lane_index in (0, 1)
     assert far_car.lane_index != DBL_LANE_INDEX
@@ -156,7 +164,7 @@ def test_westbound_dbl_clears_vehicle_ahead_symmetrically():
 
     controller.update(vehicles)
     assert controller.get_active_dbl_request(NODE_B, "WB")
-    run(controller, vehicles, 120, ALL_GREEN)
+    run(controller, vehicles, LANE_CHANGE_FRAMES + 60, ALL_GREEN)
 
     assert blocker.lane_index in (0, 1)
     assert blocker.lane_index != DBL_LANE_INDEX
@@ -198,7 +206,7 @@ def test_car_behind_dbl_bus_vacates_reserved_lane():
     controller.update(vehicles)
     assert controller.get_active_dbl_request(NODE_A, "EB")
 
-    run(controller, vehicles, 120, ALL_GREEN)
+    run(controller, vehicles, LANE_CHANGE_FRAMES + 60, ALL_GREEN)
 
     assert follower.speed > 0.0
     assert follower.lane_index in (0, 1)
@@ -228,7 +236,7 @@ def test_car_blocking_dbl_merge_eases_off_so_the_bus_can_merge():
 
     # Until the merge completes the car only eases off; it never stops.
     frames_to_merge = None
-    for frame in range(1, 151):
+    for frame in range(1, LANE_CHANGE_FRAMES + 120):
         run(controller, vehicles, 1, ALL_GREEN)
         if bus.lane_index == DBL_LANE_INDEX:
             frames_to_merge = frame
@@ -313,7 +321,12 @@ def test_far_node_left_turner_holds_in_its_general_lane_while_dbl_is_active():
     controller.update(vehicles)
     assert controller.get_active_dbl_request(NODE_B, "EB")["bus_id"] == "R2_BUS"
 
-    run(controller, vehicles, 240, ALL_GREEN)
+    # Until it stands at the bar -- while DBL still holds the lane. (Once the
+    # bus clears, DBL ends and the turner correctly moves into lane 2.)
+    for _ in range(420):
+        run(controller, vehicles, 1, ALL_GREEN)
+        if turner.speed == 0.0 and turner.must_hold_for_lane:
+            break
 
     assert turner.target_turn == "LEFT"
     assert turner.lane_index == 1 and turner.lane_vacate_target is None
@@ -334,7 +347,7 @@ def test_left_turner_that_stops_in_the_reserved_lane_revokes_dbl():
     run(controller, vehicles, 30, ALL_GREEN)
     assert controller.get_active_dbl_request(NODE_B, "EB")
 
-    turner.max_speed = 0.0  # blocked permissive left: stands in lane 2
+    turner.max_speed = turner.speed = 0.0  # blocked permissive left: stands in lane 2
     run(controller, vehicles, 60, ALL_GREEN)
 
     assert turner.speed == 0.0 and turner.lane_index == DBL_LANE_INDEX
@@ -354,7 +367,7 @@ def test_bus_catching_a_vehicle_that_stopped_keeps_tsp_but_loses_dbl():
     request = controller.nodes[NODE_B].active_request
     assert request.dbl_requested and request.tsp_requested
 
-    blocker.max_speed = 0.0  # spillback hold: the bus catches it standing
+    blocker.max_speed = blocker.speed = 0.0  # spillback hold: the bus catches it standing
     run(controller, vehicles, 60, ALL_GREEN)
 
     assert controller.nodes[NODE_B].active_request is request  # TSP lives on

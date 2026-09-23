@@ -51,6 +51,11 @@ ETA_MAX_FRAMES = 6000.0
 # Within this of its node's stop bar a left-turner (bus or car) moves into
 # the turn lane (lane 2) and is not asked to leave it.
 TURN_LANE_MERGE_PX = 250.0
+# A left-turner still out of lane 2 after waiting this long at the bar takes
+# the missed turn and goes straight, as a driver in the wrong lane does,
+# rather than hold a through lane indefinitely (cars held 100 s+ in lane 0,
+# 2026-09-23 audit). Counted in SAFETY_COUNTERS["missed_turns"].
+MISSED_TURN_HOLD_FRAMES = 600
 # Car-following: stop inside SAFE_GAP, follow at a gap-proportional speed
 # up to FOLLOW_FREE_GAP, free flow beyond it.
 SAFE_GAP_PX = 12.0
@@ -115,7 +120,11 @@ def px_per_frame2_to_mps2(a):
 MOVEMENT_MODEL_LEGACY = "legacy"
 MOVEMENT_MODEL_IDM = "idm"
 MOVEMENT_MODELS = (MOVEMENT_MODEL_LEGACY, MOVEMENT_MODEL_IDM)
-_movement_model = {"name": MOVEMENT_MODEL_LEGACY}
+# IDM is the default: it is the engine pinned against HCM saturation flow,
+# start-up behaviour and queue spacing (tests/test_physical_calibration.py).
+# Legacy is kept for comparison only -- its uninterrupted saturation flow is
+# ~2,800 veh/h/lane at the default speed scale, far above HCM's 1,900 base.
+_movement_model = {"name": MOVEMENT_MODEL_IDM}
 LEGACY_ACCEL_PX_PER_FRAME2 = 0.05
 
 # IDM parameters per vehicle class, physical units (Treiber & Kesting, Traffic
@@ -129,6 +138,70 @@ IDM_PARAMS_MPS = {
     "bus":   {"T": 1.5, "a": 1.2, "b": 1.5},
 }
 IDM_S0_PX = SAFE_GAP_PX
+# Braking bound. The most a vehicle may decelerate in one step, per class:
+# SUMO's vehicle-type defaults for emergencyDecel (passenger 9.0, truck and
+# bus 7.0 m/s^2; SUMO documentation, "Vehicle Type Parameter Defaults"). The
+# IDM law has no such bound -- its interaction term grows without limit as a
+# gap closes -- so an obstacle that appears close (a vehicle entering at
+# speed, a stop line inside the braking distance) used to be absorbed by an
+# arbitrarily hard stop: 71 events above 2 g per vehicle-hour at the
+# 2026-09-22 campaign's demand. MSCFModel::finalizeSpeed applies the same
+# floor; what the floor cannot resolve is recorded, not hidden (see
+# SAFETY_COUNTERS).
+EMERGENCY_DECEL_MPS2 = {"car": 9.0, "truck": 7.0, "bus": 7.0}
+# Surrogate safety measure: time-to-collision to the leader below this is a
+# conflict (FHWA, Surrogate Safety Assessment Model, FHWA-HRT-08-051, 2008,
+# default maximum TTC 1.5 s).
+SSM_TTC_THRESHOLD_SEC = 1.5
+STOP_LINE_EPSILON_PX = 1e-3
+# Comfortable deceleration a vehicle entering the network is assumed to be
+# able to use against the vehicle ahead, for the legacy engine (SUMO's
+# passenger default decel, 4.5 m/s^2); the IDM engine uses its class b.
+LEGACY_INSERTION_DECEL_MPS2 = 4.5
+
+# Run-level safety counters, restarted per run (reset_safety_counters) and
+# copied into main.network_throughput each frame so steady-state versions
+# exist. Frames are vehicle-frames.
+#   emergency_decel_frames  the law asked for more than the class bound
+#   leader_clamp_frames     move truncated at the leader's rear bumper
+#   stop_line_clamp_frames  move truncated at a stop line / hold point
+#   ttc_conflict_frames     TTC to the leader below SSM_TTC_THRESHOLD_SEC
+#   ttc_conflicts           conflicts (entries into that state)
+SAFETY_COUNTERS = {
+    "emergency_decel_frames": 0,
+    "emergency_decel_events": 0,
+    "leader_clamp_frames": 0,
+    "stop_line_clamp_frames": 0,
+    "ttc_conflict_frames": 0,
+    "ttc_conflicts": 0,
+    # Not a safety surrogate: a realism counter reported alongside them.
+    "missed_turns": 0,
+}
+
+
+def reset_safety_counters():
+    for key in SAFETY_COUNTERS:
+        SAFETY_COUNTERS[key] = 0
+
+
+def emergency_decel_px(vehicle):
+    return mps2_to_px_per_frame2(EMERGENCY_DECEL_MPS2[vehicle_class(vehicle)])
+
+
+def safe_insertion_speed(vehicle, gap, leader):
+    """Fastest speed a newly entering vehicle can have and still stop behind
+    its leader at a comfortable rate if the leader also stops -- the role of
+    SUMO's insertionFollowSpeed. Entering at full desired speed behind a
+    queue was 36 % of all IDM braking beyond 9 m/s^2."""
+    if leader is None or gap == float("inf"):
+        return vehicle.max_speed
+    if is_idm():
+        decel = idm_params_px(vehicle)[2]
+    else:
+        decel = mps2_to_px_per_frame2(LEGACY_INSERTION_DECEL_MPS2)
+    leader_v = max(0.0, float(getattr(leader, "speed", 0.0)))
+    room = max(0.0, float(gap) - IDM_S0_PX)
+    return min(vehicle.max_speed, math.sqrt(leader_v * leader_v + 2.0 * decel * room))
 LANE_CHANGE_DURATION_S = 3.0        # Toledo & Zohar 2007: 3-5 s urban
 MOBIL_POLITENESS = 0.3
 MOBIL_THRESHOLD_MPS2 = 0.1
@@ -222,16 +295,43 @@ def lane_changes_suspended():
         LANE_CHANGE_HAZARD_PER_FRAME = saved
 
 
-def eta_frames_to_stop_bar(distance_px, speed_px_per_frame):
-    """Frames until a vehicle ``distance_px`` short of a stop bar reaches it
-    at its *current* speed. The one estimator shared by telemetry, the
-    LLM/rule decision path and the signal arbiter, so no two of them can
-    disagree about when a bus arrives."""
+def eta_frames_to_stop_bar(distance_px, speed_px_per_frame, max_speed=None, accel=None):
+    """Frames until a vehicle ``distance_px`` short of a stop bar reaches it.
+    The one estimator shared by telemetry, the LLM/rule decision path and
+    the signal arbiter, so no two of them can disagree about when a bus
+    arrives.
+
+    With ``max_speed`` and ``accel`` it is the UNIMPEDED arrival time:
+    accelerate from the current speed to the desired speed at ``accel``,
+    then cruise. That is the question a priority request asks -- when would
+    the bus arrive if it were given the green -- and how deployed TSP
+    predicts arrival (from travel time past a check-in point, not the bus's
+    instantaneous speed). Under IDM a bus facing red slows well before the
+    bar, so its current speed badly overstates the time it needs once the
+    green comes. Without them: at the current speed (the legacy engine,
+    whose vehicles hold speed until the bar)."""
     distance = float(distance_px)
     if distance <= 0:
         return 0.0
-    speed = max(float(speed_px_per_frame), ETA_MIN_SPEED_PX_PER_FRAME)
-    return min(ETA_MAX_FRAMES, distance / speed)
+    v = max(0.0, float(speed_px_per_frame))
+    if max_speed is not None and accel is not None and float(accel) > 0 and float(max_speed) > v:
+        v0, a = float(max_speed), float(accel)
+        accel_distance = (v0 * v0 - v * v) / (2.0 * a)
+        if distance <= accel_distance:
+            frames = (-v + math.sqrt(v * v + 2.0 * a * distance)) / a
+        else:
+            frames = (v0 - v) / a + (distance - accel_distance) / v0
+        return min(ETA_MAX_FRAMES, frames)
+    return min(ETA_MAX_FRAMES, distance / max(v, ETA_MIN_SPEED_PX_PER_FRAME))
+
+
+def bus_eta_frames(vehicle, distance_px):
+    """eta_frames_to_stop_bar for this vehicle on the active engine."""
+    if is_idm():
+        return eta_frames_to_stop_bar(
+            distance_px, vehicle.speed, vehicle.max_speed, idm_params_px(vehicle)[1]
+        )
+    return eta_frames_to_stop_bar(distance_px, vehicle.speed)
 
 
 def _is_following(mover, other):
@@ -242,13 +342,14 @@ def _is_following(mover, other):
     every mover mid-slide once its follower catches up (a queue-head deadlock
     seen live: a left-turning truck frozen straddling lanes 1/2 at Node A).
     The margin still applies to vehicles ahead and to starting a slide."""
+    ox, oy, _, _ = _seen(other)
     if mover.direction == "EB":
-        behind = other.x < mover.x
+        behind = ox < mover.x
     elif mover.direction == "WB":
-        behind = other.x > mover.x
+        behind = ox > mover.x
     else:
         return False
-    return behind and abs(other.y - mover.y) < (mover.width + other.width) / 2.0
+    return behind and abs(oy - mover.y) < (mover.width + other.width) / 2.0
 
 
 # --- per-frame spatial index -------------------------------------------
@@ -277,11 +378,15 @@ _INDEX_CELL_PX = 64.0
 class _FrameIndex:
     """Uniform grid of (list position, vehicle) over one frame's vehicles."""
 
-    __slots__ = ("source", "length", "cells", "margin", "buses", "bounds")
+    __slots__ = ("source", "length", "cells", "margin", "buses", "bounds", "receiving")
 
     def __init__(self, vehicles):
         self.source = vehicles
         self.length = len(vehicles)
+        # receiving_space_px answers per (node, exit lane), read from the
+        # frame-start snapshot, so it cannot change within a frame unless a
+        # vehicle leaves; drop() clears it.
+        self.receiving = {}
         cells = {}
         buses = []
         half_max = 0.0
@@ -323,6 +428,7 @@ class _FrameIndex:
 
     def drop(self, vehicle):
         """Forget one vehicle the frame has just removed from the network."""
+        self.receiving.clear()
         key = (int(vehicle.x // _INDEX_CELL_PX), int(vehicle.y // _INDEX_CELL_PX))
         bucket = self.cells.get(key)
         if bucket is not None:
@@ -354,6 +460,36 @@ class _FrameIndex:
 
 _frame_index = None
 
+# Plan-before-commit perception. SUMO plans every vehicle's move against one
+# frozen state and only then moves them all (MSEdgeControl::planMovements,
+# then executeMovements; 09_INVARIANTS "planning precedes execution"). This
+# engine updates vehicles one at a time, so a vehicle used to see some
+# neighbours already moved this frame and others not, depending only on list
+# order: reversing that order moved passengers served by up to 9.5 % and
+# travel delay by up to 8.9 % on one seed (2026-09-23 audit). Every
+# neighbour query now reads the position, direction and speed each vehicle
+# had when the frame began (_seen), so car-following and lane-change
+# perception are independent of update order. Reservations at the conflict
+# box stay sequential -- first to ask is first served -- which is SUMO's
+# link-arbitration behaviour too.
+_SNAPSHOT = {"current": None, "counter": 0}
+
+
+def _seen(vehicle):
+    """(x, y, direction, speed) as the frame began; live when no snapshot
+    belongs to the current frame (tests, calibration, foreign lists)."""
+    snap = vehicle.__dict__.get("_snap")
+    if snap is not None and snap[0] == _SNAPSHOT["current"]:
+        return snap[1], snap[2], snap[3], snap[4]
+    return vehicle.x, vehicle.y, vehicle.direction, vehicle.speed
+
+
+def _take_snapshot(vehicles):
+    _SNAPSHOT["counter"] += 1
+    epoch = _SNAPSHOT["current"] = _SNAPSHOT["counter"]
+    for v in vehicles:
+        v._snap = (epoch, v.x, v.y, v.direction, v.speed)
+
 
 def index_frame(vehicles):
     """Rebuild the per-frame index, or drop it when given None.
@@ -364,7 +500,12 @@ def index_frame(vehicles):
     never calls either just gets the full scans, unchanged.
     """
     global _frame_index
-    _frame_index = None if vehicles is None else _FrameIndex(vehicles)
+    if vehicles is None:
+        _frame_index = None
+        _SNAPSHOT["current"] = None
+        return
+    _take_snapshot(vehicles)
+    _frame_index = _FrameIndex(vehicles)
 
 
 def drop_from_index(vehicle):
@@ -407,12 +548,13 @@ def _gap_ahead(vehicle, other, my_y, my_half_w):
     """
     if other is vehicle:
         return None
-    if other.direction in ("EB", "WB"):
-        o_min_y, o_max_y = other.y - other.width / 2.0, other.y + other.width / 2.0
-        o_min_x, o_max_x = other.x - other.length / 2.0, other.x + other.length / 2.0
+    ox, oy, odir, _ = _seen(other)
+    if odir in ("EB", "WB"):
+        o_min_y, o_max_y = oy - other.width / 2.0, oy + other.width / 2.0
+        o_min_x, o_max_x = ox - other.length / 2.0, ox + other.length / 2.0
     else:
-        o_min_y, o_max_y = other.y - other.length / 2.0, other.y + other.length / 2.0
-        o_min_x, o_max_x = other.x - other.width / 2.0, other.x + other.width / 2.0
+        o_min_y, o_max_y = oy - other.length / 2.0, oy + other.length / 2.0
+        o_min_x, o_max_x = ox - other.width / 2.0, ox + other.width / 2.0
 
     direction = vehicle.direction
     if direction in ("EB", "WB"):
@@ -506,15 +648,18 @@ def corridor_blockers(mover, desired_y, all_vehicles):
     corridor_max = max(mover.y, desired_y) + mover.width / 2.0
     blockers = []
     for other in all_vehicles or []:
-        if other is mover or other.direction != mover.direction:
+        if other is mover:
             continue
-        other_min = other.y - other.width / 2.0
-        other_max = other.y + other.width / 2.0
+        ox, oy, odir, _ = _seen(other)
+        if odir != mover.direction:
+            continue
+        other_min = oy - other.width / 2.0
+        other_max = oy + other.width / 2.0
         if not (other_min < corridor_max and other_max > corridor_min):
             continue
         if _is_following(mover, other):
             continue
-        if abs(other.x - mover.x) < (mover.length + other.length) / 2.0 + 15:
+        if abs(ox - mover.x) < (mover.length + other.length) / 2.0 + 15:
             blockers.append(other)
     return blockers
 
@@ -530,15 +675,16 @@ def lane_band_blockers(mover, desired_y, all_vehicles, origin_y, lane_w=22):
     band_max = max(mover.y, desired_y) + mover.width / 2.0
     blockers = []
     for other in all_vehicles or []:
-        if other is mover or other.direction != mover.direction:
+        if other is mover:
             continue
-        if abs(other.y - origin_y) < lane_w / 2.0:
+        ox, oy, odir, _ = _seen(other)
+        if odir != mover.direction or abs(oy - origin_y) < lane_w / 2.0:
             continue
-        if not (other.y - other.width / 2.0 < band_max and other.y + other.width / 2.0 > band_min):
+        if not (oy - other.width / 2.0 < band_max and oy + other.width / 2.0 > band_min):
             continue
         if _is_following(mover, other):
             continue
-        if abs(other.x - mover.x) < (mover.length + other.length) / 2.0 + 15:
+        if abs(ox - mover.x) < (mover.length + other.length) / 2.0 + 15:
             blockers.append(other)
     return blockers
 
@@ -677,6 +823,21 @@ def receiving_space_px(
     read it, keyed by node, entry direction, movement and receiving lane,
     so a blocked target lane is never hidden by an empty neighbour."""
     exit_dir, cross = receiving_lane(node_x, direction, movement, lane_cross, h_y, lane_w)
+    # The metrics pass asks this for every vehicle upstream of a bar, every
+    # frame, and each answer scans the whole list: 24 ms of a 16.67 ms frame
+    # at 200 vehicles (2026-09-23). Only 2 nodes x 4 exits x 3 lanes of
+    # answers exist per frame, so the frame's index memoises them.
+    index = _index_for(all_vehicles)
+    key = (node_x, exit_dir, cross, h_y, road_w, lane_w, tuple(int_x_list))
+    if index is not None and key in index.receiving:
+        return index.receiving[key]
+    free = _receiving_scan(exit_dir, cross, node_x, all_vehicles, h_y, road_w, lane_w, int_x_list)
+    if index is not None:
+        index.receiving[key] = free
+    return free
+
+
+def _receiving_scan(exit_dir, cross, node_x, all_vehicles, h_y, road_w, lane_w, int_x_list):
     half_w = road_w / 2.0
     horizontal = exit_dir in ("EB", "WB")
     if exit_dir == "EB":
@@ -697,19 +858,20 @@ def receiving_space_px(
     half_band = lane_w / 2.0
     slow = slow_vehicle_speed()
     for other in all_vehicles or []:
-        if other.direction != exit_dir or other.speed >= slow:
+        ox, oy, odir, ospeed = _seen(other)
+        if odir != exit_dir or ospeed >= slow:
             continue
         # Straight-line arithmetic, not per-call lambdas: this runs for
         # every vehicle on every call and the call itself runs per vehicle
         # per frame (2026-09-23 audit).
         if horizontal:
-            if abs(other.y - cross) >= half_band:
+            if abs(oy - cross) >= half_band:
                 continue
-            centre = other.x
+            centre = ox
         else:
-            if abs(other.x - cross) >= half_band:
+            if abs(ox - cross) >= half_band:
                 continue
-            centre = other.y
+            centre = oy
         reach = other.length / 2.0
         tail = (centre - sign * reach - start) * sign
         head = (centre + sign * reach - start) * sign
@@ -794,12 +956,45 @@ def reset_vehicle_serials():
     _serial_counter = itertools.count()
 
 
+# Yellow-onset go/stop decision (the ITE "Type I dilemma zone"): a driver
+# who cannot stop before the bar from the moment the yellow appears --
+# perception-reaction plus braking at the comfortable rate the change
+# interval is designed around -- proceeds. These are the same t and a the
+# yellow is computed from (webster.ITE_REACTION_SEC / ITE_DECEL_MPS2; ITE,
+# "Guidelines for Determining Traffic Signal Change and Clearance
+# Intervals", 2020), so a vehicle told to go can in fact reach the bar
+# before red at its approach speed, and the all-red covers its clearance.
+YELLOW_REACTION_SEC = 1.0
+YELLOW_DECEL_MPS2 = 3.05
+
+
+def ite_stopping_distance_px(speed_px_per_frame):
+    """Distance a driver needs to stop from yellow onset, px."""
+    v = max(0.0, float(speed_px_per_frame))
+    decel = mps2_to_px_per_frame2(YELLOW_DECEL_MPS2)
+    return v * YELLOW_REACTION_SEC * FPS + v * v / (2.0 * decel)
+
+
 class Vehicle:
     def __init__(self, x, y, direction, max_speed=1.0, color=(50, 150, 250), is_heavy=False, target_turn="STRAIGHT", lane_index=2, assigned_node_x=None, left_nodes=None):
         self.x = float(x)
         self.y = float(y)
         self.serial = next(_serial_counter)
+        # node_x -> True (go) / False (stop), fixed at the first yellow frame
+        # and kept until the next green, so the decision is made once.
+        self.yellow_decision = {}
+        # Behavioural draws (the lane-change hazard) come from this vehicle's
+        # own stream. main keys it on the vehicle's exogenous identity -- its
+        # source and arrival index, or its route and trip -- so a vehicle's
+        # draws do not depend on the order vehicles update in or on what any
+        # other vehicle did: common random numbers extend from demand to
+        # behaviour. On the shared global stream, reversing the update order
+        # handed every vehicle a different number and swung vehicles served
+        # by 20 % on one seed. A vehicle built outside the spawner keeps the
+        # module RNG, as before.
+        self.behaviour_rng = random
         self.direction = direction
+        self.spawn_direction = direction  # origin, kept through turns (trip records)
         # Where the last physics step started, for render interpolation.
         self.prev_x, self.prev_y, self.prev_direction = self.x, self.y, direction
         self.max_speed = max_speed
@@ -821,6 +1016,7 @@ class Vehicle:
         self.intersection_entry_approaches = {}
         self.intersection_entry_movements = {}
         self.must_hold_for_lane = False
+        self.lane_hold_frames = 0
         self.merge_hold_distance = 35.0
         self.route_merge_hold_active = False
         self.route_exit_merge_blocked = False
@@ -900,6 +1096,17 @@ class Vehicle:
         """A left-turner on the approach to its node must be in lane 2."""
         return self.target_turn == "LEFT" and 0.0 <= dist_to_stop <= TURN_LANE_MERGE_PX
 
+    def positions_for_turn(self, dist_to_stop):
+        """Whether a left-turner should be working its way into lane 2 now.
+        Within TURN_LANE_MERGE_PX of its node, or -- for a far-node turn, one
+        that has already passed a node -- anywhere on the link after it, as a
+        driver positions for the next junction: two lane changes of
+        LANE_CHANGE_DURATION_S do not fit in 62 m of queued road. (The DBL
+        eviction exemption stays needs_turn_lane.)"""
+        if self.target_turn != "LEFT" or dist_to_stop < 0.0:
+            return False
+        return dist_to_stop <= TURN_LANE_MERGE_PX or bool(self.passed_nodes)
+
     def follow_target_speed(self, lead_dist):
         """Speed the following law aims for at this gap to the leader."""
         if lead_dist < SAFE_GAP_PX:
@@ -916,16 +1123,17 @@ class Vehicle:
         in the lane centred on ``at_y``; (inf, None) when it is empty behind."""
         gap, follower = float("inf"), None
         for other in all_vehicles or []:
-            if other is self or other.direction != self.direction:
+            if other is self:
                 continue
-            if abs(other.y - at_y) >= 8.0:
+            ox, oy, odir, _ = _seen(other)
+            if odir != self.direction or abs(oy - at_y) >= 8.0:
                 continue
             if self.direction == "EB":
-                behind = other.x < self.x
+                behind = ox < self.x
             else:
-                behind = other.x > self.x
+                behind = ox > self.x
             if behind:
-                candidate = abs(other.x - self.x) - (other.length + self.length) / 2.0
+                candidate = abs(ox - self.x) - (other.length + self.length) / 2.0
                 if candidate < gap:
                     gap, follower = candidate, other
         return gap, follower
@@ -934,13 +1142,15 @@ class Vehicle:
     def _idm_accel_between(follower, leader):
         """IDM acceleration of ``follower`` behind ``leader`` (None = free)."""
         T, a, b = idm_params_px(follower)
+        fx, _, _, fv = _seen(follower)
         if leader is None:
             gap, dv = float("inf"), 0.0
         else:
-            gap = abs(leader.x - follower.x) - (leader.length + follower.length) / 2.0
-            dv = follower.speed - leader.speed
+            lx, _, _, lv = _seen(leader)
+            gap = abs(lx - fx) - (leader.length + follower.length) / 2.0
+            dv = fv - lv
         return idm_acceleration(
-            follower.speed, follower.max_speed, max(gap, 0.0), dv, T, a, b
+            fv, follower.max_speed, max(gap, 0.0), dv, T, a, b
         )
 
     def choose_discretionary_lane_mobil(self, h_y, lane_w, all_vehicles):
@@ -1163,7 +1373,7 @@ class Vehicle:
             and upstream
             and self.distance_to_node_stop_bar(target_node_x, h_y, road_w, stop_offset)
             > LANE_CHANGE_MIN_DIST_TO_BAR_PX
-            and random.random() < LANE_CHANGE_HAZARD_PER_FRAME
+            and self.behaviour_rng.random() < LANE_CHANGE_HAZARD_PER_FRAME
         ):
             self.lane_vacate_target = self.choose_discretionary_lane(
                 h_y, lane_w, all_vehicles
@@ -1183,7 +1393,7 @@ class Vehicle:
                 and self.direction in ("EB", "WB")
                 and self.lane_index != DBL_LANE_INDEX
                 and upstream
-                and self.needs_turn_lane(
+                and self.positions_for_turn(
                     self.distance_to_node_stop_bar(target_node_x, h_y, road_w, stop_offset)
                 )
             ):
@@ -1206,6 +1416,16 @@ class Vehicle:
         ):
             should_stop = True
 
+        # Cooperative holds set above (hold behind a DBL bus, yield to a bus's
+        # route merge) mean "stop where you are", not "stop at the next bar".
+        # The legacy engine stops on the spot either way; under IDM the bar
+        # logic below would have turned them into a gentle brake for a line
+        # hundreds of pixels away -- a yield that never yielded. They are kept
+        # apart and applied after the bar logic as a comfortable stop.
+        cooperative_hold = should_stop
+        if is_idm():
+            should_stop = False
+
         # 2. SIGNAL YIELDING & DOWNSTREAM SPILLBACK
         # IDM engine: the stop bar becomes a standing obstacle the vehicle
         # brakes for at its comfortable rate -- on red and yellow (nothing
@@ -1225,35 +1445,52 @@ class Vehicle:
             else:
                 sig_state = sig_state.upper()
 
-            # Left turns are permissive/yield-controlled movements in this
-            # network.  They do not wait for a green indication, but they do
-            # still need an intersection reservation so an occupied or
-            # conflicting movement can stop them safely.
-            unrestricted_left = self.target_turn == "LEFT"
+            # Dilemma zone. The go/stop choice is made once, at the first
+            # yellow frame, and held through the red that follows (a vehicle
+            # committed to go does not change its mind at the bar); a green
+            # clears it. A committed vehicle is treated as facing green: it
+            # requests its reservation like any other entrant, so the
+            # controller's conflict check -- not the lamp -- still decides
+            # whether the box is safe to enter.
+            if sig_state == "GREEN":
+                self.yellow_decision.pop(target_node_x, None)
+            elif sig_state == "YELLOW" and target_node_x not in self.yellow_decision:
+                self.yellow_decision[target_node_x] = (
+                    dist_to_stop < ite_stopping_distance_px(self.speed)
+                )
+            if self.yellow_decision.get(target_node_x) and self.speed <= 1e-3:
+                # Stopped short of the bar after all (refused the box, held
+                # for its lane): no dilemma is left, so it waits for the next
+                # green. A kept commitment let it book the box on red.
+                self.yellow_decision[target_node_x] = False
+            if self.yellow_decision.get(target_node_x) and sig_state != "GREEN":
+                sig_state = "GREEN"
 
-            if sig_state != "GREEN" and signal_controller and not unrestricted_left:
+            # Near-side turns (left-hand traffic) run with their approach's
+            # green like through traffic: no turn on red at a signal without a
+            # green filter arrow (TSRGD 2016; Highway Code rule 175). They used
+            # to ignore the lamp and book the box whenever no reserved vehicle
+            # conflicted -- 30 of 61 turns entered on red at 0.6x demand, across
+            # the cross street's green, and the all-red then waited for them
+            # (median 13 s against 3.5 s at Node A; 2026-09-23 audit).
+            if sig_state != "GREEN" and signal_controller:
                 signal_controller.cancel_intersection_entry(self, target_node_x)
-            
-            if (
-                not unrestricted_left
-                and sig_state in ("RED", "YELLOW")
-                and dist_to_stop <= 15.0
-            ):
+
+            if sig_state in ("RED", "YELLOW") and dist_to_stop <= 15.0:
                 should_stop = True
-                
+
             if (
-                (sig_state == "GREEN" or unrestricted_left)
+                sig_state == "GREEN"
                 and 0.0 <= dist_to_stop <= ENTRY_ZONE_PX
+                and not getattr(self, "dwelling", False)
             ):
                 if self.route_exit_merge_blocked:
                     should_stop = True
+                elif self.must_hold_for_lane and dist_to_stop <= self.merge_hold_distance:
+                    # Held for its turn lane: it cannot go, so it books nothing.
+                    should_stop = True
                 elif self.is_spillback_blocked(target_node_x, h_y, road_w, all_vehicles):
                     should_stop = True
-                elif unrestricted_left and not signal_controller:
-                    # A permissive turn may ignore the lamp, never the
-                    # conflict arbiter. Legacy/controller-less callers fail
-                    # closed when attempting the turn against red/yellow.
-                    should_stop = sig_state != "GREEN"
                 elif signal_controller and not signal_controller.request_intersection_entry(
                     self, target_node_x, all_vehicles
                 ):
@@ -1261,17 +1498,36 @@ class Vehicle:
 
             if self.must_hold_for_lane and 0.0 <= dist_to_stop <= self.merge_hold_distance:
                 should_stop = True
+                self.lane_hold_frames += 1
+                if self.lane_hold_frames >= MISSED_TURN_HOLD_FRAMES and self.left_nodes is not None:
+                    # Missed turn: straight on from the next frame.
+                    self.left_nodes = tuple(n for n in self.left_nodes if n != target_node_x)
+                    self.lane_vacate_target = None
+                    self.lane_hold_frames = 0
+                    SAFETY_COUNTERS["missed_turns"] += 1
+            else:
+                self.lane_hold_frames = 0
 
             if is_idm():
                 if should_stop:
                     hold_gap = dist_to_stop
                 brake_px = comfortable_stop_px(self.speed, idm_params_px(self)[2])
-                if sig_state != "GREEN" and not unrestricted_left:
+                if sig_state != "GREEN":
                     bar_obstacle_gap = dist_to_stop
-                elif (
-                    dist_to_stop <= brake_px + ENTRY_ZONE_PX
-                    and self.is_spillback_blocked(target_node_x, h_y, road_w, all_vehicles)
+                elif dist_to_stop <= brake_px + ENTRY_ZONE_PX and (
+                    self.is_spillback_blocked(target_node_x, h_y, road_w, all_vehicles)
+                    or (
+                        signal_controller is not None
+                        and dist_to_stop > ENTRY_ZONE_PX
+                        and hasattr(signal_controller, "entry_would_be_granted")
+                        and not signal_controller.entry_would_be_granted(
+                            self, target_node_x, all_vehicles
+                        )
+                    )
                 ):
+                    # Look-ahead: the box will not open for this vehicle, so
+                    # brake for the bar at the comfortable rate now rather
+                    # than be refused at the booking distance.
                     bar_obstacle_gap = dist_to_stop
 
         # This hold point is on the link immediately after the previous node,
@@ -1280,9 +1536,31 @@ class Vehicle:
         if self.route_merge_hold_active:
             should_stop = True
 
+        if cooperative_hold and is_idm():
+            # Stop now at the comfortable rate: an obstacle exactly one
+            # comfortable braking distance ahead, re-placed every frame.
+            brake_gap = comfortable_stop_px(self.speed, idm_params_px(self)[2]) + IDM_S0_PX
+            hold_gap = brake_gap if hold_gap is None else min(hold_gap, brake_gap)
+            should_stop = True
+
+        # A point this vehicle must stop at off the stop-bar logic (a bus
+        # stop): braked for like a hold, and a full stop while dwelling.
+        external = getattr(self, "external_hold_gap", None)
+        if external is not None:
+            if is_idm():
+                hold_gap = external if hold_gap is None else min(hold_gap, external)
+                if getattr(self, "dwelling", False):
+                    should_stop = True
+            elif external <= 15.0:
+                should_stop = True
+
         # 3. KINEMATICS
         lead_dist, leader = self.get_lead_vehicle(all_vehicles)
         lead_dist = max(0.0, lead_dist)
+        self._record_ttc(lead_dist, leader)
+        # A vehicle that must stop at a line it has no reservation for may
+        # not move past it, whatever speed the braking bound left it with.
+        stop_line_limit = hold_gap if (should_stop and hold_gap is not None) else None
         if is_idm():
             should_stop = self._idm_step(
                 lead_dist, leader, should_stop, hold_gap, bar_obstacle_gap
@@ -1307,7 +1585,24 @@ class Vehicle:
             signal_controller.cancel_intersection_entry(self, target_node_x)
 
         # 4. TURN TRIGGERS & CONTINUOUS MOVEMENT
-        step_dist = min(self.speed, lead_dist) if lead_dist < float('inf') else self.speed
+        # Recovery layer, counted. The following law (IDM within its braking
+        # bound) is meant to leave these limits slack; when it cannot, the
+        # move is truncated so nothing overlaps, and the event is recorded as
+        # the collision SUMO would detect -- never silently absorbed.
+        step_dist = self.speed
+        if lead_dist < float('inf') and step_dist > lead_dist:
+            step_dist = lead_dist
+            SAFETY_COUNTERS["leader_clamp_frames"] += 1
+        # Strictly short of the line: a front bumper that reached it exactly
+        # would stop counting as upstream, drop out of the stop-bar logic and
+        # enter the box without a reservation (tests/test_vehicle_safety.py
+        # fail-closed cases caught exactly that).
+        line = None if stop_line_limit is None else max(0.0, stop_line_limit - STOP_LINE_EPSILON_PX)
+        if line is not None and step_dist > line:
+            step_dist = line
+            SAFETY_COUNTERS["stop_line_clamp_frames"] += 1
+        if step_dist < self.speed:
+            self.speed = step_dist
         turned = False
 
         if self.target_turn == "LEFT" and target_node_x not in self.passed_nodes:
@@ -1385,6 +1680,20 @@ class Vehicle:
             if not getattr(self, "is_heavy", False):
                 self.target_turn = "STRAIGHT"
 
+    def _record_ttc(self, lead_dist, leader):
+        """Count frames and conflicts with TTC to the leader under the SSAM
+        threshold. Only a closing, moving follower has a finite TTC."""
+        closing = self.speed - (_seen(leader)[3] if leader is not None else 0.0)
+        in_conflict = bool(
+            leader is not None and self.speed > 0.0 and closing > 1e-9
+            and lead_dist / closing < SSM_TTC_THRESHOLD_SEC * FPS
+        )
+        if in_conflict:
+            SAFETY_COUNTERS["ttc_conflict_frames"] += 1
+            if not getattr(self, "_in_ttc_conflict", False):
+                SAFETY_COUNTERS["ttc_conflicts"] += 1
+        self._in_ttc_conflict = in_conflict
+
     def _idm_step(self, lead_dist, leader, should_stop, hold_gap, bar_obstacle_gap):
         """One IDM speed update. The leader, a hold point and the stop bar
         (when it is an obstacle) compete for the smallest gap; a hold with
@@ -1392,15 +1701,24 @@ class Vehicle:
         Returns the stop flag for the reservation bookkeeping."""
         T, a, b = idm_params_px(self)
         v = self.speed
-        gap, dv = lead_dist, v - (leader.speed if leader is not None else 0.0)
+        gap, dv = lead_dist, v - (_seen(leader)[3] if leader is not None else 0.0)
         if should_stop and (hold_gap is None or hold_gap <= IDM_S0_PX):
-            self.speed = 0.0
-            return True
-        for obstacle in (hold_gap, bar_obstacle_gap):
-            if obstacle is not None and obstacle < gap:
-                gap, dv = obstacle, v
-        accel = idm_acceleration(v, self.max_speed, gap, dv, T, a, b)
-        self.speed = min(self.max_speed, max(0.0, v + accel))
+            wanted = 0.0
+        else:
+            for obstacle in (hold_gap, bar_obstacle_gap):
+                if obstacle is not None and obstacle < gap:
+                    gap, dv = obstacle, v
+            accel = idm_acceleration(v, self.max_speed, gap, dv, T, a, b)
+            wanted = min(self.max_speed, max(0.0, v + accel))
+        floor = max(0.0, v - emergency_decel_px(self))
+        at_bound = wanted < floor
+        if at_bound:
+            SAFETY_COUNTERS["emergency_decel_frames"] += 1
+            if not getattr(self, "_at_braking_bound", False):
+                SAFETY_COUNTERS["emergency_decel_events"] += 1
+            wanted = floor
+        self._at_braking_bound = at_bound
+        self.speed = wanted
         return should_stop or self.speed <= 0.0
 
     def render_position(self, alpha=1.0):
@@ -1437,6 +1755,16 @@ class Vehicle:
         pygame.draw.rect(screen, self.color, rect, border_radius=max(1, round(3 * scale)))
 
 
+# Bus stops. A near-side stop holds the bus this far short of the stop bar
+# (front bumper), beyond the reservation booking distance, so a dwelling bus
+# never holds the conflict box; a far-side stop puts the bus's rear this far
+# clear of the box on the exit road. Arrival: within this gap of the point,
+# standing.
+NEAR_SIDE_STOP_SETBACK_PX = 30.0
+FAR_SIDE_STOP_CLEARANCE_PX = 20.0
+STOP_ARRIVAL_TOLERANCE_PX = 4.0
+
+
 class Bus(Vehicle):
     def __init__(
         self, x, y, direction, route_info, bus_id="BUS_01", max_speed=1.0
@@ -1469,6 +1797,71 @@ class Bus(Vehicle):
         self.route_merge_desired_y = None
         # The single car asked to make room for this bus's DBL-lane merge.
         self.dbl_merge_blocker = None
+        # This trip's stops and dwells (main.draw_stop_plan), served in order.
+        self.stop_plan = [dict(stop) for stop in route_info.get("stops", []) or []]
+        self.dwelling = False
+        self.dwell_frames_total = 0
+        self.near_side_stop_pending = None
+        self.external_hold_gap = None
+
+    def _stop_gap_px(self, stop, h_y, road_w, stop_offset):
+        """Front-bumper distance to where this stop wants the front, along the
+        current road, or None while the stop is not on the road ahead."""
+        node = stop["node"]
+        half = road_w / 2.0
+        if stop["side"] == "near":
+            if node in self.passed_nodes or self.get_next_target_node(INT_X) != node:
+                return None
+            if not self.is_front_bumper_upstream(node, h_y, road_w, stop_offset):
+                return None
+            return self.distance_to_node_stop_bar(node, h_y, road_w, stop_offset) - NEAR_SIDE_STOP_SETBACK_PX
+        if node not in self.passed_nodes:
+            return None
+        reach = FAR_SIDE_STOP_CLEARANCE_PX + self.length
+        front = {"EB": self.x + self.length / 2.0, "WB": self.x - self.length / 2.0,
+                 "NB": self.y - self.length / 2.0, "SB": self.y + self.length / 2.0}[self.direction]
+        if self.direction == "EB":
+            return (node + half + reach) - front
+        if self.direction == "WB":
+            return front - (node - half - reach)
+        if self.direction == "NB":
+            return front - (h_y - half - reach)
+        return (h_y + half + reach) - front
+
+    def _update_stop(self, h_y, road_w, stop_offset):
+        """Approach, dwell at and leave the next unserved stop. Sets
+        external_hold_gap (a point Vehicle.update brakes for), dwelling, and
+        near_side_stop_pending (the node whose TSP check-in waits for it)."""
+        self.external_hold_gap = None
+        self.dwelling = False
+        pending = [stop for stop in self.stop_plan if not stop["served"]]
+        self.near_side_stop_pending = next(
+            (stop["node"] for stop in pending if stop["side"] == "near"), None
+        )
+        if not pending:
+            return
+        stop = pending[0]
+        gap = self._stop_gap_px(stop, h_y, road_w, stop_offset)
+        if gap is None:
+            return
+        if gap < -self.length:
+            stop["served"] = True  # passed it (cannot happen when braked for)
+            return
+        arrived = gap <= IDM_S0_PX + STOP_ARRIVAL_TOLERANCE_PX and self.speed <= 0.05
+        if stop["dwelt"] > 0 or arrived:
+            stop["dwelt"] += 1
+            self.dwell_frames_total += 1
+            if stop["dwelt"] >= stop["dwell_frames"]:
+                stop["served"] = True
+                if stop["side"] == "near":
+                    self.near_side_stop_pending = next(
+                        (s["node"] for s in self.stop_plan if not s["served"] and s["side"] == "near"), None
+                    )
+                return
+            self.dwelling = True
+            self.external_hold_gap = 0.0
+            return
+        self.external_hold_gap = max(0.0, gap)
 
     def get_active_route_leg(self, int_x_list):
         """Return canonical metadata for the next unfinished route leg."""
@@ -1697,6 +2090,13 @@ class Bus(Vehicle):
                     previous_node_x, road_w
                 ):
                     self.route_merge_hold_active = True
+                elif getattr(self, "_route_merge_holding", False) and not lane_clear:
+                    # Once waiting, wait until the merge can happen. A bus
+                    # braking at a physical rate rolls on past the blocker
+                    # that started the hold; dropping the hold then would
+                    # carry the unresolved merge to the next stop bar, which
+                    # is what the hold exists to prevent.
+                    self.route_merge_hold_active = True
 
             # Only a DBL-driven merge may be abandoned. A LEFT turn genuinely
             # needs its turn lane, and a leg whose configured lane already is
@@ -1727,7 +2127,10 @@ class Bus(Vehicle):
 
         if dbl_enabled_for_leg and self.lane_index == DBL_LANE_INDEX:
             self.dbl_merge_hold_frames = 0
+        # Every frame, so a hold never outlives the merge (or leg) it was for.
+        self._route_merge_holding = self.route_merge_hold_active
 
+        self._update_stop(h_y, road_w, stop_offset)
         super().update(signal_data, int_x_list, h_y, road_w, stop_offset, lane_w, all_vehicles, signal_controller)
 
     def draw(self, screen, alpha=1.0, view=None, scale=1.0):

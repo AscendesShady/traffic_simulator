@@ -5,6 +5,7 @@ from src.core.signal_controller import SignalController
 from src.core.vehicle import (
     DISCRETIONARY_LANES,
     LANE_CHANGE_MIN_DIST_TO_BAR_PX,
+    lane_change_step_px,
     Vehicle,
 )
 from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
@@ -39,7 +40,10 @@ def test_fast_car_overtakes_slow_leader_then_keeps_outer():
     random.seed(3)
     slow = car(NODE_A - 500, 0, 0.30)
     fast = car(NODE_A - 560, 0, 0.70)
-    lanes = run([slow, fast], 600)[id(fast)]
+    # Out, past, and back in: three lane changes' worth of time on top of
+    # the pass itself, on whichever engine is active.
+    budget = 600 + 3 * int(LANE / lane_change_step_px(LANE))
+    lanes = run([slow, fast], budget)[id(fast)]
     assert 1 in lanes  # pulled into the inner lane to pass
     assert fast.x > slow.x + 60  # and actually got past
     assert lanes[-1] == 0  # then drifted back out (keep-outer bias)

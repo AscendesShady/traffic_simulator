@@ -19,8 +19,7 @@ The simulator is a time-stepped microscopic simulation of a two-intersection
 urban arterial segment carrying mixed traffic (cars, trucks) and fixed-route
 buses. Its purpose is the **controlled, paired comparison of transit-priority
 decision policies** — Transit Signal Priority (TSP) and a Dynamic Bus Lane
-(DBL) granted by a rule, a pressure heuristic, a reinforcement-learning policy
-or a large language model — against a fixed-time Webster baseline, holding
+(DBL) granted by a rule, a pressure heuristic or a large language model — against a fixed-time Webster baseline, holding
 network, demand and vehicle behaviour identical across arms. The objective
 function is passenger-weighted: person-hours of travel delay, not vehicle
 counts.
@@ -88,10 +87,17 @@ free-flow speed, not a lane limit.
 ### 5. Longitudinal movement
 
 Two named movement engines exist and are selected per run by
-`global_config["movement_model"]` (default `"legacy"`); the selection is
+`global_config["movement_model"]` (default `"idm"`, §5.2); the selection is
 part of `config_hash`, so runs from different engines never pair.
 
-**5.1 Legacy following rule (default).** With bumper-to-bumper gap *g* to
+**5.1 Legacy following rule (comparison only).** Retained so earlier
+results can be reproduced, not for benchmark results: measured on an
+uninterrupted discharge its saturation flow is ≈2,800 veh/h/lane at speed
+scale 0.6 (HCM base 1,900), about 470 of its braking events per
+vehicle-hour exceed 2 g, and its absolute standing threshold (0.5 px/frame,
+27 km/h) makes any slower vehicle — every truck at scale ≤ 0.6 — read as a
+spillback queue, stalling the discharge behind it for up to 20 s. Every
+campaign up to 2026-09-22 used it. With bumper-to-bumper gap *g* to
 the leader in the same lane and desired speed *v*max:
 
 - *g* < 3 m (12 px, `SAFE_GAP_PX`): target speed 0;
@@ -138,11 +144,30 @@ default 0.5 scale; 0→v₀ in 4–12 s; peak braking ≤ b; queue spacing 7.5 m
 queue-tail shockwave −6 to −20 km/h; lane change 3 s; MOBIL safety and
 politeness; and a headless network soak with zero overlaps.
 
-**5.3 Within-frame update order.** Vehicles are updated sequentially in
-list (spawn) order within one frame and each reads the live positions of
-the others; there is no separate plan/commit pass. This is an accepted
-simplification (see the SUMO conformance audit) whose effect at 60 Hz has
-not been measured.
+*Braking bound and recovery.* The IDM law has no deceleration limit; the
+engine floors each step at the class emergency deceleration (car 9.0,
+truck and bus 7.0 m/s², SUMO's vehicle-type defaults). When that is not
+enough, the move is truncated at the leader's rear bumper or strictly short
+of the stop line and the event is counted (`vehicle.SAFETY_COUNTERS`,
+reported per vehicle-hour with TTC conflicts below FHWA SSAM's 1.5 s) —
+collision is prevented, and every instance of the prevention being
+super-physical is on the record. Vehicles enter the network at the speed
+from which they could stop behind the vehicle ahead at the comfortable rate
+(SUMO's insertion follow speed). A vehicle inside its braking distance of a
+stop line asks the controller whether it would be granted entry
+(`entry_would_be_granted`, side-effect free) and brakes comfortably for a
+box that will not open, rather than learning it at the 6.25 m booking
+distance. Cooperative holds (yield to a merging bus, hold behind a DBL bus)
+are a comfortable stop in place.
+
+**5.3 Within-frame update order.** Vehicles are updated one at a time, but
+every neighbour query (leader gap and speed, followers, lane bands,
+receiving space) reads the state each vehicle had at the start of the frame
+(`vehicle._seen`), so perception is plan-then-commit as in SUMO. Behavioural
+random draws come from each vehicle's own stream keyed on its exogenous
+identity (source and arrival index; route and trip), not from a shared
+stream consumed in update order. Box reservations remain first-come in list
+order. The residual order sensitivity is measured in the validation note.
 
 ### 6. Turning movements, lane assignment and route progression
 
@@ -153,8 +178,12 @@ double left (left at the first node, then left again at the second); A_NB
 and B_SB meet one node and have one option. Straight arrivals are placed in
 lane 0 or 1 with equal probability; a left at the first node is placed in
 lane 2 at the source; a far-node left rides lanes 0–1 through the near node
-and must be in lane 2 within 62.5 m (250 px) of its turning node, holding
-at the stop line until it is. After any left the vehicle lands in the exit
+and starts working into lane 2 as soon as it has passed it (a driver
+positions for the next junction; two 3 s lane changes do not fit in the
+last 62.5 m of a queued link). It must be in lane 2 to turn and holds at the
+stop line until it is, booking nothing; one still out of its lane after
+10 s at the line takes the missed turn and goes straight, counted as
+`missed_turns_total`. After any left the vehicle lands in the exit
 road's lane 2 and keeps it. Buses follow six fixed routes (§8). A vehicle is
 removed, and its passengers credited to throughput, only when it leaves the
 surface **and** has recorded at least one node crossing; a crossing is
@@ -172,10 +201,15 @@ vehicle — only when the entry is clear (no vehicle within the lateral block
 zone at the spawn point); a blocked entry delays it and never redraws it.
 Consequently a control policy that changes congestion cannot change what
 any source offered, and `demand_draw_hash` — a hash over every
-(source, offer frame, attributes) tuple — fingerprints the whole offered
-schedule for the pairing check. Vehicle attributes are never drawn at
-admission time nor from the global RNG; behavioural draws (the lane-change
-hazard) use the global run-seeded RNG.
+(source, offer frame, attributes) tuple offered up to the row's own mark —
+fingerprints the offered schedule for the pairing check (it is keyed by
+frame, so an export landing a frame late cannot change it). Vehicle
+attributes are never drawn at admission time nor from the global RNG;
+behavioural draws (the lane-change hazard) use each vehicle's own stream
+keyed on (seed, source, arrival index), so they too are common across arms.
+The time an offered arrival waits at a blocked source before becoming a
+vehicle is latent demand: it is recorded per trip (`entry_delay_frames`,
+SUMO's departDelay) and integrated per frame into the primary DV (§11).
 
 Arrival processes per source (rate λ in veh/min, λ_f = λ/3600 per frame):
 
@@ -211,6 +245,17 @@ with the movement and lane the bus uses at every node it meets:
 | R5_WB_B_SB | WB, left at B to SB | B: LEFT (2) | 45 s | active |
 | R6_WB_ONLY | WB through both | B, A: STRAIGHT (1) | 90 s | inactive |
 
+Each route has stops (`stops`, default one far-side stop at the route's
+first node — the placement transit-priority guidance pairs with TSP). A bus
+brakes for its stop, dwells, and continues; dwell follows the Transit
+Capacity and Quality of Service Manual (3rd ed., Ch. 6): door time 4 s plus
+the longer of boardings × 3 s and alightings × 2 s (two-door bus), with
+Poisson boardings and alightings of mean 4 each (mean dwell ≈ 19 s,
+8–34 s observed). Dwells are drawn per (seed, route, trip index), so every
+arm sees identical dwells, and boardings equal alightings in expectation,
+so occupancy stays 45. A near-side stop holds the bus 7.5 m short of the
+stop line and withholds priority at that node until it has been served.
+
 Departures are trips: one pending trip is appended per elapsed headway (and
 per manual dispatch) and trips leave in order as the entry clears, so
 departures due while the entry is blocked accumulate rather than vanish.
@@ -220,13 +265,30 @@ the pending backlog; trips held by a blocked entry are counted once in
 
 ### 9. Signal control
 
-**9.1 Baseline: fixed-time Webster per node.** Each node runs an
-independent two-phase cycle
-EW green → EW yellow → all-red → NS green → NS yellow → all-red, with
-yellow = 1 s and all-red = 1 s (60 frames each), hence lost time
-L = 2 × (1 + 1) = 4 s per cycle. Nodes hold separate phase, timer,
-clearance, reservation and priority state and may drift apart under
-node-local priority.
+**9.1 Baseline: coordinated fixed-time Webster.** Each node runs a
+two-phase cycle EW green → EW yellow → all-red → NS green → NS yellow →
+all-red. Yellow and all-red follow ITE's kinematic formulas (Guidelines for
+Determining Traffic Signal Change and Clearance Intervals, 2020):
+Y = t + v/(2a), R = (W + L)/v, with t = 1.0 s, a = 3.05 m/s², L = 6.1 m, v
+the 85th-percentile desired speed and W the stop line to far box edge
+(35.5 m), bounded by MUTCD (2009) §4D.26 guidance — 3.0 s and 3.5 s at
+speed scale 0.6. Lost time is HCM's t_L = l1 + (Y + AR − e) per phase
+(HCM 7th ed., Ch. 19; e = 2 s), with the start-up lost time l1 *measured*
+on the driving engine by the calibrator (≈1.5–2.3 s under IDM at scale
+0.5–0.6; HCM default 2.0 s if the first discharge headways are
+interrupted): ≈12.6 s per cycle at scale 0.6, against 4 s under the former
+1 s + 1 s. Both nodes run one common cycle — the longer of their own Webster
+cycles, each node re-split on its own flow ratios — with Node B offset from
+Node A by the link travel time at the mean car desired speed in the
+progression direction (EB by default; NCHRP Report 812, Signal Timing
+Manual 2nd ed.). Every time a node starts its EW green the controller
+compares the start with the master schedule and spreads the error over that
+cycle's greens, at most 20 % of each green per cycle; this returns a node to
+coordination after a TSP action, an all-red that waited for a blocked box,
+or a discharge episode. `"signal_coordination": "independent"` restores the
+former per-node cycles, whose relative offset drifts (81.6 s against 62.0 s
+on seed 234, ≈20 s per cycle). Nodes still hold separate phase, timer,
+clearance, reservation and priority state.
 
 Green splits come from Webster's method with a per-run *measured*
 saturation flow S. Per node, each phase is represented by its heaviest
@@ -240,14 +302,21 @@ C_opt = (1.5 L + 5) / (1 − Y),
 
 floored at 40 s and, when Y ≥ 1 (oversaturated), replaced by a 120 s cap
 that is reported as such; effective green C − L is split in proportion to
-y. Minimum green is 5 s (300 frames). Saturation flow is measured at every
-run start by the HCM queue-discharge method (`main.calibrate_saturation_flow`):
+y, and converted to displayed green G = g + l1 − e so the controller's real
+cycle equals the cycle Webster chose. Minimum green is 5 s (300 frames).
+Saturation flow is measured once per regime (speed scale, vehicle mix,
+movement engine; with a fixed calibration seed, never the run seed) by the
+HCM queue-discharge method (`main.calibrate_saturation_flow`):
 a standing queue of 30 vehicles is built on one EB lane behind red with no
 downstream interference, released with no new arrivals, the first 4
-departures are discarded as start-up lost time, and S is the reciprocal of
-the mean headway of the rest (default fallback 1,366 veh/h/lane if the run
-yields none). Under the legacy engine at the default speed scale S ≈ 1,290
-veh/h/lane; the IDM figures are in §5.2. Calibration happens *after* the
+departures are discarded as start-up lost time (and measure l1), headways
+above 2.5 × the median are dropped as an interrupted discharge (HCM 7th ed.,
+Ch. 31), and S is the reciprocal of the mean of the rest (default fallback
+1,366 veh/h/lane if the run yields none). Under IDM with 10 % heavy vehicles
+S ≈ 1,340 veh/h/lane at speed scale 0.5 and ≈1,460 at 0.6; cars-only figures
+are in §5.2. Because this is one lane in isolation, the network's own
+saturation flow is also measured during every run from stop-bar headways
+(§11) and reported beside it. Calibration happens *after* the
 movement model is selected and *before* the regime hash is frozen, so S and
 the splits describe the engine that actually drives.
 
@@ -261,17 +330,29 @@ at least its own length plus 3 m — the spillback hold; this is the same
 `receiving_space_px` telemetry and the TSP gate read), and (iii) obtain a
 movement reservation. A reservation is refused while any live reservation
 or occupant conflicts with it: movements on perpendicular axes always
-conflict; on the same axis only a left turn and its own approach's
-through/left traffic conflict, and only until the turning vehicle has
-cleared the corner lane it sweeps (released dynamically, not by a fixed
-interval). Lefts are permissive; a through entry from the same approach is
-refused once a waiting left-turner has been denied for 1 s (60 frames) so a
-queue of through traffic cannot starve the turn. Yellow is an obstacle like
-red. A node is added to a vehicle's `passed_nodes` only when its rear has
-cleared the conflict area, and all-red must find the area empty before the
-next green starts. There is **no collision recovery layer**: overlap is
-treated as structurally impossible and `tests/test_adversarial_simulation.py`
-asserts all-pair and swept (before→after tick) non-overlap on every run.
+conflict; on the same axis only a near-side (left) turn and its own
+approach's traffic can conflict, and only where the turn's square-corner
+pivot physically sweeps the other vehicle's lane: half the turning
+vehicle's length either side of its lane centre, which passes the 5.5 m
+lane edge only for a vehicle longer than a lane is wide (a truck by
+0.75 m, a bus by 2.5 m, never a car), and then only into the adjacent lane.
+The conflict is released dynamically once the corner is clear. A through
+entry in a swept lane is refused once a waiting turner has been denied for
+1 s (60 frames), so a queue of through traffic cannot starve the turn.
+Near-side turns obey the signal like through traffic -- no turn on red
+without a green filter arrow (TSRGD 2016; Highway Code rule 175) -- and,
+being near-side turns in left-hand traffic, never cross or yield to the
+opposing stream. At
+yellow onset a vehicle inside its ITE stopping distance (v·t + v²/2a, the
+same t and a the yellow is computed from) commits to go and is treated as
+facing green until the next green — the Type I dilemma-zone rule the change
+interval is designed for; beyond it the yellow is an obstacle like red. A
+node is added to a vehicle's `passed_nodes` only when its rear has cleared
+the conflict area, and all-red must find the area empty before the next
+green starts. Overlap is prevented by construction and continuously tested
+(`tests/test_adversarial_simulation.py`, all-pair and swept non-overlap);
+where prevention needs more than the braking bound (§5.2) it is counted,
+not hidden.
 
 **9.3 Transit Signal Priority.** TSP is a bounded perturbation of the
 running Webster cycle, never a phase override. A bus becomes eligible when
@@ -283,13 +364,15 @@ action:
 
 - **Green extension** — if the bus's phase is green when it would end, the
   green is held, up to a cap of 20 % of that phase's green
-  (`TSP_MAX_ADJUST_FRACTION`), *only if* the bus's ETA at its current speed
-  (`vehicle.eta_frames_to_stop_bar`, the estimator telemetry publishes)
-  falls within the cap; otherwise the green ends on time and the request
-  stays armed.
+  (`TSP_MAX_ADJUST_FRACTION`), *only if* the bus's predicted arrival
+  (`vehicle.bus_eta_frames`: under IDM the unimpeded time to accelerate from
+  its current speed to its desired speed at the bus a₀ and cruise — how
+  deployed TSP predicts arrival from a check-in point; the same estimator
+  telemetry and the comparators read) falls within the cap; otherwise the
+  green ends on time and the request stays armed.
 - **Early green (red truncation)** — if the conflicting phase is green, it
   is shortened by up to the same cap, never below the 5 s minimum green,
-  *only if* the cut exceeds yellow + all-red (2 s) and the bus's predicted
+  *only if* the cut exceeds yellow + all-red and the bus's predicted
   crossing, max(ETA, start of the advanced green), falls inside the green
   the cut brings forward. The gate is re-evaluated every frame as the bus
   closes in.
@@ -318,7 +401,7 @@ the bus's landed ETA reaching zero at the bar): in the 2026-09-21
 campaign `FEATURE_DISABLED` was 9 of the rule arm's 9 TSP denials and
 29 of llama3.1's 34, and the buses concerned stopped for 13–33 s.
 The snapshot lock alone still leaked (Run 8, 2026-09-21: 45 of 83
-denials): a stale decision (`max(3 × tick, 12 s)` = 15 s at the 5 s tick,
+denials): a stale decision (`max(3 × tick, 12 s)` = 15 s at the 5 s tick then in use,
 shorter than a slow model's latency), a guard-held all-off, or a decider
 whose snapshot predated the request all cleared the flags. The lock is
 therefore also enforced at the merge boundary from the *live* controller:
@@ -377,7 +460,9 @@ controller does not yet hold a request for, `agent.check_locked` /
 `anti_cheat` keep a locked route's flags as they are, whatever the arm
 returns for it, and the merge itself (`_set_ai_flags`, including the
 all-off of every refusal) skips any route with a live controller request.
-The tick is 2–120 s (`control_panel.TICK_SECONDS_MIN/MAX`): the agent
+The tick is 2–120 s (`control_panel.TICK_SECONDS_MIN/MAX`, default 60 s;
+50 s is the floor at which no arm can skip, being the longest provider
+call timeout, 45 s, plus a margin): the agent
 skips-and-counts a grid point that comes due while a call is still running
 (`SKIPPED_SLOW`), so a tick below a model's latency measures a
 disconnected loop (Run 8 lost a median 65 of 99 turns at 5 s; r = −0.87
@@ -386,12 +471,41 @@ above the slowest arm's p95 latency -- one decision per signal cycle
 (~50 s) is what a field controller re-plans at -- and record it; the stale
 window follows as 3 × tick.
 
+**Local model selection (2026-09-23).** Each installed Ollama model was run
+through the agent's real turn on five telemetry snapshots (2.2–3.0k-token
+prompts, 0.6× campaign demand, 6–16 buses) on the study machine (Ryzen 7
+5800X, RTX 3070 8 GB, Ollama 0.34), with a campaign-density simulation
+running alongside to measure the frame-time cost. Every model gets the same
+8,192-token context (`agent.OLLAMA_NUM_CTX`; left to Ollama, the window
+follows the model's maximum and small models spilled onto the CPU), 6
+inference threads, and the simulator runs at above-normal priority. The
+latency bars follow from the bus: at 9 m/s a bus crosses the 200 m priority
+zone in about 22 s, so a decision must land within that (worst turn ≤ 22 s)
+and, for the median bus in the zone, within half of it (median ≤ 11 s).
+
+| Model | Placement | Median | Worst | Valid | Arm |
+|---|---|---|---|---|---|
+| llama3.2:3b | 100 % GPU | 0.7 s | 1.0 s | 5/5 | kept |
+| phi3:3.8b | 100 % GPU | 1.4 s | 2.0 s | 5/5 | kept |
+| llama3:latest (8B) | 100 % GPU | 1.5 s | 1.8 s | 5/5 | kept |
+| llama3.1:8b | 100 % GPU | 1.7 s | 2.0 s | 5/5 | kept |
+| gemma4:latest | 100 % GPU | 17.8 s | 26.1 s, then 45 s timeout | 4/5 | dropped: 1.3–2.3k reasoning tokens a turn |
+| orca-mini:7b | 100 % GPU | — | 45 s timeout | 1/2 | dropped: 4k native context, timed out |
+| nemotron-3-nano:4b | 100 % GPU | — | 45 s timeout | 0/1 | dropped: reasoning model, timed out |
+| gemma4:12b | 31 % CPU | — | 45 s timeout | 0/1 | dropped: 8.9 GB exceeds VRAM |
+
+With the kept models running, the simulator's frame stayed inside its
+16.67 ms budget at campaign density. Model size alone did not predict speed:
+before the context was fixed, phi3:3.8b ran 81 % on the CPU at 16.7 s while
+the older 8B llama3 ran on the GPU at 1.5 s. Re-run the selection if the
+GPU, the Ollama version or the prompt changes.
+
 | Arm (`ai_runtime["model"]`) | Decision rule |
 |---|---|
 | **Baseline** (`None`) | No decisions and no treatment: `agent.guard_baseline` turns every turn into `OBSERVATION_ONLY`, the reset clears all route flags, and a summary row showing any decision or TSP treatment raises `BaselineContaminationError` (row refused, batch marked `FAILED`). |
 | **Rule-based** (`rule-based`) | Deterministic conditional TSP: for each approaching bus that would otherwise stop at red and whose receiving lane is free, grant if the cross street's queued passengers < 45 (one bus load, `RULE_CROSS_QUEUE_THRESHOLD_PAX`); score = bus passengers − cross-street passengers; at most 1 grant per node per decision. DBL for every approaching bus unless telemetry reports the lane obstructed or queued. Zero latency by construction. |
 | **Passenger-pressure TSP** (`passenger-pressure-tsp`) | Same DBL rule and per-node cap; TSP granted when the bus approach's pressure (queued passengers upstream plus the bus load, zero if its downstream is blocked) exceeds the conflicting approaches' summed pressure. It is a TSP *gate*, not a phase-selecting max-pressure controller. |
-| **LLM, assisted** (any Ollama tag or Gemini model) | A separate-process LangGraph loop reads the telemetry snapshot every tick (2–15 s, default 5 s), renders a structured text "minimap" (per-node competing queues in passengers, per-route bus positions/ETAs/loads, receiving-lane state, lane obstruction) and asks the model for `{reason, tsp[6], dbl[6]}` with a prompt stating that Webster is the competent baseline, congestion is failure, all-off is often correct, and a bus must remain actionable after expected inference latency. A server-side `anti_cheat` step forces `dbl=False` for any new grant where telemetry shows the lane obstructed. Ollama calls time out at 45 s, Gemini at 30 s (temperature 0.2); both time-outs are held all-off. |
+| **LLM, assisted** (any Ollama tag or Gemini model) | A separate-process LangGraph loop reads the telemetry snapshot every tick (2–120 s, default 60 s), renders a structured text "minimap" (per-node competing queues in passengers, per-route bus positions/ETAs/loads, receiving-lane state, lane obstruction) and asks the model for `{reason, tsp[6], dbl[6]}` with a prompt stating that Webster is the competent baseline, congestion is failure, all-off is often correct, and a bus must remain actionable after expected inference latency. A server-side `anti_cheat` step forces `dbl=False` for any new grant where telemetry shows the lane obstructed. Ollama calls time out at 45 s, Gemini at 30 s (temperature 0.2); a time-out is held all-off, and grid points that come due while the abandoned call still holds the provider are skipped (`SKIPPED_SLOW`), not held. |
 | **LLM, decided** (`<model> [decided]`) | `control_mode = "configured"`: the model writes the timing plan itself — per node EW and NS green (clamped 5–90 s), `end_current_green_now`, and four commanded DBL lanes — through the same single writer and identity checks; `SignalController.apply_plan` is the only entry, Webster and the TSP state machine are off, and a commanded lane is shared with left-turners. This arm is a different mechanism and is paired only against the Webster baseline, never against an assisted arm as "decision quality". |
 
 Every AI/rule turn is logged with the exact telemetry snapshot it saw,
@@ -407,13 +521,20 @@ All counters are accumulated once per simulated frame in
 | Measure | Definition |
 |---|---|
 | Passenger throughput | Σ passengers of vehicles that left the surface with ≥ 1 rear-clear node crossing (car 4, truck 1, bus 45); also per mode, per vehicle, and as passengers/min cumulative and recent |
-| **Travel delay (primary)** | per vehicle per frame, lost = 1 − min(v, v_free)/v_free with v_free the vehicle's own desired speed; person-hours = Σ passengers × lost / (60 × 3600). Split bus/car. Counts crawl, not only stops. |
+| **Delay incl. entry wait (primary)** | on-road travel delay (next row) **plus** passenger-hours of offered demand waiting at a blocked source (cars 4 / trucks 1 per queued arrival, 45 per pending bus trip, every frame). Without the second term an arm that holds traffic outside the model is credited for the delay it exported (FHWA Traffic Analysis Toolbox Vol. III). |
+| Travel delay (on-road) | per vehicle per frame, lost = 1 − min(v, v_free)/v_free with v_free the vehicle's own desired speed; person-hours = Σ passengers × lost / (60 × 3600). Split bus/car. Counts crawl, not only stops. |
 | Stopped delay (proxy) | frames with v < 0.25 px/frame (3.75 m/s); passenger-weighted per mode; labelled a proxy and never used to grade LOS |
 | Control delay per vehicle | Σ lost frames over the whole route / 60 (both nodes for through traffic — conservative against a per-intersection HCM grade) |
 | Level of service | HCM signalised-intersection thresholds on mean control delay: A ≤ 10, B ≤ 20, C ≤ 35, D ≤ 55, E ≤ 80, F > 80 s/veh |
 | Per-vehicle means | every mean (`mean_*_delay_sec`, node means, live telemetry) divides *completed*-vehicle counters by the served count; the censored remainder is reported separately as `unfinished_stopped_person_hours` and `passenger_hours_in_network`, so an unfinished vehicle never sits in a numerator without its denominator |
 | Bus service | trips scheduled / pending / missed, source delay, per-bus TSP/DBL event log (request, arm, action, gate reason, adjust frames, outcome) |
 | Cross-street cost | `tsp_window_cross_street_person_hours`, descriptive only |
+| Latent demand | vehicles still waiting to enter at the mark and their share of offered vehicles; mean entry delay per served vehicle |
+| Capacity validation | in-network saturation flow from stop-bar headways (5th queued vehicle on, uninterrupted discharge, HCM Ch. 31) and its ratio to the calibrated S; GEH of entered vs offered hourly volume per source (FHWA TAT Vol. III target GEH < 5 on ≥ 85 %) |
+| Surrogate safety | TTC conflicts (< 1.5 s, FHWA SSAM), braking-bound events and recovery clamps, each per vehicle-hour |
+| Pace | achieved sim-seconds per wall-second; must be 1.0 for decision latency to mean what the agent assumes |
+| Control delay | per decision, sim seconds from the telemetry frame the decider saw to the first frame the decision took effect (grid-point detection + model call + 30-frame merge), measured on the sim clock: `control_delay_sim_s` (audit sheet), `control_delay_sim_sec_median/_p95` (summary) |
+| Trip records | one per vehicle (depart, arrival, duration, time loss, waiting time, depart delay, dwell, credited) in the workbook's Trip Info sheet, unfinished vehicles appended at export (SUMO tripinfo); optional floating-car data (`fcd_period_s`) |
 | Gridlock | onset/clearance times, stopped share, queue-head diagnosis |
 | Real-world readouts | v/c per approach from `approach_critical_lane_flow_veh_hr` (so v/c and Webster's y agree by construction), queue lengths in m, downstream space per lane in m — display/export only, never fed back |
 
@@ -421,8 +542,13 @@ All counters are accumulated once per simulated frame in
 
 - **Common random numbers.** Paired arms run on identical seeds; the
   offered demand (§7) is provably identical across arms
-  (`demand_draw_hash`), giving the standard variance-reduction design for
-  paired simulation comparisons.
+  (`demand_draw_hash`), as are each vehicle's behavioural draws and each
+  bus trip's dwells, giving the standard variance-reduction design for
+  paired simulation comparisons (Law, 2015).
+- **Replications.** `print_campaign_summary` states, per arm, the runs
+  needed for the mean paired DV to lie within ±10 % of itself at 95 %:
+  N = (t₀.₉₇₅,ₙ₋₁ · s / e)² (FHWA Traffic Analysis Toolbox Vol. III), and
+  flags an under-replicated arm.
 - **Warm-up.** Every steady-state DV (`*_steady`, `converged`) discards the
   first 120 s (`warmup_discard_frames` = 7,200) via a snapshot taken once per
   run; cumulative columns are kept alongside. `converged` requires the
@@ -449,7 +575,8 @@ All counters are accumulated once per simulated frame in
   (`PAIRING_MUST_MATCH`); otherwise the pair is refused and listed with the
   differing columns. The primary DV is
   `net_person_hours_saved = baseline − arm` on
-  `total_person_hours_travel_delay_steady`, with bus/car split and the
+  `total_person_hours_delay_incl_entry_steady`, with bus/car split, the
+  on-road-only variant (`net_person_hours_saved_on_road`) and the
   stopped-delay variant, one row per (campaign, seed, arm). No per-run
   column claims "net saved": the baseline is another run.
 - **Baseline integrity.** See §10; a contaminated baseline row is refused
@@ -471,8 +598,12 @@ All counters are accumulated once per simulated frame in
   control-panel input table and the Webster calibration outputs
   (S, C, y, Y, cycle source) in its workbook and in
   `results/experiment_summary_<YYYYMMDD>.csv` (dated by the day the campaign
-  started, so one batch is one file; schema version 5; a CSV whose header no
+  started, so one batch is one file; schema version 9; a CSV whose header no
   longer matches is rotated, never appended to ragged).
+- **Golden outputs.** `tests/test_golden_regression.py` pins the complete
+  end state of two canonical scenarios; any change to what the simulation
+  produces fails until deliberately re-pinned (`REPIN_GOLDEN=1`) and
+  committed with its reason.
 
 ### 13. Verification summary
 
@@ -491,20 +622,40 @@ integrity, pairing contract, DV definitions), `test_rule_controller.py`,
 `test_max_pressure_and_rl.py`, `test_llm_control_loop.py` and
 `test_ai_configured.py` (every decision arm through the real guard and
 merge), `test_gridlock_monitor.py`, `test_turn_options.py`,
-`test_lane_change.py`, `test_motion_tuning.py`.
+`test_lane_change.py`, `test_motion_tuning.py`, and
+`test_standards_conformance.py` (each standard-derived behaviour pinned to
+its source: ITE/MUTCD intervals, HCM lost time, near-side turn signal
+compliance and corner-sweep geometry,
+coordination and recovery, dilemma zone, braking bound and SSM, insertion
+speed, order-independent perception, latent demand, trip records, TCQSM
+dwell and near-side check-in, FHWA replications), `test_campaign_integrity.py`
+and `test_golden_regression.py`.
 
 ### 14. Limitations to state with any result
 
 - Two intersections, fixed geometry, left-hand traffic, near-side turns
   only; no pedestrians, no far-side/crossing turns, no right turns.
-- The legacy engine's acceleration ramp is uncalibrated (45 m/s²); results
-  produced with it are internally consistent and paired, but its
-  saturation flow (≈1,290 veh/h/lane at the default speed scale) is below
-  HCM base. The IDM engine is the physically calibrated one.
-- Sequential within-frame update (§5.3); no collision-recovery layer
-  (§9.2).
-- Yellow and all-red of 1 s each are shorter than typical field practice
-  (3–5 s and 1–2 s); lost time is therefore small and Webster cycles short.
+- The legacy engine is not physically calibrated (§5.1) and must not be
+  used for benchmark results; campaigns before 2026-09-23 used it.
+- Box reservations are first-come in update order (§5.3); the residual
+  order sensitivity and its size relative to ordinary run-to-run variation
+  are reported in the validation note.
+- The reservation/turning abstraction still leaves some braking-bound
+  events and recovery clamps (square-corner turns at speed, conflicts that
+  appear inside the booking distance); they are counted and reported per
+  vehicle-hour, not eliminated. Turning speed is not reduced before a turn.
+- North–south approaches are 56 m long, so under heavy demand queues reach
+  the network boundary; the resulting latent demand is measured and charged
+  in the primary DV, but a boundary that truncates queues is itself a
+  limitation (FHWA TAT Vol. III advises extending the network until latent
+  demand is negligible).
+- Saturation flow is calibrated on one straight lane in isolation; the
+  in-network value is measured and reported beside it, not fed back.
+- Bus stops are in-lane (no bays); occupancy is fixed at 45 (boardings equal
+  alightings in expectation). Dwell parameters are TCQSM-range defaults,
+  not calibrated to a corridor.
+- The network is synthetic: validation is against published standards and
+  internal consistency, not field observations.
 - Queue passenger *estimates* in live telemetry use 4 passengers per queued
   vehicle (the aggregated queue counter does not retain class); served
   throughput uses actual occupancy.

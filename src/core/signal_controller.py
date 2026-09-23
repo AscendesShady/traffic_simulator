@@ -15,6 +15,7 @@ from src.core.vehicle import (
     dbl_lane_queue_ahead,
     ENTRY_ZONE_PX,
     eta_frames_to_stop_bar,
+    bus_eta_frames,
     SAFE_GAP_PX,
 )
 
@@ -200,7 +201,17 @@ class NodeState:
     plan_green_frames: dict[int, int] | None = None
     dbl_commanded: set[str] = field(default_factory=set)
     cut_pending: bool = False
+    # Coordination transition for the cycle in progress: frames added to (or,
+    # negative, taken from) each green so the node returns to its offset.
+    transition_adjust: dict[int, int] = field(default_factory=dict)
 
+
+# Coordination transition: the most a single cycle may move either green
+# towards the master schedule, as a fraction of that green. A bounded
+# correction spread over several cycles, in the spirit of the "short-way"
+# transition methods of NCHRP Report 812 (Signal Timing Manual, 2nd ed.),
+# rather than a jump that would starve one phase to catch up in one go.
+COORDINATION_MAX_ADJUST_FRACTION = 0.2
 
 # A same-approach left turn yields to through traffic in the corner sweep
 # (movements_conflict). Under a crawling box that stream never leaves a gap
@@ -275,6 +286,9 @@ class SignalController:
             )
         self.frame_number = 0
         self.nodes = {node_x: NodeState() for node_x in INT_X}
+        # {"cycle": frames, "offsets": {node_x: frames}} once set_coordination
+        # has run for this episode; None = independent nodes.
+        self.coordination = None
         self._request_sequence = 0
         self._attempt_counts: dict[tuple[str, int, int], int] = {}
         self.experiment_metrics = {
@@ -1230,11 +1244,20 @@ class SignalController:
 
         A live plan (apply_plan) wins; else Webster splits are per node and
         per phase, so EW and NS no longer share a single slider value. Falls
-        back to the legacy green_time when no calibration has run yet.
+        back to the legacy green_time when no calibration has run yet. Under
+        coordination the cycle's transition adjustment is included, so TSP
+        feasibility, extension caps and telemetry all read the green the
+        node will actually run.
         """
         node = self.nodes.get(node_x)
         if node is not None and node.plan_green_frames:
             return node.plan_green_frames[3 if phase == 3 else 0]
+        base = self._base_green_frames(node_x, phase)
+        if node is not None and self.coordination:
+            base += node.transition_adjust.get(3 if phase == 3 else 0, 0)
+        return max(1, int(base))
+
+    def _base_green_frames(self, node_x, phase):
         splits = self.global_config.get("webster_splits") or {}
         node_split = splits.get(node_x) or splits.get(str(node_x))
         if node_split:
@@ -1243,6 +1266,71 @@ class SignalController:
             if isinstance(frames, (int, float)) and frames > 0:
                 return max(1, int(frames))
         return max(1, int(self.global_config.get("green_time", 240)))
+
+    # --- coordination -----------------------------------------------------
+    #
+    # Coordinated operation: both nodes run one common cycle, and each node's
+    # EW green is scheduled to start at its offset against a master clock
+    # (this controller's frame_number). A node is placed in its cycle at
+    # reset so it starts on schedule, and every time it begins an EW green it
+    # compares the start with the schedule and spreads the error over that
+    # cycle's two greens, within COORDINATION_MAX_ADJUST_FRACTION. The same
+    # correction is what returns a node to coordination after a TSP green
+    # extension or early green, an all-red that waited for a blocked box, or
+    # a discharge episode -- the "recovery" transit priority requires.
+
+    def set_coordination(self, cycle_frames, offsets):
+        if not cycle_frames:
+            self.coordination = None
+            return
+        cycle = int(cycle_frames)
+        self.coordination = {
+            "cycle": cycle,
+            "offsets": {int(k): int(v) % cycle for k, v in (offsets or {}).items()},
+        }
+        for node_x, node in self.nodes.items():
+            offset = self.coordination["offsets"].get(node_x, 0)
+            self._place_in_cycle(node_x, node, (-offset) % cycle)
+
+    def _phase_durations(self, node_x):
+        return [
+            self._base_green_frames(node_x, 0), self.yellow_time, self.red_clearance_time,
+            self._base_green_frames(node_x, 3), self.yellow_time, self.red_clearance_time,
+        ]
+
+    def _place_in_cycle(self, node_x, node, position):
+        durations = self._phase_durations(node_x)
+        position = int(position) % max(1, sum(durations))
+        for phase, duration in enumerate(durations):
+            if position < duration:
+                node.phase, node.timer = phase, position
+                return
+            position -= duration
+        node.phase, node.timer = 0, 0
+
+    def _coordinate(self, node_x, node):
+        """Set this cycle's transition so the node heads back to its offset."""
+        node.transition_adjust = {}
+        if not self.coordination or self.plan_active or self.discharge_active:
+            return
+        cycle = self.coordination["cycle"]
+        offset = self.coordination["offsets"].get(node_x, 0)
+        error = (self.frame_number - offset) % cycle
+        if error > cycle / 2:
+            error -= cycle          # negative: started early
+        need = -error               # frames this cycle must gain (or lose)
+        if need == 0:
+            return
+        green = {0: self._base_green_frames(node_x, 0), 3: self._base_green_frames(node_x, 3)}
+        adjust = {}
+        remaining = float(need)
+        for phase in (0, 3):
+            share = need * green[phase] / float(green[0] + green[3]) if phase == 0 else remaining
+            cap = COORDINATION_MAX_ADJUST_FRACTION * green[phase]
+            floor = -min(cap, max(0, green[phase] - self.min_green_frames))
+            adjust[phase] = int(round(max(floor, min(cap, share))))
+            remaining -= adjust[phase]
+        node.transition_adjust = adjust
 
     @staticmethod
     def _normal_signals_for_phase(phase):
@@ -1336,6 +1424,31 @@ class SignalController:
             and (movement_a == "LEFT" or movement_b == "LEFT")
         )
 
+    @staticmethod
+    def _corner_sweep_conflict(entry_vehicle, entry_movement, other_vehicle, other_movement):
+        """Whether two vehicles of one approach, one of them turning near-side,
+        really share road in the box.
+
+        The turn pivots at a square corner, so its body swings half its length
+        either side of its lane centre: past the lane edge only when it is
+        longer than a lane is wide (LANE, 5.5 m) -- a truck by 0.75 m, a bus
+        by 2.5 m, a car not at all. Only then does it sweep the neighbouring
+        lane. Treating every near-side turn as blocking every through lane of
+        its approach stopped the whole approach for each turning car: at 0.6x
+        demand, below Webster capacity, queues reached the boundary on every
+        source (2026-09-23 audit). Same-lane pairs keep the conservative
+        answer; car following orders them anyway."""
+        if "LEFT" not in (entry_movement, other_movement):
+            return True
+        turner = entry_vehicle if entry_movement == "LEFT" else other_vehicle
+        lane_gap = abs(
+            int(getattr(entry_vehicle, "lane_index", 0))
+            - int(getattr(other_vehicle, "lane_index", 0))
+        )
+        if lane_gap == 0:
+            return True
+        return lane_gap == 1 and float(getattr(turner, "length", 0.0)) > LANE
+
     def _left_turn_cleared_adjacent_through_lane(
         self, vehicle, originating_approach, node_x
     ):
@@ -1378,12 +1491,21 @@ class SignalController:
         other_approach,
         other_movement,
         node_x,
+        entry_vehicle=None,
     ):
         if not self.movements_conflict(
             entry_approach,
             entry_movement,
             other_approach,
             other_movement,
+        ):
+            return False
+        if (
+            entry_vehicle is not None
+            and entry_approach == other_approach
+            and not self._corner_sweep_conflict(
+                entry_vehicle, entry_movement, other_vehicle, other_movement
+            )
         ):
             return False
 
@@ -1440,6 +1562,60 @@ class SignalController:
                 ):
                     del node.reservations[vehicle_key]
 
+    def entry_would_be_granted(self, vehicle, node_x, vehicles):
+        """Whether request_intersection_entry would grant this vehicle entry
+        now, with no side effects. Lets a vehicle still inside its braking
+        distance see that the box will not open and brake comfortably, the
+        way a SUMO vehicle sees a link's state well before reaching it --
+        instead of learning it at the 25 px booking distance, where the only
+        way to stop is harder than any road vehicle can brake (78 of 130
+        braking-bound events in a 2-minute audit run were exactly that)."""
+        node = self.nodes.get(node_x)
+        if node is None:
+            return False
+        if id(vehicle) in node.reservations:
+            return True
+        return self._entry_blocker(vehicle, node, node_x, vehicles) is None
+
+    def _entry_blocker(self, vehicle, node, node_x, vehicles):
+        """None when nothing blocks this vehicle's entry, else the
+        (approach, movement) of what does ("DISCHARGE"/"STARVED" for the
+        non-vehicle reasons)."""
+        approach = vehicle.direction
+        movement = self._movement_for_vehicle(vehicle, node_x)
+        if self.discharge_active:
+            if (
+                self.discharge_state != DISCHARGE_ACTIVE
+                or self._discharge_green_map.get(node_x) != approach
+            ):
+                return ("DISCHARGE", None)
+        if movement == "STRAIGHT" and self._left_turn_starved(node, approach, node_x, vehicles):
+            # Only a through vehicle the waiting turner would actually sweep
+            # is held; the other lanes keep flowing.
+            waiting = node.left_turn_waiting[approach][0]
+            if self._corner_sweep_conflict(vehicle, movement, waiting, "LEFT"):
+                return ("STARVED", None)
+        for reservation in node.reservations.values():
+            if self._vehicle_blocks_entry(
+                approach, movement, reservation["vehicle"],
+                reservation["approach"], reservation["movement"], node_x,
+                entry_vehicle=vehicle,
+            ):
+                return (reservation["approach"], reservation["movement"])
+        # Protect against an unregistered vehicle placed inside the box by a
+        # test, reset, or legacy caller.
+        for other in vehicles or []:
+            if other is vehicle or not self.vehicle_occupies_intersection(other, node_x):
+                continue
+            other_approach = self._approach_for_vehicle(other, node_x)
+            other_movement = self._movement_for_vehicle(other, node_x)
+            if self._vehicle_blocks_entry(
+                approach, movement, other, other_approach, other_movement, node_x,
+                entry_vehicle=vehicle,
+            ):
+                return (other_approach, other_movement)
+        return None
+
     def request_intersection_entry(self, vehicle, node_x, vehicles):
         """Reserve a movement before a vehicle crosses the stop bar."""
         node = self.nodes.get(node_x)
@@ -1451,45 +1627,11 @@ class SignalController:
 
         approach = vehicle.direction
         movement = self._movement_for_vehicle(vehicle, node_x)
-        if self.discharge_active:
-            if (
-                self.discharge_state != DISCHARGE_ACTIVE
-                or self._discharge_green_map.get(node_x) != approach
-            ):
-                return False
-        if movement == "STRAIGHT" and self._left_turn_starved(node, approach, node_x, vehicles):
+        blocker = self._entry_blocker(vehicle, node, node_x, vehicles)
+        if blocker is not None:
+            if movement == "LEFT" and blocker[0] == approach:
+                node.left_turn_waiting.setdefault(approach, (vehicle, self.frame_number))
             return False
-        for reservation in node.reservations.values():
-            if self._vehicle_blocks_entry(
-                approach,
-                movement,
-                reservation["vehicle"],
-                reservation["approach"],
-                reservation["movement"],
-                node_x,
-            ):
-                if movement == "LEFT" and reservation["approach"] == approach:
-                    node.left_turn_waiting.setdefault(approach, (vehicle, self.frame_number))
-                return False
-
-        # Protect against an unregistered vehicle placed inside the box by a
-        # test, reset, or legacy caller.
-        for other in vehicles or []:
-            if other is vehicle or not self.vehicle_occupies_intersection(other, node_x):
-                continue
-            other_approach = self._approach_for_vehicle(other, node_x)
-            other_movement = self._movement_for_vehicle(other, node_x)
-            if self._vehicle_blocks_entry(
-                approach,
-                movement,
-                other,
-                other_approach,
-                other_movement,
-                node_x,
-            ):
-                if movement == "LEFT" and other_approach == approach:
-                    node.left_turn_waiting.setdefault(approach, (vehicle, self.frame_number))
-                return False
 
         if movement == "LEFT":
             node.left_turn_waiting.pop(approach, None)
@@ -1526,6 +1668,15 @@ class SignalController:
         # or in _left_turn_starved once the vehicle is gone or through.
         if node is not None:
             node.reservations.pop(id(vehicle), None)
+        # A released booking leaves no movement behind while the vehicle is
+        # still short of the box: the next request must be judged on what it
+        # does now (a missed turn goes straight), not on the old booking. In
+        # the box the stored movement is what identifies a turn mid-pivot.
+        if hasattr(vehicle, "is_front_bumper_upstream") and vehicle.is_front_bumper_upstream(
+            node_x, H_Y, ROAD_W, STOP
+        ):
+            getattr(vehicle, "intersection_entry_movements", {}).pop(node_x, None)
+            getattr(vehicle, "intersection_entry_approaches", {}).pop(node_x, None)
 
     def distance_to_node_stop_bar(self, vehicle, node_x):
         return vehicle.distance_to_node_stop_bar(
@@ -1549,6 +1700,13 @@ class SignalController:
             return False
         leg = bus.get_active_route_leg(INT_X)
         if not leg or leg["node_x"] != target_node:
+            return False
+        # Near-side stop: priority check-in waits until the bus has served
+        # it. A request raised before the dwell would spend the green on a
+        # standing bus -- why TSP deployments detect buses downstream of a
+        # near-side stop (FTA/ITS America, Transit Signal Priority: A Planning
+        # and Implementation Handbook, 2005).
+        if getattr(bus, "near_side_stop_pending", None) == target_node:
             return False
         dist = self.distance_to_node_stop_bar(bus, target_node)
         return 0 <= dist <= self.get_priority_eligibility_px()
@@ -1936,15 +2094,13 @@ class SignalController:
     def _extension_is_feasible(self, request, node_x, cap):
         """Arrival-time gate on an extension, the twin of the early-green
         gate: the bus must be predicted to cross the stop bar within the cap
-        (ETA at its current speed, the shared estimator). Otherwise the green
+        (unimpeded ETA, the shared estimator vehicle.bus_eta_frames). Otherwise the green
         is held for a bus that still meets the red at the end of it -- the
         cross street pays the whole cap for nothing -- so the green ends on
         time and the request stays armed for an early green instead. A bus
         that then crosses untreated finishes DENIED with this reason."""
         bus = request.bus
-        eta = eta_frames_to_stop_bar(
-            self.distance_to_node_stop_bar(bus, node_x), bus.speed
-        )
+        eta = bus_eta_frames(bus, self.distance_to_node_stop_bar(bus, node_x))
         if eta > cap:
             request.tsp_gate_reason = TSP_DENY_ETA_WINDOW
             return False
@@ -1968,9 +2124,7 @@ class SignalController:
             request.tsp_gate_reason = TSP_DENY_NET_BENEFIT
             return False
         bus = request.bus
-        eta = eta_frames_to_stop_bar(
-            self.distance_to_node_stop_bar(bus, node_x), bus.speed
-        )
+        eta = bus_eta_frames(bus, self.distance_to_node_stop_bar(bus, node_x))
         earliest_green = (target_end - node.timer) + clearance
         latest_useful = earliest_green + self.get_green_time(
             node_x, self._phase_for_approach(request.originating_approach)
@@ -1992,10 +2146,11 @@ class SignalController:
         # The cut is cap-sized and the ARRIVAL WINDOW gates it
         # (_early_green_is_feasible), deliberately: sizing the cut to the ETA
         # point estimate was tried on 2026-09-22 and regressed T1/T2, because
-        # eta_frames_to_stop_bar reads the bus's INSTANTANEOUS speed and so
-        # runs long for a bus that is still accelerating -- a near bus then
-        # yields cut == 0 and never gets its early green. Fix the estimator
-        # before sizing anything from it.
+        # the estimator then read the bus's INSTANTANEOUS speed and so ran
+        # long for a bus that was still accelerating -- a near bus yielded
+        # cut == 0 and never got its early green. Under IDM the shared
+        # estimator (vehicle.bus_eta_frames) is now the unimpeded kinematic
+        # arrival time; re-measure before sizing the cut from it.
         shortened = max(self.min_green_frames, green - cap)
         target_end = max(node.timer + 1, shortened)
         cut = green - target_end
@@ -2078,6 +2233,10 @@ class SignalController:
             self._collect_priority_requests(vehicles)
             for node_x, node in self.nodes.items():
                 self._priority_update(node_x, node, vehicles)
+        if self.coordination:
+            for node_x, node in self.nodes.items():
+                if node.phase == 0 and node.timer == 0:
+                    self._coordinate(node_x, node)
         self._publish_discharge_status()
 
     def get_experiment_metrics(self):

@@ -99,6 +99,59 @@ GROK_TIMEOUT_SECONDS = 30.0
 # openai SDK and the same call path as OpenAI, pointed at a different host.
 GROK_BASE_URL = "https://api.x.ai/v1"
 OLLAMA_TIMEOUT_SECONDS = 45.0
+# CPU split with the simulator on the same machine. Ollama defaults to one
+# inference thread per physical core, so a model that does not fit in VRAM
+# and spills layers to the CPU takes every core, and the simulator's single
+# thread -- whose 60 Hz step sets the pace every latency figure depends on --
+# is time-sliced against it. Leave SIM_RESERVED_CORES physical cores to the
+# simulator (its thread, Tk, the agent and the OS); main raises its own
+# priority as well. OLLAMA_NUM_THREAD in the environment overrides.
+SIM_RESERVED_CORES = 2
+
+
+def ollama_num_thread():
+    override = os.environ.get("OLLAMA_NUM_THREAD", "").strip()
+    if override.isdigit() and int(override) > 0:
+        return int(override)
+    # ponytail: assumes 2-way SMT (Ryzen, non-hybrid Intel); on a hybrid
+    # P/E-core CPU set OLLAMA_NUM_THREAD instead.
+    physical = max(1, (os.cpu_count() or 2) // 2)
+    return max(1, physical - SIM_RESERVED_CORES)
+
+
+OLLAMA_NUM_THREAD = ollama_num_thread()
+
+# One context window for every local model. Ollama sizes the window from the
+# model's own maximum when none is given -- 65,536 tokens for llama3.2:3b,
+# a 10 GB allocation that put 42 % of the model on the CPU of an 8 GB GPU,
+# where it competed with the simulator; at 8,192 the same model is 3.1 GB and
+# 100 % GPU (2026-09-23, Ollama 0.34). The turn prompt is 2.2-3.0k tokens and
+# a reasoning model's answer up to ~2.3k, so 8k holds both; a fixed window
+# also means every arm decides with the same context.
+OLLAMA_NUM_CTX = 8192
+# A prompt that fills the window is truncated by Ollama without an error, and
+# a model answering a cut-off prompt still emits valid JSON. Fail closed.
+OLLAMA_CONTEXT_MARGIN_TOKENS = 256
+_MODEL_CONTEXT_TOKENS = {}
+
+
+def model_context_tokens(client, model):
+    """The window Ollama actually gives ``model``: OLLAMA_NUM_CTX, capped at
+    the model's own maximum (orca-mini:7b has 4,096), read once per model."""
+    if model not in _MODEL_CONTEXT_TOKENS:
+        native = None
+        try:
+            info = client.show(model)
+            model_info = getattr(info, "modelinfo", None) or {}
+            native = min(
+                (int(v) for k, v in model_info.items()
+                 if k.endswith(".context_length") and "original" not in k),
+                default=None,
+            )
+        except Exception:
+            native = None
+        _MODEL_CONTEXT_TOKENS[model] = min(OLLAMA_NUM_CTX, native or OLLAMA_NUM_CTX)
+    return _MODEL_CONTEXT_TOKENS[model]
 _GEMINI_CLIENT = None
 _GEMINI_CALL_LOCK = threading.Lock()
 _OPENAI_CLIENT = None
@@ -665,7 +718,13 @@ def load_save(state: AgentState) -> dict:
         return {"telemetry": telemetry, "status": "STALE"}
     if age > STALE_SECONDS:
         return {"telemetry": telemetry, "status": "STALE"}
-    return {"telemetry": telemetry, "status": "OK"}
+    loaded = {"telemetry": telemetry, "status": "OK"}
+    # The frame this turn is decided on: main measures the control delay
+    # from it to the frame the decision takes effect.
+    frame = _telemetry_frame_number(telemetry)
+    if frame is not None:
+        loaded["telemetry_frame"] = frame
+    return loaded
 
 
 def _route_after_load(state: AgentState) -> str:
@@ -1205,7 +1264,11 @@ def _call_ollama(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": minimap},
         ],
-        "options": {"temperature": 0.2},
+        "options": {
+            "temperature": 0.2,
+            "num_thread": OLLAMA_NUM_THREAD,
+            "num_ctx": OLLAMA_NUM_CTX,
+        },
     }
 
     result_queue = queue.Queue(maxsize=1)
@@ -1254,6 +1317,13 @@ def _call_ollama(
         "eval_duration_ns": response.get("eval_duration"),
         "total_duration_ns": response.get("total_duration"),
     }
+    prompt_tokens = metrics["input_tokens"] or 0
+    window = model_context_tokens(client, model)
+    if prompt_tokens >= window - OLLAMA_CONTEXT_MARGIN_TOKENS:
+        raise RuntimeError(
+            f"prompt used {prompt_tokens} of the {window}-token context: "
+            "it may have been truncated, so the decision is not trusted"
+        )
     return content, metrics
 
 

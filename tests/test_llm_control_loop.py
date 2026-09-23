@@ -522,6 +522,33 @@ def test_fresh_decision_applies(tmp_path, monkeypatch):
     assert control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] is True
 
 
+def test_control_delay_is_measured_on_the_sim_clock(tmp_path, monkeypatch):
+    """Snapshot frame -> first frame the decision takes effect, in sim
+    seconds: not wall latency x pace, and not re-stamped by later merges."""
+    now = 1_900_000_000.0
+    monkeypatch.setattr(main.time, "time", lambda: now)
+    monkeypatch.setitem(control_panel.global_config, "ai_runtime", {"tick_seconds": 5})
+    monkeypatch.setitem(main.run_metrics, "decision_applied", {})
+    decision_path = tmp_path / "decision.json"
+    decision_path.write_text(json.dumps({
+        "run_uuid": RUN_ID, "timestamp": now, "status": "OK", "turn": 3,
+        "telemetry_frame": 940, "flags": valid_flags(tsp_route="R1_EB_A_NB"),
+    }), encoding="utf-8")
+
+    monkeypatch.setitem(main._current_frame, "n", 1000)
+    assert main.merge_ai_decision(decision_path)
+    monkeypatch.setitem(main._current_frame, "n", 1030)
+    assert main.merge_ai_decision(decision_path)     # same turn, merged again
+
+    assert main.run_metrics["decision_applied"] == {3: (940, 1000)}
+    assert main._control_delay_columns() == {
+        "decisions_applied": 1,
+        "control_delay_sim_sec_median": 1.0,
+        "control_delay_sim_sec_p95": 1.0,
+    }
+    assert main._applied_columns(3) == [1000, 1.0]
+
+
 def test_stale_decision_held_all_off(tmp_path, monkeypatch):
     now = 1_900_000_000.0
     monkeypatch.setattr(main.time, "time", lambda: now)
@@ -1138,7 +1165,10 @@ def test_agent_call_is_single_network_call_and_guarded(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0]["model"] == "test-model"
-    assert calls[0]["options"] == {"temperature": 0.2}
+    # num_thread leaves SIM_RESERVED_CORES physical cores to the simulator.
+    assert calls[0]["options"] == {
+        "temperature": 0.2, "num_thread": agent.OLLAMA_NUM_THREAD, "num_ctx": agent.OLLAMA_NUM_CTX,
+    }
     assert calls[0]["format"] == agent.OLLAMA_OUTPUT_FORMAT
     assert calls[0]["messages"][1]["content"] == "whole network"
     assert guarded["decision"]["status"] == "OK"
@@ -2284,3 +2314,48 @@ def test_the_tick_floor_matches_the_agent_call_timeouts():
     assert control_panel.DEFAULT_TICK_SECONDS <= control_panel.TICK_SECONDS_MAX
     # Both decision paths ship at the floor, not just the Single Run card.
     assert control_panel.DEFAULT_BATCH_RUNTIME["tick_seconds"] == control_panel.DEFAULT_TICK_SECONDS
+
+
+def test_ollama_leaves_physical_cores_to_the_simulator(monkeypatch):
+    monkeypatch.delenv("OLLAMA_NUM_THREAD", raising=False)
+    monkeypatch.setattr(agent.os, "cpu_count", lambda: 16)     # 8 physical, 2-way SMT
+    assert agent.ollama_num_thread() == 8 - agent.SIM_RESERVED_CORES
+    monkeypatch.setattr(agent.os, "cpu_count", lambda: 2)
+    assert agent.ollama_num_thread() == 1                        # never zero
+    monkeypatch.setenv("OLLAMA_NUM_THREAD", "3")
+    assert agent.ollama_num_thread() == 3                        # hybrid-CPU override
+
+
+def test_a_prompt_that_fills_the_context_window_fails_closed(monkeypatch):
+    """Ollama truncates an over-long prompt silently and the model still
+    answers valid JSON; the call must not be trusted."""
+    def fake_chat(**kwargs):
+        return {
+            "message": {"content": json.dumps(positional_output(tsp_route="R2_EB_B_NB"))},
+            "prompt_eval_count": agent.OLLAMA_NUM_CTX - 10,
+        }
+
+    monkeypatch.setattr(agent, "ollama", SimpleNamespace(chat=fake_chat))
+    monkeypatch.setattr(agent, "_OLLAMA_CLIENT", None)
+    state = agent_state(minimap="whole network", turn=9)
+    update = agent.ai_turn(state)
+    guarded = agent.anti_cheat({**state, **update})
+    assert guarded["decision"]["status"] == "HELD_ALL_OFF"
+    assert not any(route["tsp"] for route in guarded["decision"]["flags"].values())
+
+
+def test_the_truncation_guard_uses_the_models_own_smaller_window(monkeypatch):
+    """A model whose native context is below OLLAMA_NUM_CTX is capped there by
+    Ollama, so a prompt that fits 8k can still be truncated."""
+    class Client:
+        def show(self, model):
+            return SimpleNamespace(modelinfo={"llama.context_length": 4096})
+        def chat(self, **kwargs):
+            return {"message": {"content": json.dumps(positional_output(tsp_route="R2_EB_B_NB"))},
+                    "prompt_eval_count": 4000}
+    monkeypatch.setattr(agent, "_OLLAMA_CLIENT", Client())
+    monkeypatch.setattr(agent, "_MODEL_CONTEXT_TOKENS", {})
+    assert agent.model_context_tokens(agent._OLLAMA_CLIENT, "small-ctx") == 4096
+    state = agent_state(minimap="whole network", turn=10, model="small-ctx")
+    guarded = agent.anti_cheat({**state, **agent.ai_turn(state)})
+    assert guarded["decision"]["status"] == "HELD_ALL_OFF"

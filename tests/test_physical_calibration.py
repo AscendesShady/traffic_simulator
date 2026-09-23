@@ -52,7 +52,7 @@ def test_one_physical_scale_and_the_legacy_numbers_the_audit_measured():
     # The legacy ramp and slide really are 45 m/s^2 and 7.5 m/s: not calibrated.
     assert vm.px_per_frame2_to_mps2(vm.LEGACY_ACCEL_PX_PER_FRAME2) == 45.0
     assert vm.px_per_frame_to_mps(vm.LANE_CHANGE_STEP_PX) == 7.5
-    assert vm.movement_model() == vm.MOVEMENT_MODEL_LEGACY           # default
+    assert vm.movement_model() == vm.MOVEMENT_MODEL_IDM              # default
     with pytest.raises(ValueError):
         vm.set_movement_model("krauss")
 

@@ -50,9 +50,10 @@ def test_far_node_left_goes_straight_through_a_and_turns_north_at_b():
 def test_double_left_from_south_of_b_exits_south_of_a():
     car = Vehicle(LANES["B_NB"][2], HEIGHT + 20, "NB", max_speed=1.0,
                   lane_index=DBL_LANE_INDEX, assigned_node_x=NODE_B, left_nodes=(NODE_B, NODE_A))
-    # Permissive lefts need no green, only a free box; NS gets the green here.
-    controller = SignalController({"green_time": 100000}, 60, 60)
-    controller.phase = 3
+    # Near-side turns run with their green (left-hand traffic, no turn on
+    # red): the first left needs NS green at B, the second EW green at A, so
+    # the signals cycle.
+    controller = SignalController({"green_time": 300}, 60, 60)
     direction, x, y = drive(car, 8000, controller)
     assert direction == "SB" and y > HEIGHT
     assert abs(x - (NODE_A + 2.5 * LANE)) < 1
@@ -62,8 +63,7 @@ def test_double_left_from_south_of_b_exits_south_of_a():
 def test_double_left_from_north_of_a_exits_north_of_b():
     car = Vehicle(LANES["A_SB"][2], -20, "SB", max_speed=1.0,
                   lane_index=DBL_LANE_INDEX, assigned_node_x=NODE_A, left_nodes=(NODE_A, NODE_B))
-    controller = SignalController({"green_time": 100000}, 60, 60)
-    controller.phase = 3
+    controller = SignalController({"green_time": 300}, 60, 60)
     direction, x, y = drive(car, 8000, controller)
     assert direction == "NB" and y < 0
     assert abs(x - (NODE_B - 2.5 * LANE)) < 1
@@ -105,3 +105,38 @@ def test_single_node_approaches_never_get_a_second_option():
         main.try_spawn_vehicle(vehicles, "A_NB", "NB", HEIGHT + 20, LANES["A_NB"], cfg, min_gap=0)
     assert vehicles and all(v.left_nodes == (NODE_A,) for v in vehicles)
     main.reset_all_spawner_states()
+
+
+def test_a_far_node_left_positions_for_its_turn_right_after_the_near_node():
+    """Two lane changes do not fit in the last TURN_LANE_MERGE_PX of a queued
+    link: once past its first node, a far-node left starts moving across."""
+    from src.core.vehicle import TURN_LANE_MERGE_PX
+    car = Vehicle(NODE_A + 200, LANES["EB"][0], "EB", lane_index=0, left_nodes=(NODE_B,))
+    car.target_turn = "LEFT"
+    far = TURN_LANE_MERGE_PX + 300
+    assert not car.positions_for_turn(far)          # still before any node
+    car.passed_nodes.add(NODE_A)
+    assert car.positions_for_turn(far)              # on the link to its turning node
+    assert not car.needs_turn_lane(far)             # DBL eviction exemption unchanged
+
+
+def test_a_left_turner_stuck_out_of_its_lane_takes_the_missed_turn():
+    """Held at the bar in lane 0 with lane 2 occupied, it goes straight after
+    MISSED_TURN_HOLD_FRAMES instead of blocking the through lane for good."""
+    from src.core import vehicle as V
+    bar = NODE_A - ROAD_W / 2 - STOP
+    car = Vehicle(bar - 30, LANES["EB"][0], "EB", max_speed=1.0, lane_index=0, left_nodes=(NODE_A,))
+    blockers = [Vehicle(bar - 30 - i * 30, LANES["EB"][lane], "EB", max_speed=1.0, lane_index=lane)
+                for lane in (1, 2) for i in range(3)]
+    for b in blockers:
+        b.speed = 0.0
+    vehicles = [car] + blockers
+    controller = SignalController({"green_time": 100000}, 60, 60)
+    before = V.SAFETY_COUNTERS["missed_turns"]
+    for _ in range(V.MISSED_TURN_HOLD_FRAMES + 900):
+        controller.update(vehicles)
+        car.update(controller.get_all_signals(INT_X), INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
+        if NODE_A in car.passed_nodes:
+            break
+    assert V.SAFETY_COUNTERS["missed_turns"] == before + 1
+    assert NODE_A in car.passed_nodes and car.direction == "EB"   # straight through A

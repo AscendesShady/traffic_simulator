@@ -277,7 +277,10 @@ def test_auto_selects_blocker_draining_plan():
     assert controller.current_discharge_stage.label == "Node B downstream"
     assert_exclusive_greens(controller.get_all_signals(), {NODE_B: "EB"})
 
-    for _ in range(120):
+    # Both start standing, 9.5 px apart (under the 3 m minimum gap): the car
+    # has to pull away first and the bus follows at a bus's ~1.2 m/s^2, so
+    # clearing the box takes several seconds, not the 2 s a 45 m/s^2 ramp did.
+    for _ in range(420):
         signals = controller.get_all_signals()
         for vehicle in vehicles:
             vehicle.update(

@@ -200,6 +200,7 @@ def test_test_autoexports_with_correct_filename(tmp_path, monkeypatch):
         "Bus Events",
         "Unit Conversions",
         "Experiment Summary",
+        "Trip Info",  # one record per vehicle (SUMO tripinfo)
     ]
     # The benchmark file records the exact configuration that produced it.
     inputs = workbook["Control Panel Inputs"]

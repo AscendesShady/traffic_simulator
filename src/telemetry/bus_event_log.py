@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 from src.ui import canvas_gemini as canvas
-from src.core.vehicle import Bus, eta_frames_to_stop_bar
+from src.core.vehicle import Bus, bus_eta_frames, eta_frames_to_stop_bar
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -295,7 +295,7 @@ class BusEventTracker:
     ):
         """Freeze the pre-treatment arrival state used for matched TSP analysis."""
         node["eta_frames_at_decision"] = round(
-            eta_frames_to_stop_bar(distance, getattr(bus, "speed", 0.0)), 2
+            bus_eta_frames(bus, distance), 2
         )
         node["queue_ahead_veh"] = self._queue_ahead_count(
             bus, node_x, vehicles
@@ -321,11 +321,7 @@ class BusEventTracker:
             ) or bool(signal_controller.is_bus_tsp_eligible(bus, node_x))
         except Exception:
             colour = None
-        unrestricted_left = getattr(bus, "target_turn", "STRAIGHT") == "LEFT"
-        node["would_have_stopped"] = bool(
-            node["queue_ahead_veh"]
-            or (not unrestricted_left and colour != "GREEN")
-        )
+        node["would_have_stopped"] = bool(node["queue_ahead_veh"] or colour != "GREEN")
 
     @staticmethod
     def _eligibility_px(signal_controller):

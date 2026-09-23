@@ -220,6 +220,17 @@ def snapshot_warmup_baseline(master_frame_count):
 # (offer frame, fingerprint) per exogenous arrival, in draw order. Not a
 # rolling digest: see _demand_draw_hash_hex.
 _demand_draw_state = {"offers": []}
+
+# Wall-clock seconds this run has actually spent running (not paused, not
+# calibrating), accumulated by the Tk loop. Divided into the sim clock it
+# gives sim_seconds_per_wall_second: the ratio the agent's latency
+# arithmetic silently assumes is 1.0. decision_lag_seconds measures a model
+# call in wall time and eta_at_decision_land subtracts it from a sim-time
+# ETA, so at any other ratio every arm plans with the wrong horizon -- and
+# the error scales with the ratio, which varies with machine load and with
+# how much CPU a local model is taking. Headless leaves this at zero (it is
+# not paced against a clock) and the column is then empty.
+_pace_state = {"wall_seconds": 0.0}
 DEMAND_MODEL_SIGNATURE = "per_source_streams_queued_v2"
 VEHICLE_COLORS = [(50, 150, 250), (250, 100, 50), (250, 200, 50), (150, 50, 250), (50, 200, 150)]
 
@@ -1557,7 +1568,7 @@ def write_unit_conversions_sheet(sheet, telemetry=None):
 
 # Bumped whenever a column is added/removed/redefined. append_experiment_summary_row
 # rotates the CSV (never appends ragged) when either this or config_hash changes.
-EXPERIMENT_SUMMARY_SCHEMA_VERSION = 7
+EXPERIMENT_SUMMARY_SCHEMA_VERSION = 8
 
 # PRIMARY DV: total_person_hours_travel_delay_steady, compared as a paired
 # per-seed difference against the baseline arm (pair_against_baseline ->
@@ -1590,7 +1601,8 @@ EXPERIMENT_SUMMARY_HEADERS = (
     "yellow_time_frames", "red_clearance_time_frames",
     "lost_time_sec", "min_cycle_sec", "discharge_selection",
     "measured_saturation_flow_veh_per_hr", "bus_occupancy_pax", "demand_model",
-    "demand_draw_hash", "export_frame", "sampling_params_json",
+    "demand_draw_hash", "export_frame", "sim_seconds_per_wall_second",
+    "sampling_params_json",
     # Throughput
     "passengers_served_total", "passengers_served_bus", "passengers_served_car",
     "buses_served", "cars_served", "pax_per_min",
@@ -2215,6 +2227,19 @@ def _run_export_assertions(row, schedule):
         raise ExportAssertionError("; ".join(problems))
 
 
+# How far the achieved pace may drift from 1.0 before an arm's wall-clock
+# decision latency stops describing its sim-time control delay.
+PACE_TOLERANCE = 0.02
+
+
+def _achieved_pace(sim_seconds):
+    """Sim seconds advanced per wall second of running, or None headless."""
+    wall = float(_pace_state.get("wall_seconds", 0.0) or 0.0)
+    if wall <= 0.0 or sim_seconds <= 0.0:
+        return None
+    return round(sim_seconds / wall, 4)
+
+
 def build_experiment_summary_row(
     checkpoint_sim_seconds, workbook_filename=None, actual_sim_seconds=None
 ):
@@ -2424,6 +2449,11 @@ def build_experiment_summary_row(
         # the loop breaks on the boundary; recorded so an overshoot is
         # visible instead of silently moving a fingerprint again.
         "export_frame": int(round(float(actual_sim_seconds or checkpoint_seconds) * 60.0)),
+        # Achieved pace. Must be 1.0 for the arm's decision latency to mean
+        # what the agent assumes it means (see _pace_state). Empty headless.
+        "sim_seconds_per_wall_second": _achieved_pace(
+            float(actual_sim_seconds or checkpoint_seconds)
+        ),
         "sampling_params_json": _sampling_params_json(config),
         "passengers_served_total": total_served,
         "passengers_served_bus": bus_pax_served,
@@ -3027,12 +3057,30 @@ def print_campaign_summary(campaign_id):
     hashes = {row.get("config_hash") for row in rows}
     not_converged = [f"{r['model']}/{r['seed']}" for r in rows if r.get("converged") != "True"]
     noop = [f"{r['model']}/{r['seed']}" for r in rows if r.get("is_noop") == "True"]
+    paces = [
+        (f"{r['model']}/{r['seed']}", float(r["sim_seconds_per_wall_second"]))
+        for r in rows
+        if str(r.get("sim_seconds_per_wall_second") or "").strip()
+        not in ("", "None")
+    ]
+    off_pace = [
+        f"{name} {pace:.3f}" for name, pace in paces
+        if abs(pace - 1.0) > PACE_TOLERANCE
+    ]
     lines = [
         f"=== BATCH DONE: campaign {campaign_id} -- {len(rows)} run(s) ===",
         f"config_hash: {'ONE (' + hashes.pop() + ')' if len(hashes) == 1 else 'MULTIPLE ' + str(sorted(hashes)) + ' -- NOT one campaign'}",
         f"not converged: {len(not_converged)} {not_converged if not_converged else ''}",
         f"no-op arms (decisions_effective == 0): {len(noop)} {noop if noop else ''}",
         f"git_dirty rows: {sum(1 for r in rows if r.get('git_dirty') == 'True')}",
+        # A run that could not hold 1.0 did not measure the control delay
+        # its latency columns claim: the agent times a model call on the
+        # wall clock and spends it against the simulation clock.
+        (
+            f"achieved pace off 1.0 by >{PACE_TOLERANCE:.0%}: {len(off_pace)} {off_pace}"
+            if off_pace else
+            f"achieved pace: all {len(paces)} run(s) within {PACE_TOLERANCE:.0%} of 1.0"
+        ),
     ]
     pairs, unpaired, mismatched = pair_against_baseline(rows)
     if pairs:
@@ -3443,6 +3491,7 @@ def reset_traffic_generation():
     described "calibration draws plus the run" rather than the run.
     """
     _demand_draw_state["offers"].clear()
+    _pace_state["wall_seconds"] = 0.0
     vehicle_module.reset_vehicle_serials()
     reset_all_spawner_states()
     # Freeze motion tuning for the episode. Slider changes made during a run
@@ -4944,7 +4993,11 @@ def main():
         nonlocal master_frame_count, time_accumulator, last_wall_time
 
         now = time.monotonic()
-        elapsed = min(max(0.0, now - last_wall_time), max_catchup_seconds)
+        # Real wall time for the pace measurement; the physics accumulator
+        # gets the clamped value, because a desktop stall it could never
+        # replay is still wall time the run spent.
+        wall_since_last = max(0.0, now - last_wall_time)
+        elapsed = min(wall_since_last, max_catchup_seconds)
         last_wall_time = now
         run_just_reset = False
 
@@ -4959,6 +5012,7 @@ def main():
             control_panel.global_config["start_requested"] = False
             control_panel.write_ai_control()
             run_just_reset = True
+            last_wall_time = time.monotonic()
         elif control_panel.global_config["reset_triggered"]:
             master_frame_count = perform_full_reset(vehicles, signals, telemetry)
             time_accumulator = 0.0
@@ -4966,6 +5020,7 @@ def main():
             # both session logs so the next benchmark run is isolated.
             control_panel.global_config["reset_triggered"] = False
             run_just_reset = True
+            last_wall_time = time.monotonic()
 
         sim_speed = control_panel.global_config.get("sim_speed", 1.0)
         is_running = control_panel.global_config.get("is_running", False)
@@ -4973,6 +5028,7 @@ def main():
 
         if is_running and not is_paused and not run_just_reset:
             time_accumulator += elapsed * sim_speed
+            _pace_state["wall_seconds"] += wall_since_last
 
             # FIXED TIMESTEP LOOP: Physics, Signals, Spawners run exactly at 60Hz intervals
             steps_this_callback = 0

@@ -133,3 +133,51 @@ def test_cross_street_counters_use_serials_not_addresses():
     assert all(isinstance(v, int) for v in counted)
     # Serials are small ordinals; raw id() values are machine addresses.
     assert not counted or max(counted) < 10 ** 6
+
+
+def test_achieved_pace_is_reported_and_is_none_when_unpaced():
+    """sim_seconds_per_wall_second is the check that an arm's wall-clock
+    decision latency describes its sim-time control delay: the agent times a
+    call with time.time() and eta_at_decision_land spends it against a
+    sim-time ETA, which is only the same thing at a ratio of 1.0."""
+    assert "sim_seconds_per_wall_second" in main.EXPERIMENT_SUMMARY_HEADERS
+
+    main._pace_state["wall_seconds"] = 0.0
+    assert main._achieved_pace(900.0) is None       # headless: never paced
+
+    main._pace_state["wall_seconds"] = 900.0
+    assert main._achieved_pace(900.0) == 1.0
+    main._pace_state["wall_seconds"] = 1800.0
+    assert main._achieved_pace(900.0) == 0.5        # the campaign's real pace
+    main._pace_state["wall_seconds"] = 0.0
+
+
+def test_a_run_resets_the_pace_accumulator():
+    main._pace_state["wall_seconds"] = 123.0
+    _reset()
+    assert main._pace_state["wall_seconds"] == 0.0
+
+
+def test_the_tk_loop_measures_unclamped_wall_time():
+    """The physics accumulator clamps to max_catchup_seconds because it can
+    never replay a desktop stall, but that stall is still wall time the run
+    spent: measuring the clamped value would report a pace the run did not
+    achieve."""
+    import inspect
+
+    source = inspect.getsource(main.main)
+    assert "wall_since_last = max(0.0, now - last_wall_time)" in source
+    assert "elapsed = min(wall_since_last, max_catchup_seconds)" in source
+    assert '_pace_state["wall_seconds"] += wall_since_last' in source
+
+
+def test_a_reset_does_not_charge_its_setup_to_the_runs_pace():
+    """perform_full_reset runs the calibration synchronously inside the tick,
+    after the wall clock was stamped, so the next tick would measure from
+    before the reset and bill the run for setup it never simulated. A live
+    90 s benchmark read 0.963 until the stamp was taken again."""
+    import inspect
+
+    source = inspect.getsource(main.main)
+    reset_branches = source.count("run_just_reset = True\n            last_wall_time = time.monotonic()")
+    assert reset_branches == 2, "both START and RESET must re-stamp"

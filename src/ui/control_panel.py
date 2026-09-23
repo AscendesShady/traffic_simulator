@@ -164,14 +164,20 @@ DISCHARGE_OPTIONS = (
 BATCH_BASELINE_LABEL = "None (baseline)"
 
 # The largest hard call timeout agent.py imposes on any provider
-# (agent.OLLAMA_TIMEOUT_SECONDS; the API providers are 30 s). A turn can
-# never take longer than this, so a tick above it is the one interval at
-# which NO arm skips a grid point -- and the decision schedule has to be
-# one fixed interval across every arm for the paired DV to mean anything.
-# tests/test_llm_control_loop.py pins this to agent.py's own constants.
+# (agent.OLLAMA_TIMEOUT_SECONDS; the API providers are 30 s): the most one
+# stuck call can cost is ceil(ceiling / tick) grid points, skipped and
+# counted. tests/test_llm_control_loop.py pins it to agent.py's constants.
 AGENT_CALL_TIMEOUT_CEILING_SEC = 45
-MIN_UNSKIPPED_TICK_SECONDS = AGENT_CALL_TIMEOUT_CEILING_SEC + 5
-DEFAULT_TICK_SECONDS = 60
+# One decision interval for every arm (the paired DV needs one schedule).
+# It is set by the bus, not by the slowest model: a bus reaches Node A's
+# stop line about 20 s after entering (200 m at 9 m/s) and is in its
+# priority zone the whole way, so 10 s gives it two decision points; 60 s
+# left two buses in three reaching A before any decision had seen them. It
+# must also clear the slowest arm's p95 latency by a margin -- the kept
+# local models answer in 0.7-1.7 s median, 2.0 s worst, at the fixed 8k
+# context (2026-09-23 benchmark) -- and print_campaign_summary flags any
+# arm that skipped more than SKIP_RATE_TOLERANCE of its grid points.
+DEFAULT_TICK_SECONDS = 10
 
 DEFAULT_BATCH_RUNTIME = {
     "active": False,
@@ -187,9 +193,7 @@ DEFAULT_BATCH_RUNTIME = {
     # applies to the single Benchmark Test and to every queued Batch
     # Benchmark run, so an unattended sweep is never silently governed by
     # whatever the Single Run panel happens to be set to.
-    # Defaults to MIN_UNSKIPPED_TICK_SECONDS: one tick must outlast the
-    # agent's own worst-case call timeout or a slow arm spends the run
-    # skipping grid points (campaign 2026-09-22: phi3 issued 118 of 300).
+    # Same default as the Single Run card (DEFAULT_TICK_SECONDS).
     "tick_seconds": DEFAULT_TICK_SECONDS,
 }
 
@@ -2089,7 +2093,7 @@ def create_dashboard_window(parent=None):
 
     tick_value_lbl, tick_slider = add_slider_row(
         ai_body, "Decision interval",
-        f"{int(tick_runtime.get('tick_seconds', 5))}s",
+        f"{int(tick_runtime.get('tick_seconds', DEFAULT_TICK_SECONDS))}s",
         TICK_SECONDS_MIN, TICK_SECONDS_MAX, tick_runtime.get("tick_seconds", DEFAULT_TICK_SECONDS),
         on_tick_seconds_changed,
         step=1, style="Global.Horizontal.TScale",
@@ -2341,7 +2345,7 @@ def create_dashboard_window(parent=None):
 
     batch_tick_value_lbl, batch_tick_slider = add_slider_row(
         test_body, "Decision interval",
-        f"{int(batch_runtime_config.get('tick_seconds', 5))}s",
+        f"{int(batch_runtime_config.get('tick_seconds', DEFAULT_TICK_SECONDS))}s",
         TICK_SECONDS_MIN, TICK_SECONDS_MAX, batch_runtime_config.get("tick_seconds", DEFAULT_TICK_SECONDS),
         on_batch_tick_seconds_changed,
         step=1, style="Global.Horizontal.TScale",

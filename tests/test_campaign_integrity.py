@@ -181,3 +181,14 @@ def test_a_reset_does_not_charge_its_setup_to_the_runs_pace():
     source = inspect.getsource(main.main)
     reset_branches = source.count("run_just_reset = True\n            last_wall_time = time.monotonic()")
     assert reset_branches == 2, "both START and RESET must re-stamp"
+
+
+def test_an_arm_that_skipped_its_decision_points_is_named():
+    """A tick below an arm's latency gives that arm a different decision
+    schedule; the campaign summary names it rather than pair it silently."""
+    rows = [
+        {"model": "fast", "seed": "1", "decision_opportunities": "360", "decisions_skipped_slow": "3"},
+        {"model": "slow", "seed": "1", "decision_opportunities": "360", "decisions_skipped_slow": "90"},
+        {"model": "None", "seed": "1", "decision_opportunities": "0", "decisions_skipped_slow": "0"},
+    ]
+    assert main._arms_skipping_decisions(rows) == ["slow/1 25%"]

@@ -61,7 +61,7 @@ RECENT_DECISION_LIMIT = 5
 DEFAULT_CONTROL = {
     "armed": False,
     "model": "None",
-    "tick_seconds": 5,
+    "tick_seconds": control_panel.DEFAULT_TICK_SECONDS,
     "simulation_running": False,
     "control_mode": "assisted",
 }
@@ -575,7 +575,9 @@ def read_ai_control(path: Path = AI_CONTROL_PATH) -> dict:
             "model": str(payload.get("model", "None")),
             "tick_seconds": min(
                 control_panel.TICK_SECONDS_MAX,
-                max(control_panel.TICK_SECONDS_MIN, int(payload.get("tick_seconds", 5))),
+                max(control_panel.TICK_SECONDS_MIN, int(payload.get(
+                    "tick_seconds", control_panel.DEFAULT_TICK_SECONDS
+                ))),
             ),
             "simulation_running": payload.get("simulation_running") is True,
             "control_mode": (

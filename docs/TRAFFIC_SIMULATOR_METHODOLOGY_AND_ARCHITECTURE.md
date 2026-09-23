@@ -460,16 +460,22 @@ controller does not yet hold a request for, `agent.check_locked` /
 `anti_cheat` keep a locked route's flags as they are, whatever the arm
 returns for it, and the merge itself (`_set_ai_flags`, including the
 all-off of every refusal) skips any route with a live controller request.
-The tick is 2–120 s (`control_panel.TICK_SECONDS_MIN/MAX`, default 60 s;
-50 s is the floor at which no arm can skip, being the longest provider
-call timeout, 45 s, plus a margin): the agent
-skips-and-counts a grid point that comes due while a call is still running
-(`SKIPPED_SLOW`), so a tick below a model's latency measures a
-disconnected loop (Run 8 lost a median 65 of 99 turns at 5 s; r = −0.87
-between median latency and the share of decisions issued). Set the tick
-above the slowest arm's p95 latency -- one decision per signal cycle
-(~50 s) is what a field controller re-plans at -- and record it; the stale
-window follows as 3 × tick.
+The tick is 2–120 s (`control_panel.TICK_SECONDS_MIN/MAX`, a slider on
+both run cards), default **10 s**, one value for every arm. It follows from
+the bus: an entering bus reaches Node A's stop line in about 20 s (200 m at
+9 m/s) and is inside the priority zone throughout, so a 10 s tick gives
+every bus two decision points before Node A, where a 60 s tick left two in
+three reaching it before any decision had seen them. (Route flags are a
+continuous hold, so a long tick does not stop buses being treated; it
+reduces the decider to a once-a-minute route switch.) The tick must also
+clear the slowest arm's p95 latency: the agent skips-and-counts a grid
+point that comes due while a call is still running (`SKIPPED_SLOW`), so a
+tick below a model's latency measures a disconnected loop (Run 8 lost a
+median 65 of 99 turns at 5 s with the slow models of the time; r = −0.87
+between median latency and the share of decisions issued). The kept local
+models answer in 0.7–1.7 s median, 2.0 s worst; the campaign summary names
+any arm that skipped more than 5 % of its points, and one stuck call can
+cost at most ⌈45 s / tick⌉ of them. The stale window follows as 3 × tick.
 
 **Local model selection (2026-09-23).** Each installed Ollama model was run
 through the agent's real turn on five telemetry snapshots (2.2–3.0k-token
@@ -495,7 +501,10 @@ and, for the median bus in the zone, within half of it (median ≤ 11 s).
 | gemma4:12b | 31 % CPU | — | 45 s timeout | 0/1 | dropped: 8.9 GB exceeds VRAM |
 
 With the kept models running, the simulator's frame stayed inside its
-16.67 ms budget at campaign density. Model size alone did not predict speed:
+16.67 ms budget at campaign density. A 50-turn follow-up per kept model gave p95 latencies of 0.89 s
+(llama3.2:3b), 1.76 s (phi3:3.8b), 1.85 s (llama3:latest) and 1.94 s
+(llama3.1:8b), 200/200 valid, frame 11.6–12.9 ms: the 10 s decision tick
+is at least 5× the slowest arm's p95. Model size alone did not predict speed:
 before the context was fixed, phi3:3.8b ran 81 % on the CPU at 16.7 s while
 the older 8B llama3 ran on the GPU at 1.5 s. Re-run the selection if the
 GPU, the Ollama version or the prompt changes.
@@ -505,7 +514,7 @@ GPU, the Ollama version or the prompt changes.
 | **Baseline** (`None`) | No decisions and no treatment: `agent.guard_baseline` turns every turn into `OBSERVATION_ONLY`, the reset clears all route flags, and a summary row showing any decision or TSP treatment raises `BaselineContaminationError` (row refused, batch marked `FAILED`). |
 | **Rule-based** (`rule-based`) | Deterministic conditional TSP: for each approaching bus that would otherwise stop at red and whose receiving lane is free, grant if the cross street's queued passengers < 45 (one bus load, `RULE_CROSS_QUEUE_THRESHOLD_PAX`); score = bus passengers − cross-street passengers; at most 1 grant per node per decision. DBL for every approaching bus unless telemetry reports the lane obstructed or queued. Zero latency by construction. |
 | **Passenger-pressure TSP** (`passenger-pressure-tsp`) | Same DBL rule and per-node cap; TSP granted when the bus approach's pressure (queued passengers upstream plus the bus load, zero if its downstream is blocked) exceeds the conflicting approaches' summed pressure. It is a TSP *gate*, not a phase-selecting max-pressure controller. |
-| **LLM, assisted** (any Ollama tag or Gemini model) | A separate-process LangGraph loop reads the telemetry snapshot every tick (2–120 s, default 60 s), renders a structured text "minimap" (per-node competing queues in passengers, per-route bus positions/ETAs/loads, receiving-lane state, lane obstruction) and asks the model for `{reason, tsp[6], dbl[6]}` with a prompt stating that Webster is the competent baseline, congestion is failure, all-off is often correct, and a bus must remain actionable after expected inference latency. A server-side `anti_cheat` step forces `dbl=False` for any new grant where telemetry shows the lane obstructed. Ollama calls time out at 45 s, Gemini at 30 s (temperature 0.2); a time-out is held all-off, and grid points that come due while the abandoned call still holds the provider are skipped (`SKIPPED_SLOW`), not held. |
+| **LLM, assisted** (any Ollama tag or Gemini model) | A separate-process LangGraph loop reads the telemetry snapshot every tick (2–120 s, default 10 s), renders a structured text "minimap" (per-node competing queues in passengers, per-route bus positions/ETAs/loads, receiving-lane state, lane obstruction) and asks the model for `{reason, tsp[6], dbl[6]}` with a prompt stating that Webster is the competent baseline, congestion is failure, all-off is often correct, and a bus must remain actionable after expected inference latency. A server-side `anti_cheat` step forces `dbl=False` for any new grant where telemetry shows the lane obstructed. Ollama calls time out at 45 s, Gemini at 30 s (temperature 0.2); a time-out is held all-off, and grid points that come due while the abandoned call still holds the provider are skipped (`SKIPPED_SLOW`), not held. |
 | **LLM, decided** (`<model> [decided]`) | `control_mode = "configured"`: the model writes the timing plan itself — per node EW and NS green (clamped 5–90 s), `end_current_green_now`, and four commanded DBL lanes — through the same single writer and identity checks; `SignalController.apply_plan` is the only entry, Webster and the TSP state machine are off, and a commanded lane is shared with left-turners. This arm is a different mechanism and is paired only against the Webster baseline, never against an assisted arm as "decision quality". |
 
 Every AI/rule turn is logged with the exact telemetry snapshot it saw,

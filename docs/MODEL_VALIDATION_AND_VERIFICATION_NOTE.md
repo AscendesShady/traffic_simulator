@@ -208,8 +208,12 @@ each is now covered by a test.
    left its worker holding the call lock and every following turn was
    recorded as a rejected, all-off decision (grok-4.6: 98.6 % "rejects",
    zero effective decisions). *Corrected:* such turns are skipped and
-   counted, and the decision interval defaults above the longest provider
-   timeout.
+   counted, and an arm that skips more than 5 % of its decision points is
+   named in the campaign summary. The decision interval (default 10 s, one
+   value for every arm) is set by the bus — two decision points on its
+   ~20 s approach to the first node — and clears the kept models' measured
+   latency (≤ 2.0 s) by a wide margin; in campaign 2026-09-22 a 3–5 s tick
+   sat below the slow models' 15–17 s latency.
 8. **Unphysical braking was absorbed silently**, including at insertion
    (36 % of IDM hard-braking came from vehicles entering at full speed
    behind a queue) and at conflict refusals inside the booking distance.
@@ -336,9 +340,9 @@ features this model has. No numerical parity is claimed.
 - The legacy engine must not be used for results.
 - LLM arms are non-deterministic across repeats of a seed; only demand,
   behaviour and dwell draws are common.
-- The evidence in §8 was produced headless from the working tree before
-  the fixes were committed; regenerate it from the commit the dissertation
-  cites and quote that `git_sha`.
+- The evidence in §8 was produced headless from commit `3ae7751`; if the
+  dissertation cites a later commit, regenerate it there and quote that
+  `git_sha`.
 
 ## 7a. Questions an examiner is likely to ask
 
@@ -371,23 +375,102 @@ yes: golden-output regression pins two scenarios' complete end state (§3).
 Changing only the update order still moves results, by an amount compared
 with ordinary behavioural noise in §8.
 
-**Why is so much demand held at the boundary?** The side streets store
-about seven cars per lane (56 m). Under heavy demand the queue overflows
-and the wait is charged to the DV (§4.1). Results should be reported at a
-demand level where latent demand is small (§8) or with the latent share
-stated beside them.
+**Why is some demand held at the boundary?** The side streets store
+about seven cars per lane (56 m), so queues can reach the edge of the
+model; that wait is charged to the DV (§4.1), not dropped. At 0.6× the
+campaign demand (Webster Y = 0.70) 8–9 % of offered demand is still waiting
+at the end of a run; at the full campaign demand (Y = 1.17, oversaturated)
+27–32 % is (§8.3). Results are reported at the lower demand, or with the
+latent share beside them. Before the right-of-way corrections of §4.2
+item 11 the same 0.6× demand left 44–50 % outside.
 
-## 8. Measured evidence (validation run, 2026-09-23)
+## 8. Measured evidence (validation runs, 2026-09-23/24)
 
-*Pending.* The validation campaign — two seeds × two demand levels
-(campaign and 0.6×) × baseline and TSP+DBL, 20 min each, plus four
-behavioural realisations and a reversed update order per seed and demand
-level — is being re-run on the model as corrected in §4.2 item 11. Its
-signal timing, calibrated and in-network saturation flow, demand loading
-(served fraction, latent share, GEH), coordination adherence, surrogate-safety
-rates, bus dwell, demand-fingerprint equality and noise floor will be
-reported here. Figures from the run before that correction are superseded
-and are not quoted.
+Headless runs of the code at commit `3ae7751`: seeds 234 and 764; the
+2026-09-22 campaign demand (EB 38, WB 35, A_NB 26, A_SB 29, B_NB 27,
+B_SB 24 veh/min) and 0.6× of it; speed scale 0.6017 (car desired speeds
+32–45 km/h); 20 min per run with a 120 s warm-up; a coordinated-Webster
+baseline and TSP+DBL with every active route's flags held on. The TSP+DBL
+arm is a mechanism check with no decider, not an arm comparison. Figures
+from runs before the correction in §4.2 item 11 are superseded.
+
+**8.1 Signal timing (ITE, MUTCD, HCM).** Yellow 3.0 s and all-red 3.5 s
+(85th-percentile desired speed ≈ 44 km/h, 35.5 m from stop line to far
+box edge); start-up lost time measured on the driving engine 1.78 s (HCM
+default 2.0 s); lost time 12.56 s per cycle. Webster's flow-ratio sum is
+Y = 0.70 at 0.6× demand, giving an 80 s common cycle ("optimal"), and
+Y = 1.17 at campaign demand — oversaturated, so the cycle is held at its
+120 s cap. Node B is offset 18.5 s behind Node A for eastbound progression.
+
+**8.2 Saturation flow.** Calibrated on the driving engine: 1,396
+veh/h/lane (heavy-vehicle mix, 38 km/h mean desired speed; below HCM's
+1,900 base, which assumes cars at higher speed — the calibration test pins
+the cars-only engine to 1,913–1,939 at speed scale 1.0). Measured in the
+running network from 983–1,805 saturation headways per run (HCM Ch. 31
+procedure): 0.96–1.00 of the calibrated value in every run, against a
+0.90 flag threshold. The calibration transfers to the network.
+
+**8.3 Demand loading.** At 0.6× demand 83–85 % of offered vehicles were
+served within the run, 8–9 % of offered demand was still waiting at the
+boundary at the end, the mean entry delay was 25–36 s per vehicle, and
+GEH < 5 held on 83–100 % of sources (maximum 6.2). At campaign demand the
+network is oversaturated by construction: 62–67 % served, 27–32 % latent,
+105–148 s entry delay, GEH < 5 on no source (maximum 14–21). **Results at
+campaign demand must be reported with their latent share; a demand at or
+below 0.6× (Y ≤ 0.8) is the defensible operating point** for comparing
+arms.
+
+**8.4 Coordination.** Error of each coordinated-phase start against the
+master schedule: median 1.2–1.9 s in the baseline and 2.3–6.4 s with
+TSP+DBL (priority moves greens, the transition recovers them), with single
+cycles up to 10–36 s after a priority action or a box that had to clear,
+corrected within the ±20 % per-cycle transition bound.
+
+**8.5 Surrogate safety and recovery layer** (per vehicle-hour, steady
+state): TTC < 1.5 s conflicts 0.33–0.63; braking at the emergency bound
+6.5–10.9 events; motion truncated at a leader or stop line 0.47–1.16;
+missed turns 7–20 per 20-minute run. No vehicle overlap occurs (asserted
+all-pair and swept by the test suite). These are the counted residuals of
+the reservation and square-corner turning abstraction (§7), reported
+rather than hidden.
+
+**8.6 Bus dwell.** Mean 16.3–17.9 s over 39–74 dwells per run, against
+17.25 s expected from the TCQSM parameters (4 s door time plus the longer
+of 3 s × boardings and 2 s × alightings, Poisson mean 4 each).
+
+**8.7 Common random numbers.** The offered-demand fingerprint was
+identical between the arms of every seed and demand level (4 of 4 pairs),
+and behaviour and dwell draws are keyed on each vehicle's and trip's own
+identity, so the arms differ only in treatment.
+
+**8.8 Noise floor and update-order sensitivity.** Four behavioural
+realisations per seed and demand level (7.5 min each, same demand, same
+update order): coefficient of variation 1.3–3.9 % for person-hours of
+delay including entry wait and 1.1–3.2 % for vehicles served. Reversing
+the vehicle update order moved those two measures by less than one
+realisation standard deviation in 6 of 8 cases; in one case (0.6×,
+seed 234) delay moved −12.3 % (4.4 SD) and vehicles served +3.3 %
+(1.8 SD). Car-following perception is order-independent (§3), but
+conflict-box reservations are still granted in update order, and that
+residual can add a seed-specific offset. Update order is identical across
+the arms of a pair, so it does not enter the paired difference directly;
+it is one reason to report paired differences over several seeds rather
+than single runs.
+
+**8.9 Mechanism check.** TSP+DBL against the baseline of the same seed,
+person-hours saved including entry wait: 24.6 and 34.3 at campaign demand,
+83.6 and 87.8 at 0.6× (on-road component 18.5, −7.0, 13.0 and 12.9; the
+rest is bus passengers entering sooner through the reserved lane), at a
+1–2.4-point lower vehicle served fraction. This shows the mechanism acts in
+the expected direction; it is not a result about any decider.
+
+**8.10 Real time and decision latency.** One simulation frame costs
+10.5–11.9 ms at 200–230 vehicles (campaign density, single process)
+against the 16.67 ms budget of a 60 Hz step. The four local models kept for the study answer in
+p95 0.89–1.94 s (50 turns each, 200 of 200 valid, running on the GPU
+beside the simulation), at least 5× inside the 10 s decision interval.
+Each decision's control delay — snapshot to effect — is measured on the
+simulation clock and reported per run.
 
 ## 9. Summary argument
 

@@ -2297,23 +2297,21 @@ def test_live_request_keeps_its_route_flag_through_stale_and_held_all_off(
     assert control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] is False
 
 
-def test_the_tick_floor_matches_the_agent_call_timeouts():
-    """control_panel.MIN_UNSKIPPED_TICK_SECONDS exists so that no arm ever
-    skips a decision grid point: the agent skips-and-counts any point that
-    comes due while a call is still running, so the tick has to outlast the
-    longest a call can possibly take. If a provider timeout is raised, this
-    fails until the floor -- and the default tick above it -- follow.
-    """
+def test_the_default_tick_is_set_by_the_bus_and_the_timeout_ceiling_is_pinned():
+    """The decision interval gives an entering bus two decision points before
+    Node A (~20 s at 9 m/s, in the priority zone throughout), and one stuck
+    call can cost at most ceil(ceiling / tick) grid points. If a provider
+    timeout is raised, the ceiling must follow."""
     longest_call = max(
         agent.OLLAMA_TIMEOUT_SECONDS, agent.GEMINI_TIMEOUT_SECONDS,
         agent.OPENAI_TIMEOUT_SECONDS, agent.GROK_TIMEOUT_SECONDS,
     )
     assert control_panel.AGENT_CALL_TIMEOUT_CEILING_SEC == longest_call
-    assert control_panel.MIN_UNSKIPPED_TICK_SECONDS > longest_call
-    assert control_panel.DEFAULT_TICK_SECONDS >= control_panel.MIN_UNSKIPPED_TICK_SECONDS
-    assert control_panel.DEFAULT_TICK_SECONDS <= control_panel.TICK_SECONDS_MAX
-    # Both decision paths ship at the floor, not just the Single Run card.
+    assert control_panel.DEFAULT_TICK_SECONDS == 10
+    assert control_panel.TICK_SECONDS_MIN <= control_panel.DEFAULT_TICK_SECONDS <= control_panel.TICK_SECONDS_MAX
+    # Both decision paths, and the agent's own fallback, ship the same default.
     assert control_panel.DEFAULT_BATCH_RUNTIME["tick_seconds"] == control_panel.DEFAULT_TICK_SECONDS
+    assert agent.DEFAULT_CONTROL["tick_seconds"] == control_panel.DEFAULT_TICK_SECONDS
 
 
 def test_ollama_leaves_physical_cores_to_the_simulator(monkeypatch):

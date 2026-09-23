@@ -43,7 +43,7 @@ Source: `control_panel.py` (as of the current working tree). These are the defau
 |---|---|
 | `armed` | `False` |
 | `model` | `"None"` |
-| `tick_seconds` | `60` (`DEFAULT_TICK_SECONDS`; floor for no skipped decisions `MIN_UNSKIPPED_TICK_SECONDS` = 50) |
+| `tick_seconds` | `10` (`DEFAULT_TICK_SECONDS`; slider 2–120 s on both run cards; an arm skipping > 5 % of its decision points is flagged) |
 | `last_status` | `"INACTIVE"` |
 | `last_turn` | `0` |
 

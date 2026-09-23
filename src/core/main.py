@@ -2529,6 +2529,25 @@ def _run_export_assertions(row, schedule):
 # How far the achieved pace may drift from 1.0 before an arm's wall-clock
 # decision latency stops describing its sim-time control delay.
 PACE_TOLERANCE = 0.02
+# An arm that skipped more than this share of its decision grid points ran a
+# different decision schedule from the others (the tick sat below its
+# latency) and its paired DV confounds speed with decision quality.
+SKIP_RATE_TOLERANCE = 0.05
+
+
+def _arms_skipping_decisions(rows):
+    """``model/seed pct`` for every row whose skipped share of decision
+    opportunities exceeds SKIP_RATE_TOLERANCE."""
+    flagged = []
+    for row in rows:
+        try:
+            opportunities = int(float(row.get("decision_opportunities") or 0))
+            skipped = int(float(row.get("decisions_skipped_slow") or 0))
+        except (TypeError, ValueError):
+            continue
+        if opportunities and skipped / opportunities > SKIP_RATE_TOLERANCE:
+            flagged.append(f"{row.get('model')}/{row.get('seed')} {skipped / opportunities:.0%}")
+    return flagged
 
 
 def _achieved_pace(sim_seconds):
@@ -3290,17 +3309,6 @@ def _is_batch_api_model(model):
     return model in control_panel.get_api_models()
 
 
-def _arm_uses_a_model(arm_label):
-    """True when this batch arm is served by an LLM, so its turn can block
-    for AGENT_CALL_TIMEOUT_CEILING_SEC. The baseline and the deterministic
-    comparators answer on the merge tick and never skip a grid point."""
-    model = control_panel.split_arm_label(arm_label)[0]
-    return not (
-        model in ("None", control_panel.BATCH_BASELINE_LABEL)
-        or rule_controller.is_rule_model(model)
-    )
-
-
 def _batch_run_hit_rate_limit(model):
     """Scan the just-finished run's own turn log (perform_full_reset clears
     it every run) for this model's rate-limit/quota signature."""
@@ -3398,6 +3406,7 @@ def print_campaign_summary(campaign_id):
         f"{name} {pace:.3f}" for name, pace in paces
         if abs(pace - 1.0) > PACE_TOLERANCE
     ]
+    skipping = _arms_skipping_decisions(rows)
     lines = [
         f"=== BATCH DONE: campaign {campaign_id} -- {len(rows)} run(s) ===",
         f"config_hash: {'ONE (' + hashes.pop() + ')' if len(hashes) == 1 else 'MULTIPLE ' + str(sorted(hashes)) + ' -- NOT one campaign'}",
@@ -3411,6 +3420,12 @@ def print_campaign_summary(campaign_id):
             f"achieved pace off 1.0 by >{PACE_TOLERANCE:.0%}: {len(off_pace)} {off_pace}"
             if off_pace else
             f"achieved pace: all {len(paces)} run(s) within {PACE_TOLERANCE:.0%} of 1.0"
+        ),
+        (
+            f"skipped > {SKIP_RATE_TOLERANCE:.0%} of decision points (tick below the arm's "
+            f"latency -- raise the tick or drop the arm): {len(skipping)} {skipping}"
+            if skipping else
+            f"decision schedule: no arm skipped more than {SKIP_RATE_TOLERANCE:.0%} of its points"
         ),
     ]
     lines.extend(_campaign_validity_flags(rows))
@@ -3586,15 +3601,6 @@ def poll_batch_runner():
                 "short (see converged / time_to_converge_sec).\n"
             )
         queued_models = list(runtime.get("models", []))
-        tick = int(runtime.get("tick_seconds", control_panel.DEFAULT_TICK_SECONDS))
-        floor = control_panel.MIN_UNSKIPPED_TICK_SECONDS
-        if tick < floor and any(_arm_uses_a_model(model) for model in queued_models):
-            print(
-                f"\n!!! DECISION TICK {tick}s IS BELOW {floor}s: a model call can run for "
-                f"{control_panel.AGENT_CALL_TIMEOUT_CEILING_SEC}s, so a slow arm spends the run "
-                "skipping grid points (decisions_skipped_slow) instead of sharing one decision "
-                "schedule with the other arms. Raise the batch Decision interval.\n"
-            )
         runner.start(queued_models, list(runtime.get("seeds", [])))
         runtime["current"] = dict(runner.current) if runner.current else None
 

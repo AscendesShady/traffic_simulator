@@ -122,6 +122,7 @@ def measure(speed_scale, heavy_ratio=None, seed=20260909):
             "model": "Poisson",
             "rate": QUEUE_BUILD_VEH_PER_MIN,
             "turn_split": 1.0,          # everything straight, one lane only
+            "left_far_share": 0.0,
         }
     )
 

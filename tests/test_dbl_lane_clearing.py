@@ -6,6 +6,9 @@ never forced when both receiving lanes are occupied. Every scenario also
 checks that no two vehicles ever overlap.
 """
 import itertools
+import random
+
+import pytest
 
 import src.ui.control_panel as control_panel
 from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
@@ -21,6 +24,14 @@ ALL_GREEN = {
     node: {direction: "GREEN" for direction in ("EB", "WB", "NB", "SB")}
     for node in INT_X
 }
+
+
+@pytest.fixture(autouse=True)
+def _seed_lane_change_hazard():
+    # Discretionary lane changes draw from the global RNG (keep-outer lets a
+    # lone evicted car drift back to lane 0); an unseeded late slide would
+    # leave it mid-lane at the assertion.
+    random.seed(3)
 
 
 def lane_center_y(lane_index, direction="EB"):
@@ -265,3 +276,88 @@ def test_parked_merge_blocker_prevents_dbl_attempt():
     assert parked.speed == 0.0
     assert parked.lane_index == DBL_LANE_INDEX
     assert parked.y == lane_center_y(DBL_LANE_INDEX)
+
+
+# ---------------------------------------------------------------------------
+# Active DBL keeps lane 2 for the bus: left turners and vehicles that stop
+# after the gate accepted them (audit 2026-09-21, item 3)
+# ---------------------------------------------------------------------------
+from src.core.signal_controller import DBL_REVOKED_LANE_BLOCKED
+
+NODE_B_BAR_X = NODE_B - ROAD_W / 2 - STOP
+
+
+def r2_bus_at_node_b(dist_to_stop_bar, tsp=False):
+    route = control_panel.bus_routes_config["R2_EB_B_NB"]
+    route["active"] = True
+    route["dbl_enabled"] = True
+    route["tsp_enabled"] = tsp
+    bus = make_bus_for_leg("R2_EB_B_NB", NODE_B, "R2_BUS")
+    bus.x = NODE_B_BAR_X - dist_to_stop_bar - bus.length / 2.0
+    return bus
+
+
+def far_node_left_turner(dist_to_stop_bar, lane_index):
+    """A car spawned straight in a general lane that turns left at Node B."""
+    vehicle = car(NODE_B_BAR_X - dist_to_stop_bar - 9, lane_index)
+    vehicle.left_nodes = (NODE_B,)
+    vehicle.passed_nodes.add(NODE_A)
+    return vehicle
+
+
+def test_far_node_left_turner_holds_in_its_general_lane_while_dbl_is_active():
+    controller = make_controller()
+    bus = r2_bus_at_node_b(dist_to_stop_bar=320)
+    turner = far_node_left_turner(dist_to_stop_bar=200, lane_index=1)
+    vehicles = [bus, turner]
+    controller.update(vehicles)
+    assert controller.get_active_dbl_request(NODE_B, "EB")["bus_id"] == "R2_BUS"
+
+    run(controller, vehicles, 240, ALL_GREEN)
+
+    assert turner.target_turn == "LEFT"
+    assert turner.lane_index == 1 and turner.lane_vacate_target is None
+    assert turner.must_hold_for_lane and turner.speed == 0.0
+    assert 0.0 <= turner.distance_to_node_stop_bar(NODE_B, H_Y, ROAD_W, STOP) <= 35.0
+    # The reserved lane stayed usable: DBL was neither obstructed nor revoked.
+    assert controller.get_active_dbl_request(NODE_B, "EB")["bus_id"] == "R2_BUS"
+
+
+def test_left_turner_that_stops_in_the_reserved_lane_revokes_dbl():
+    """The gate accepted a moving car; when it stops ahead of the bus (a
+    permissive left waiting for a reservation), DBL cannot deliver the bus
+    and is revoked instead of left 'active' behind a standing vehicle."""
+    controller = make_controller()
+    bus = r2_bus_at_node_b(dist_to_stop_bar=300)
+    turner = far_node_left_turner(dist_to_stop_bar=150, lane_index=DBL_LANE_INDEX)
+    vehicles = [bus, turner]
+    run(controller, vehicles, 30, ALL_GREEN)
+    assert controller.get_active_dbl_request(NODE_B, "EB")
+
+    turner.max_speed = 0.0  # blocked permissive left: stands in lane 2
+    run(controller, vehicles, 60, ALL_GREEN)
+
+    assert turner.speed == 0.0 and turner.lane_index == DBL_LANE_INDEX
+    assert controller.get_active_dbl_request(NODE_B, "EB") is None
+    terminal = controller.nodes[NODE_B].terminal_history[-1]
+    assert terminal["denial_or_cancel_reason"] == DBL_REVOKED_LANE_BLOCKED
+    assert terminal["dbl_revoke_reason"] == DBL_REVOKED_LANE_BLOCKED
+    assert bus.dbl_merge_abandoned_for_leg is True
+
+
+def test_bus_catching_a_vehicle_that_stopped_keeps_tsp_but_loses_dbl():
+    controller = make_controller()
+    bus = r2_bus_at_node_b(dist_to_stop_bar=300, tsp=True)
+    blocker = far_node_left_turner(dist_to_stop_bar=150, lane_index=DBL_LANE_INDEX)
+    vehicles = [bus, blocker]
+    run(controller, vehicles, 30, ALL_GREEN)
+    request = controller.nodes[NODE_B].active_request
+    assert request.dbl_requested and request.tsp_requested
+
+    blocker.max_speed = 0.0  # spillback hold: the bus catches it standing
+    run(controller, vehicles, 60, ALL_GREEN)
+
+    assert controller.nodes[NODE_B].active_request is request  # TSP lives on
+    assert request.dbl_requested is False and request.dbl_granted is False
+    assert request.dbl_revoke_reason == DBL_REVOKED_LANE_BLOCKED
+    assert controller.get_active_dbl_request(NODE_B, "EB") is None

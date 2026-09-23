@@ -10,6 +10,11 @@ myenv/
 .venv/
 venv/
 
+# pytest --basetemp output. Named per invocation, so a new one appears
+# whenever the suite is run with an explicit basetemp; Windows sometimes
+# leaves one locked and undeletable, which must never block a commit.
+.pytest_tmp*/
+
 # Runtime-generated simulator data
 runtime/
 # The whole directory, not just data/*.json: the cross-process writers create
@@ -20,7 +25,12 @@ data/
 logs/*.jsonl
 logs/*.log
 results/*.xlsx
-results/experiment_summary.csv
+excel_exports/
+# Every campaign dataset, not just the undated name: experiment_summary.csv
+# is written per campaign day (experiment_summary_<YYYYMMDD>.csv) with
+# paired_dv_<campaign>.csv beside it. All of it is run output, not source.
+results/experiment_summary*.csv
+results/paired_dv_*.csv
 *.log
 *.tmp
 

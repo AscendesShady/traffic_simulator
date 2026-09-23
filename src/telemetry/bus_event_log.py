@@ -39,6 +39,8 @@ NODE_EVENT_FIELDS = (
     "tsp_action",
     "tsp_adjust_frames",
     "denial_reason",
+    "dbl_requested",
+    "dbl_denial_reason",
     "stop_bar_cross_frame",
     "node_wait_frames",
     "node_clear_frame",
@@ -51,6 +53,7 @@ BUS_NODE_EVENT_HEADERS = (
     "signal_colour_at_arrival", "residual_green_frames",
     "eta_frames_at_decision", "would_have_stopped", "tsp_requested",
     "tsp_granted", "tsp_action", "tsp_adjust_frames", "denial_reason",
+    "dbl_requested", "dbl_denial_reason",
     "stop_bar_cross_frame", "node_wait_frames", "node_clear_frame",
     "queue_ahead_veh", "passengers",
 )
@@ -62,6 +65,11 @@ BUS_EVENT_HEADERS = [
     "route_id",
     "spawn_frame",
     "spawn_sim_time",
+    "scheduled_departure_s",
+    "actual_departure_s",
+    "source_delay_s",
+    "pending_trips_at_departure",
+    "missed_trips_to_date",
     "first_stop_frame",
     "completion_frame",
     "completion_sim_time",
@@ -87,6 +95,8 @@ def _new_node_event(node_x):
         "tsp_action": TSP_ACTION_NONE,
         "tsp_adjust_frames": 0,
         "denial_reason": "",
+        "dbl_requested": False,
+        "dbl_denial_reason": "",
         "stop_bar_cross_frame": None,
         "node_wait_frames": 0,
         "node_clear_frame": None,
@@ -122,6 +132,11 @@ def flatten_bus_event(record):
         "route_id": record.get("route_id"),
         "spawn_frame": record.get("spawn_frame"),
         "spawn_sim_time": record.get("spawn_sim_time"),
+        "scheduled_departure_s": record.get("scheduled_departure_s"),
+        "actual_departure_s": record.get("actual_departure_s"),
+        "source_delay_s": record.get("source_delay_s"),
+        "pending_trips_at_departure": record.get("pending_trips_at_departure"),
+        "missed_trips_to_date": record.get("missed_trips_to_date"),
         "first_stop_frame": record.get("first_stop_frame"),
         "completion_frame": record.get("completion_frame"),
         "completion_sim_time": record.get("completion_sim_time"),
@@ -154,7 +169,8 @@ class BusEventTracker:
     owning module can re-point the log (tests do this via monkeypatch).
     """
 
-    def __init__(self, path=DEFAULT_BUS_EVENTS_PATH):
+    def __init__(self, path=None):
+        path = DEFAULT_BUS_EVENTS_PATH if path is None else path
         self._path = path
         self._records = {}
 
@@ -185,11 +201,16 @@ class BusEventTracker:
             pass
 
     def _register(self, bus, frame_number):
+        dispatch = getattr(bus, "route_info", {})
         record = {
             "bus_id": bus.bus_id,
             "route_id": getattr(bus, "route_id", ""),
             "spawn_frame": frame_number,
             "spawn_sim_time": frame_number / FRAMES_PER_SECOND,
+            **{key: dispatch.get(key) for key in (
+                "scheduled_departure_s", "actual_departure_s", "source_delay_s",
+                "pending_trips_at_departure", "missed_trips_to_date",
+            )},
             "first_stop_frame": None,
             "nodes": [
                 _new_node_event(node_x) for node_x in getattr(bus, "route_nodes", [])
@@ -325,6 +346,41 @@ class BusEventTracker:
             int(node.get("tsp_adjust_frames") or 0), int(adjust_frames or 0)
         )
 
+    @staticmethod
+    def _attribute(node, request):
+        """Mirror one controller request (live object or terminal snapshot)
+        onto the node record. A bus can hold several requests at one node in
+        turn (a DBL-only request after a treated TSP one), so the requested
+        flags are sticky and each path's reason goes to its own column:
+        TSP reasons to denial_reason, a DBL-only request's terminal reason
+        and any DBL revocation to dbl_denial_reason. A request that ended
+        untreated with no gate reason reports its terminal state
+        (COMPLETED: the bus crossed on its own) rather than nothing."""
+        get = request.get if isinstance(request, dict) else (
+            lambda name, default=None: getattr(request, name, default)
+        )
+        tsp_requested = bool(get("tsp_requested", False))
+        dbl_requested = bool(get("dbl_requested", False)) or bool(
+            get("dbl_revoke_reason", "")
+        )
+        node["tsp_requested"] = node["tsp_requested"] or tsp_requested
+        node["dbl_requested"] = node["dbl_requested"] or dbl_requested
+        reason = str(
+            get("denial_or_cancel_reason", "")
+            or get("tsp_gate_reason", "")
+            or get("state", "")
+            or ""
+        )
+        if tsp_requested and not node["tsp_treated"]:
+            node["denial_reason"] = reason
+        if dbl_requested:
+            node["dbl_denial_reason"] = str(
+                get("dbl_revoke_reason", "") or ("" if tsp_requested else reason)
+            )
+        BusEventTracker._apply_tsp(
+            node, get("tsp_action", TSP_ACTION_NONE), get("tsp_adjust_frames", 0)
+        )
+
     def _attribute_from_live_request(self, node, bus_id, signal_controller):
         """Mirror the controller's live request while the bus is at this node."""
         try:
@@ -336,15 +392,7 @@ class BusEventTracker:
         request = getattr(controller_node, "active_request", None)
         if request is None or getattr(request, "bus_id", None) != bus_id:
             return
-        node["tsp_requested"] = bool(getattr(request, "tsp_requested", False))
-        node["denial_reason"] = str(
-            getattr(request, "denial_or_cancel_reason", "") or ""
-        )
-        self._apply_tsp(
-            node,
-            getattr(request, "tsp_action", TSP_ACTION_NONE),
-            getattr(request, "tsp_adjust_frames", 0),
-        )
+        self._attribute(node, request)
 
     def _attribute_from_history(self, node, bus_id, signal_controller):
         """Catch a treatment finalized on the same frame the bus cleared."""
@@ -358,17 +406,7 @@ class BusEventTracker:
                 continue
             if snapshot.get("bus_id") != bus_id:
                 continue
-            node["tsp_requested"] = bool(snapshot.get("tsp_requested", False))
-            node["denial_reason"] = str(
-                snapshot.get("denial_or_cancel_reason", "")
-                or snapshot.get("tsp_gate_reason", "")
-                or ""
-            )
-            self._apply_tsp(
-                node,
-                snapshot.get("tsp_action", TSP_ACTION_NONE),
-                snapshot.get("tsp_adjust_frames", 0),
-            )
+            self._attribute(node, snapshot)
             return
 
     # -- completion -----------------------------------------------------------

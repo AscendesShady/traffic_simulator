@@ -18,8 +18,7 @@ from pathlib import Path
 
 from src.core import main
 from src.core.signal_controller import SignalController
-from src.core.vehicle import Bus
-from src.telemetry.bus_event_log import BusEventTracker
+from src.telemetry.telemetry_exporter import TelemetryExporter
 from src.ui import canvas_gemini as canvas
 from src.ui import control_panel
 
@@ -45,23 +44,21 @@ def apply_benchmark_regime():
             {"active": active, "headway_sec": headway}
         )
 
-LANE_OPTIONS = {
-    "EB": [canvas.H_Y - (i + 0.5) * canvas.LANE for i in range(3)],
-    "WB": [canvas.H_Y + (i + 0.5) * canvas.LANE for i in range(3)],
-    "A_NB": [canvas.INT_X[0] - (i + 0.5) * canvas.LANE for i in range(3)],
-    "A_SB": [canvas.INT_X[0] + (i + 0.5) * canvas.LANE for i in range(3)],
-    "B_NB": [canvas.INT_X[1] - (i + 0.5) * canvas.LANE for i in range(3)],
-    "B_SB": [canvas.INT_X[1] + (i + 0.5) * canvas.LANE for i in range(3)],
-}
-SPAWN_AT = {
-    "EB": ("EB", -20), "WB": ("WB", canvas.WIDTH + 20),
-    "A_NB": ("NB", canvas.HEIGHT + 20), "A_SB": ("SB", -20),
-    "B_NB": ("NB", canvas.HEIGHT + 20), "B_SB": ("SB", -20),
-}
+LANE_OPTIONS = main.LANE_OPTIONS
 
 
-def run(seed, frames, tsp=True, dbl=False):
-    """One seeded run; returns the completed bus-event records."""
+def run(seed, frames, tsp=True, dbl=False, decide=None, decide_every_frames=300, on_finish=None):
+    """One seeded run through main.step_simulation -- the same frame the
+    Tk loop runs, so counters, bus events and metrics are production's.
+    Returns the completed bus-event records.
+
+    ``decide(telemetry, frame)``, when given, is called every
+    ``decide_every_frames`` with the exporter's live payload and returns
+    ``{route_id: {"tsp": bool, "dbl": bool}}``, applied at the point of the
+    frame where production merges its guarded decision -- the hook a
+    learner trains through. Without it the route flags stay as ``tsp``/
+    ``dbl`` set them at the start.
+    """
     for route_id, cfg in control_panel.bus_routes_config.items():
         on = route_id in TSP_ROUTES
         cfg["tsp_enabled"] = tsp and on
@@ -74,45 +71,26 @@ def run(seed, frames, tsp=True, dbl=False):
     vehicles = []
     with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
         log_path = Path(tmp) / "bus_events.jsonl"
-        tracker = BusEventTracker(log_path)
-        # Reset touches the real session logs; point them at the temp dir.
+        # Reset touches the real session logs; point them at the temp dir
+        # (main.bus_event_tracker resolves its path lazily).
         saved = (main.TELEMETRY_LOG_PATH, main.AGENT_TURN_LOG_PATH, main.BUS_EVENTS_LOG_PATH)
         main.TELEMETRY_LOG_PATH, main.AGENT_TURN_LOG_PATH, main.BUS_EVENTS_LOG_PATH = (
             Path(tmp) / "t.jsonl", Path(tmp) / "a.jsonl", log_path
         )
         try:
             main.perform_full_reset(vehicles, signals)
-            cfgs = control_panel.approach_configs
-            for frame in range(1, frames + 1):
-                if not main.is_discharge_demand_suspended(signals):
-                    if main.post_discharge_admission_allowed():
-                        for key, (direction, pos) in SPAWN_AT.items():
-                            if cfgs[key]["active"]:
-                                main.try_spawn_vehicle(
-                                    vehicles, key, direction, pos, LANE_OPTIONS[key],
-                                    cfgs[key], signal_controller=signals,
-                                )
-                    if main.post_discharge_meter_frames_remaining <= 0:
-                        main.check_and_dispatch_buses(vehicles, LANE_OPTIONS, 1.0 / 60.0)
-                signals.update(vehicles=vehicles)
-                if not signals.is_discharge_active():
-                    main.advance_post_discharge_metering()
-                signal_data = signals.get_all_signals(canvas.INT_X)
-                for v in vehicles[:]:
-                    v.update(
-                        signal_data=signal_data, int_x_list=canvas.INT_X, h_y=canvas.H_Y,
-                        road_w=canvas.ROAD_W, stop_offset=canvas.STOP, lane_w=canvas.LANE,
-                        all_vehicles=vehicles, signal_controller=signals,
+            exporter = TelemetryExporter(Path(tmp) / "telemetry.json") if decide else None
+
+            def decision_source(frame):
+                if decide and frame % decide_every_frames == 0:
+                    main._set_ai_flags(
+                        decide(exporter.build_payload(signals, vehicles, frame), frame)
                     )
-                    if (
-                        v.x < -60 or v.x > canvas.WIDTH + 60
-                        or v.y < -60 or v.y > canvas.HEIGHT + 60
-                    ):
-                        if isinstance(v, Bus) and v.passed_nodes:
-                            tracker.complete(v, frame, signals)
-                        vehicles.remove(v)
-                tracker.observe(vehicles, frame, signals)
-                main.accumulate_frame_metrics(vehicles)
+
+            for frame in range(1, frames + 1):
+                main.step_simulation(vehicles, signals, frame, decide=decision_source)
+            if on_finish is not None:
+                on_finish(vehicles, signals)  # end-of-run state, for equivalence checks
         finally:
             main.TELEMETRY_LOG_PATH, main.AGENT_TURN_LOG_PATH, main.BUS_EVENTS_LOG_PATH = saved
         return main._read_jsonl_rows(log_path)

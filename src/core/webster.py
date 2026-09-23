@@ -15,9 +15,15 @@ Splits use the standard critical-movement method: each phase is represented by
 its heaviest *lane*, y = q_lane / S, and the available effective green is
 shared in proportion to y. S is measured per lane (main.calibrate_saturation_flow
 discharges a single-lane queue), so the flow ratio must use a per-lane flow
-too: main.try_spawn_vehicle sends straight vehicles to lanes 0/1 at random and
-left-turners to lane 2, so the busiest lane carries
-max(turn_split / 2, 1 - turn_split) of the approach flow.
+too. The per-lane flows come from a node-by-node movement matrix
+(movement_lane_flows): every (approach, turn option) pair of
+control_panel.APPROACH_TURN_OPTIONS is walked node by node with the lane the
+spawner and vehicle.py give it -- straight from the source in lanes 0/1
+(evenly), a left from lane 2 at the node it turns at (a far-node left rides
+lanes 0/1 through the near node first), and after any left the car lands on
+the exit road's lane 2 and keeps it to the next node. A side-street left
+therefore loads the corridor's lane 2 at the *other* node, and the two nodes
+see different EB/WB lane flows.
 
 Webster's optimum cycle collapses toward the lost time when Y is small, so the
 used cycle is floored at MIN_CYCLE_SEC, the usual practical minimum.
@@ -28,23 +34,107 @@ from src.ui.canvas_gemini import INT_X
 FPS = 60
 OVERSATURATED_CYCLE_CAP_SEC = 120.0
 MIN_CYCLE_SEC = 40.0
-STRAIGHT_LANE_COUNT = 2   # lanes 0 and 1 share the straight movement
+STRAIGHT_LANES = (0, 1)   # share the straight movement evenly
+LEFT_LANE = 2
+# Direction after a left, and the next node a direction reaches from a node
+# (None = leaves the network).
+_LEFT_OF = {"EB": "NB", "WB": "SB", "NB": "WB", "SB": "EB"}
+PHASE_OF = {"EB": "EW", "WB": "EW", "NB": "NS", "SB": "NS"}
 
 
-def critical_lane_fraction(turn_split):
-    """Share of an approach's flow carried by its busiest lane.
+def _next_node(direction, node_x):
+    if direction == "EB" and node_x == INT_X[0]:
+        return INT_X[1]
+    if direction == "WB" and node_x == INT_X[1]:
+        return INT_X[0]
+    return None
 
-    Straight traffic (``turn_split``) is split evenly across the two straight
-    lanes; the remainder all uses the single left-turn lane.
+
+def _first_node(approach_key, direction):
+    if direction == "EB":
+        return INT_X[0]
+    if direction == "WB":
+        return INT_X[1]
+    return INT_X[0] if approach_key.startswith("A_") else INT_X[1]
+
+
+def _turn_options(turn_options):
+    if turn_options is None:
+        from src.ui.control_panel import APPROACH_TURN_OPTIONS  # lazy: avoids a Tk import here
+        turn_options = APPROACH_TURN_OPTIONS
+    return turn_options
+
+
+def movement_lane_flows(approach_configs, turn_options=None):
+    """Node-by-node movement matrix: veh/hr entering each node, by entry
+    direction and lane, ``{node_x: {direction: {lane: veh_hr}}}``.
+
+    Each (approach, path) of ``turn_options`` (straight, first left option,
+    second left option with ``turn_split`` / ``left_far_share``) is walked
+    node to node with the lane vehicle.py gives it, so route transfers --
+    a B_NB left that then enters Node A westbound, a far-node left that
+    passes the near node in a general lane -- land on the node and lane
+    they really use. An inactive approach offers nothing.
     """
-    straight = min(1.0, max(0.0, float(turn_split)))
-    return max(straight / STRAIGHT_LANE_COUNT, 1.0 - straight)
+    turn_options = _turn_options(turn_options)
+    flows = {node_x: {} for node_x in INT_X}
+
+    def add(node_x, direction, lane, veh_hr):
+        lanes = flows[node_x].setdefault(direction, {0: 0.0, 1: 0.0, 2: 0.0})
+        lanes[lane] += veh_hr
+
+    def walk(approach_key, direction, left_nodes, veh_hr):
+        node_x = _first_node(approach_key, direction)
+        lane = None  # None = a source straight lane, spread over lanes 0/1
+        while node_x is not None:
+            if node_x in left_nodes:
+                add(node_x, direction, LEFT_LANE, veh_hr)
+                direction = _LEFT_OF[direction]
+                lane = LEFT_LANE
+            elif lane is None:
+                for straight_lane in STRAIGHT_LANES:
+                    add(node_x, direction, straight_lane, veh_hr / len(STRAIGHT_LANES))
+            else:
+                add(node_x, direction, lane, veh_hr)
+            node_x = _next_node(direction, node_x)
+
+    for approach_key, cfg in approach_configs.items():
+        if not cfg.get("active", True):
+            continue
+        veh_hr = float(cfg.get("rate", 0) or 0) * 60.0
+        if veh_hr <= 0:
+            continue
+        direction = approach_key.rsplit("_", 1)[-1]
+        options = turn_options.get(approach_key, ())
+        straight = min(1.0, max(0.0, float(cfg.get("turn_split", 0.8))))
+        far = min(1.0 - straight, max(0.0, float(cfg.get("left_far_share", 0.0)))) if len(options) > 1 else 0.0
+        near = 1.0 - straight - far
+        walk(approach_key, direction, (), straight * veh_hr)
+        if options and near > 0:
+            walk(approach_key, direction, options[0][1], near * veh_hr)
+        if far > 0:
+            walk(approach_key, direction, options[1][1], far * veh_hr)
+    return flows
 
 
-def critical_lane_flow_veh_hr(approach_cfg):
-    """Busiest-lane flow (veh/hr) for one approach configuration."""
-    rate_veh_hr = float(approach_cfg.get("rate", 0)) * 60.0
-    return rate_veh_hr * critical_lane_fraction(approach_cfg.get("turn_split", 0.8))
+def critical_lane_flows(lane_flows, node_x):
+    """One node's critical (heaviest) lane per phase from the movement matrix."""
+    critical = {"EW": 0.0, "NS": 0.0}
+    for direction, lanes in lane_flows.get(node_x, {}).items():
+        phase = PHASE_OF[direction]
+        critical[phase] = max(critical[phase], *lanes.values())
+    return critical
+
+
+def approach_critical_lane_flow_veh_hr(approach_configs, approach_key, turn_options=None):
+    """Busiest lane (veh/hr) an approach's own entry direction loads at any
+    node it enters -- the v/c movement for that approach."""
+    lane_flows = movement_lane_flows(approach_configs, turn_options)
+    direction = approach_key.rsplit("_", 1)[-1]
+    nodes = INT_X if direction in ("EB", "WB") else (_first_node(approach_key, direction),)
+    return max(
+        max(lane_flows[node_x].get(direction, {0: 0.0}).values()) for node_x in nodes
+    )
 
 
 def compute_node_green_splits(
@@ -130,46 +220,30 @@ def compute_all_nodes(
     fps=FPS,
     oversaturated_cycle_cap_sec=OVERSATURATED_CYCLE_CAP_SEC,
     min_cycle_sec=MIN_CYCLE_SEC,
+    turn_options=None,
 ):
     """Derive independent Webster cycles and splits for both nodes.
 
-    Approach rates are configured in veh/min; each approach contributes the
-    flow of its busiest lane (see critical_lane_flow_veh_hr) so the ratio
-    against the per-lane S is dimensionally consistent. The EW corridor is
-    shared by both nodes; each node contributes its own north-south pair.
-    With no explicit override, asymmetric node demand can therefore produce
+    Approach rates are configured in veh/min; each node's phase is
+    represented by its heaviest lane from the movement matrix
+    (movement_lane_flows), so the ratio against the per-lane S is
+    dimensionally consistent and each node is evaluated on the movements
+    that actually enter it. Asymmetric demand, or a side-street left that
+    feeds the corridor at the other node, therefore gives the nodes
     different cycle lengths.
     """
-
-    def veh_per_hour(key):
-        return critical_lane_flow_veh_hr(approach_configs[key])
-
-    east_west = max(veh_per_hour("EB"), veh_per_hour("WB"))
+    lane_flows = movement_lane_flows(approach_configs, turn_options)
     return {
-        INT_X[0]: compute_node_green_splits(
-            {
-                "EW": east_west,
-                "NS": max(veh_per_hour("A_NB"), veh_per_hour("A_SB")),
-            },
+        node_x: compute_node_green_splits(
+            critical_lane_flows(lane_flows, node_x),
             s,
             cycle_sec,
             lost_time_sec,
             fps,
             oversaturated_cycle_cap_sec,
             min_cycle_sec,
-        ),
-        INT_X[1]: compute_node_green_splits(
-            {
-                "EW": east_west,
-                "NS": max(veh_per_hour("B_NB"), veh_per_hour("B_SB")),
-            },
-            s,
-            cycle_sec,
-            lost_time_sec,
-            fps,
-            oversaturated_cycle_cap_sec,
-            min_cycle_sec,
-        ),
+        )
+        for node_x in INT_X
     }
 
 

@@ -34,10 +34,10 @@ def _put_bus_at_stop_bar_distance(bus, distance):
 def test_speed_scale_applied_to_spawned_vehicles(monkeypatch):
     monkeypatch.setitem(control_panel.global_config, "vehicle_speed_scale", 0.5)
     main.reset_traffic_generation()
-    monkeypatch.setattr(main, "should_spawn_vehicle", lambda *args: True)
-    monkeypatch.setattr(main.random, "random", lambda: 0.5)
-    monkeypatch.setattr(main.random, "choice", lambda values: values[0])
-    monkeypatch.setattr(main.random, "uniform", lambda low, high: high)
+    rng = main.spawner_states["EB"]["rng"]
+    monkeypatch.setattr(rng, "random", lambda: 0.0)  # offer every frame, straight car
+    monkeypatch.setattr(rng, "choice", lambda values: values[0])
+    monkeypatch.setattr(rng, "uniform", lambda low, high: high)
 
     vehicles = []
     main.try_spawn_vehicle(

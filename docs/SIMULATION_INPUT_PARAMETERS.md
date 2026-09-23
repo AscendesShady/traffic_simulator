@@ -42,20 +42,20 @@ Source: `control_panel.py` (as of the current working tree). These are the defau
 
 ## 2. Vehicle flow / distribution per approach (`approach_configs`)
 
-Drives Poisson vehicle spawning per approach, each frame, independently.
+Drives per-source arrival generation each frame, independently (Poisson, Binomial, Neg Binomial or Congestion Peak; the processes are defined in `TRAFFIC_SIMULATOR_METHODOLOGY_AND_ARCHITECTURE.md` §7).
 
-| Approach | Node / direction | Active | Arrival model | Rate (veh/min) | Turn split | Heavy-vehicle ratio |
-|---|---|---|---|---|---|---|
-| `EB` | EB Corridor | Yes | Poisson | 12 | 80% | 10% |
-| `WB` | WB Corridor | Yes | Poisson | 12 | 80% | 10% |
-| `A_NB` | Node A (NB) | Yes | Poisson | 8 | 75% | 15% |
-| `A_SB` | Node A (SB) | Yes | Poisson | 8 | 75% | 15% |
-| `B_NB` | Node B (NB) | Yes | Poisson | 8 | 75% | 15% |
-| `B_SB` | Node B (SB) | Yes | Poisson | 8 | 75% | 15% |
+| Approach | Node / direction | Active | Arrival model | Rate (veh/min) | Straight | First left | Second left | Heavy-vehicle ratio |
+|---|---|---|---|---|---|---|---|---|
+| `EB` | EB Corridor | Yes | Binomial | 34 | 75% | 14% (left @A) | 11% (left @B) | 10% |
+| `WB` | WB Corridor | Yes | Binomial | 32 | 80% | 10% (left @B) | 10% (left @A) | 10% |
+| `A_NB` | Node A (NB) | Yes | Poisson | 24 | 75% | 25% (left @A) | — | 15% |
+| `A_SB` | Node A (SB) | Yes | Poisson | 27 | 75% | 15% (left @A) | 10% (left @A then @B) | 15% |
+| `B_NB` | Node B (NB) | Yes | Poisson | 25 | 75% | 15% (left @B) | 10% (left @B then @A) | 15% |
+| `B_SB` | Node B (SB) | Yes | Poisson | 22 | 75% | 25% (left @B) | — | 15% |
 
 Field definitions:
-- **rate** — vehicles/minute spawned on that approach; inter-arrival times drawn from a Poisson process. Adjustable 1–30 v/min in the panel.
-- **turn_split** — probability of the primary turn move vs. the alternate move at the downstream node. Adjustable 0–100%.
+- **rate** — vehicles/minute spawned on that approach; inter-arrival times drawn from a Poisson process. Adjustable 0–60 v/min in the panel.
+- **turn_split** — straight share of arrivals. **left_far_share** — share taking the approach's *second* left option (`control_panel.APPROACH_TURN_OPTIONS`: the left at the far node for EB/WB, a double left for A_SB/B_NB); the rest take the first left option. Set together on one three-segment bar in the panel (two thumbs; single-option approaches A_NB/B_SB have one thumb and no far share). A far-node left-turner runs with through traffic and merges into lane 2 within 250 px of its node; a double-left car exits its first turn already in the exit road's lane 2.
 - **heavy_ratio** — probability a spawned vehicle is a truck (heavy) instead of a car. Adjustable 0–50%.
 - **active** — whether the approach is currently generating traffic (toggle in panel).
 
@@ -68,16 +68,18 @@ Field definitions:
 
 ## 4. Bus routes (`bus_routes_config`)
 
-6 fixed routes, each with a scheduled dispatch headway and fixed waypoint/lane geometry through the two signal nodes (Node A = intersection 300, Node B = intersection 700).
+6 fixed routes, each with a scheduled dispatch headway and fixed waypoint/lane geometry through the two signal nodes (Node A and Node B as listed in NETWORK_GEOMETRY.md).
 
-| Route ID | Name | Origin → Destination | Waypoints (node: move) | Lanes (node: lane#) | Active | Headway | TSP enabled | DBL enabled | Manual dispatch |
+<!-- BEGIN GENERATED ROUTES -->
+| Route ID | Name | Origin to destination | Waypoints | Lanes | Active | Headway | TSP | DBL | Manual dispatch |
 |---|---|---|---|---|---|---|---|---|---|
-| `R1_EB_A_NB` | EB → Node A (NB) | EB → NODE_A_NB | 300: LEFT | 300: 2 | Yes | 30s | No | No | No |
-| `R2_EB_B_NB` | EB → Node B (NB) | EB → NODE_B_NB | 300: STRAIGHT, 700: LEFT | 300: 1, 700: 2 | Yes | 45s | No | No | No |
-| `R3_EB_ONLY` | EB Corridor (Straight) | EB → EB_CORRIDOR | 300: STRAIGHT, 700: STRAIGHT | 300: 1, 700: 1 | No | 30s | No | No | No |
-| `R4_WB_A_SB` | WB → Node A (SB) | WB → NODE_A_SB | 700: STRAIGHT, 300: LEFT | 700: 1, 300: 2 | Yes | 30s | No | No | No |
-| `R5_WB_B_SB` | WB → Node B (SB) | WB → NODE_B_SB | 700: LEFT | 700: 2 | Yes | 45s | No | No | No |
-| `R6_WB_ONLY` | WB Corridor (Straight) | WB → WB_CORRIDOR | 700: STRAIGHT, 300: STRAIGHT | 700: 1, 300: 1 | No | 30s | No | No | No |
+| `R1_EB_A_NB` | EB → Node A (NB) | EB to NODE_A_NB | 800: LEFT | 800: 2 | Yes | 30s | No | No | No |
+| `R2_EB_B_NB` | EB → Node B (NB) | EB to NODE_B_NB | 800: STRAIGHT, 1600: LEFT | 800: 1, 1600: 2 | Yes | 45s | No | No | No |
+| `R3_EB_ONLY` | EB Corridor (Straight) | EB to EB_CORRIDOR | 800: STRAIGHT, 1600: STRAIGHT | 800: 1, 1600: 1 | Yes | 90s | No | No | No |
+| `R4_WB_A_SB` | WB → Node A (SB) | WB to NODE_A_SB | 1600: STRAIGHT, 800: LEFT | 1600: 1, 800: 2 | Yes | 30s | No | No | No |
+| `R5_WB_B_SB` | WB → Node B (SB) | WB to NODE_B_SB | 1600: LEFT | 1600: 2 | Yes | 45s | No | No | No |
+| `R6_WB_ONLY` | WB Corridor (Straight) | WB to WB_CORRIDOR | 1600: STRAIGHT, 800: STRAIGHT | 1600: 1, 800: 1 | No | 90s | No | No | No |
+<!-- END GENERATED ROUTES -->
 
 Field definitions:
 - **waypoints** — for each signal node the route passes through, the turn move the bus makes there (`STRAIGHT`/`LEFT`).
@@ -87,4 +89,4 @@ Field definitions:
 - **dbl_enabled** — Dedicated Bus Lane behavior (off by default).
 - **manual_dispatch** — if `True`, the route only dispatches on manual trigger rather than automatically on `headway_sec`.
 
-4 of the 6 routes (R1, R2, R4, R5) are active by default; the two straight-through corridor-only routes (R3, R6) start disabled.
+5 of the 6 routes are active by default; the westbound straight-through route (R6) starts disabled.

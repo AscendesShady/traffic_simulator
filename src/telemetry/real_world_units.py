@@ -104,9 +104,9 @@ def approach_capacity_veh_hr(green_ratio, lanes=1,
     return float(real_saturation_flow) * float(green_ratio) * int(lanes)
 
 
-def critical_lane_flow_veh_hr(approach_cfg):
-    """Busiest-lane flow of an approach (shared with Webster)."""
-    return webster.critical_lane_flow_veh_hr(approach_cfg)
+def critical_lane_flow_veh_hr(approach_configs, approach_key):
+    """Busiest-lane flow of an approach (Webster's movement matrix)."""
+    return webster.approach_critical_lane_flow_veh_hr(approach_configs, approach_key)
 
 
 def volume_to_capacity(flow_veh_hr, capacity_veh_hr):
@@ -177,10 +177,9 @@ def network_vc_ratio(global_config, approach_configs, approach_key="EB"):
     capacity = approach_capacity_veh_hr(green_ratio)
     if capacity is None:
         return None
-    cfg = approach_configs.get(approach_key) or {}
-    rate = float(cfg.get("rate") or 0.0) if cfg.get("active", False) else 0.0
-    lane_fraction = webster.critical_lane_fraction(cfg.get("turn_split", 0.8))
-    critical_real_flow = demand_to_real_veh_hr(rate * lane_fraction, k)
+    critical_real_flow = demand_to_real_veh_hr(
+        critical_lane_flow_veh_hr(approach_configs, approach_key) / 60.0, k
+    )
     return volume_to_capacity(critical_real_flow, capacity)
 
 
@@ -293,9 +292,11 @@ def build_conversion_table(global_config, approach_configs, approach_names, tele
         active = bool(cfg.get("active", False))
         rate = float(cfg.get("rate") or 0.0) if active else 0.0
         real_flow = demand_to_real_veh_hr(rate, k)
-        # v/c on the busiest lane, the same critical movement Webster uses.
-        lane_fraction = webster.critical_lane_fraction(cfg.get("turn_split", 0.8))
-        critical_real_flow = demand_to_real_veh_hr(rate * lane_fraction, k)
+        # v/c on the busiest lane, the same critical movement Webster uses
+        # (movement matrix: includes transfers from other approaches).
+        critical_lane = critical_lane_flow_veh_hr(approach_configs, key)
+        lane_share = critical_lane / (rate * 60.0) if rate else 0.0
+        critical_real_flow = demand_to_real_veh_hr(critical_lane / 60.0, k)
         capacity = approach_capacity_veh_hr(ratios.get(key))
         vc = volume_to_capacity(critical_real_flow, capacity)
         flow_rows.append({
@@ -304,7 +305,7 @@ def build_conversion_table(global_config, approach_configs, approach_names, tele
             "real": _fmt(real_flow, " veh/hr", 0),
             "tag": TAG_DERIVED,
             "note": (
-                f"critical lane {lane_fraction:.0%} of flow = "
+                f"critical lane {lane_share:.0%} of flow = "
                 f"{critical_real_flow:,.0f} veh/hr; v/c = {vc:.2f} "
                 f"(c = {capacity:,.0f} veh/hr/lane)"
                 if vc is not None else "v/c needs Webster splits (START)"
@@ -312,18 +313,26 @@ def build_conversion_table(global_config, approach_configs, approach_names, tele
         })
     sections.append({"title": "Flow", "rows": flow_rows})
 
-    delay = throughput.get("mean_stopped_delay_sec_per_vehicle")
+    stopped = throughput.get("mean_stopped_delay_sec_per_vehicle")
+    delay = throughput.get("mean_control_delay_sec_per_vehicle")
     served = throughput.get("vehicles_served_total")
     los = hcm_level_of_service(delay)
     sections.append({
         "title": "Delay / LOS",
         "rows": [
             {"quantity": "Mean stopped delay per vehicle",
+             "sim": _fmt(stopped * FRAMES_PER_SECOND, " frames", 0) if stopped is not None else "--",
+             "real": _fmt(stopped, " s/veh") if stopped is not None else "--",
+             "tag": TAG_DERIVED,
+             "note": (f"over {served} completed vehicles; a stopped-delay proxy, "
+                      "not HCM control delay") if served else "no vehicles served yet"},
+            {"quantity": "Mean control delay per vehicle",
              "sim": _fmt(delay * FRAMES_PER_SECOND, " frames", 0) if delay is not None else "--",
              "real": _fmt(delay, " s/veh") if delay is not None else "--",
              "tag": TAG_DERIVED,
-             "note": (f"over {served} served vehicles; stopped delay approximates "
-                      "HCM control delay") if served else "no vehicles served yet"},
+             "note": (f"over {served} completed vehicles; arrival-to-departure time "
+                      "lost below own free-flow speed, whole route") if served
+                     else "no vehicles served yet"},
             {"quantity": "Level of service (HCM signalized)",
              "sim": "--", "real": f"LOS {los}" if los else "--",
              "tag": TAG_DERIVED,

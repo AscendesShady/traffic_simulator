@@ -55,3 +55,26 @@ def rectangles_overlap(first, second):
     ax1, ay1, ax2, ay2 = vehicle_bounds(first)
     bx1, by1, bx2, by2 = vehicle_bounds(second)
     return ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1
+
+
+# The demand regime the Webster/units/soak tests are pinned to. The panel's
+# live defaults are operator settings and move; a test that needs known
+# flows takes these instead of reading control_panel.approach_configs.
+REFERENCE_DEMAND = {
+    "EB":   {"active": True, "model": "Poisson", "rate": 12, "turn_split": 0.80, "left_far_share": 0.10, "heavy_ratio": 0.10},
+    "WB":   {"active": True, "model": "Poisson", "rate": 12, "turn_split": 0.80, "left_far_share": 0.10, "heavy_ratio": 0.10},
+    "A_NB": {"active": True, "model": "Poisson", "rate": 8,  "turn_split": 0.75, "left_far_share": 0.00, "heavy_ratio": 0.15},
+    "A_SB": {"active": True, "model": "Poisson", "rate": 8,  "turn_split": 0.75, "left_far_share": 0.10, "heavy_ratio": 0.15},
+    "B_NB": {"active": True, "model": "Poisson", "rate": 8,  "turn_split": 0.75, "left_far_share": 0.10, "heavy_ratio": 0.15},
+    "B_SB": {"active": True, "model": "Poisson", "rate": 8,  "turn_split": 0.75, "left_far_share": 0.00, "heavy_ratio": 0.15},
+}
+
+
+def reference_flows():
+    return {key: dict(value) for key, value in REFERENCE_DEMAND.items()}
+
+
+def apply_reference_demand():
+    """Write REFERENCE_DEMAND into the live panel config (conftest restores it)."""
+    for key, value in REFERENCE_DEMAND.items():
+        control_panel.approach_configs[key].update(value)

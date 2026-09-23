@@ -122,6 +122,85 @@ def all_off_flags() -> dict:
     }
 
 
+# --- AI Configured: the model writes the timing plan --------------------------
+# Node keys are the string node x (JSON object keys), approaches fixed.
+PLAN_NODES = tuple(str(node_x) for node_x in (control_panel.NODE_A_X, control_panel.NODE_B_X))
+PLAN_APPROACHES = ("EB", "WB", "NB", "SB")
+PLAN_NODE_KEYS = {"ew_green_sec", "ns_green_sec", "end_current_green_now", "dbl"}
+MIN_GREEN_SEC = 5
+MAX_GREEN_SEC = 90
+
+
+def _green_seconds(value):
+    """A finite number in [MIN_GREEN_SEC, MAX_GREEN_SEC] as an int, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return int(round(min(MAX_GREEN_SEC, max(MIN_GREEN_SEC, value))))
+
+
+def validate_signal_plan(obj) -> dict | None:
+    """Return a complete, clamped timing plan keyed by node, or ``None``.
+
+    Exactly the two nodes, exactly these keys per node, numeric greens
+    (clamped to the safe band), strict booleans for the cut and the four
+    lane-2 flashers. Anything else fails closed to Webster.
+    """
+    if not isinstance(obj, dict):
+        return None
+    plan = obj.get("plan")
+    if not isinstance(plan, dict) or set(plan) != set(PLAN_NODES):
+        return None
+    validated = {}
+    for node_key in PLAN_NODES:
+        node_plan = plan[node_key]
+        if not isinstance(node_plan, dict) or set(node_plan) != PLAN_NODE_KEYS:
+            return None
+        ew = _green_seconds(node_plan["ew_green_sec"])
+        ns = _green_seconds(node_plan["ns_green_sec"])
+        cut = node_plan["end_current_green_now"]
+        dbl = node_plan["dbl"]
+        if ew is None or ns is None or not isinstance(cut, bool):
+            return None
+        if not isinstance(dbl, dict) or set(dbl) != set(PLAN_APPROACHES):
+            return None
+        if any(not isinstance(flag, bool) for flag in dbl.values()):
+            return None
+        validated[node_key] = {
+            "ew_green_sec": ew, "ns_green_sec": ns, "end_current_green_now": cut,
+            "dbl": {approach: dbl[approach] for approach in PLAN_APPROACHES},
+        }
+    return validated
+
+
+def safe_signal_plan(raw_text: str, turn: int, model: str) -> dict:
+    """Always return a complete plan decision; malformed output is held to
+    Webster (``plan`` None, status HELD_WEBSTER) and logged."""
+    safe_turn = _safe_turn(turn)
+    safe_model = model if isinstance(model, str) else str(model)
+    safe_raw = raw_text if isinstance(raw_text, str) else str(raw_text)
+    reason = ""
+    try:
+        parsed = extract_json(safe_raw)
+        plan = validate_signal_plan(parsed)
+        reason = extract_reason(parsed)
+    except Exception:
+        plan = None
+    if plan is None:
+        _record_rejection(safe_turn, safe_model, safe_raw)
+    return {
+        "schema_version": 2,
+        "schema": "signal_plan",
+        "turn": safe_turn,
+        "timestamp": round(time.time(), 3),
+        "model": safe_model,
+        "status": "OK" if plan is not None else "HELD_WEBSTER",
+        "plan": plan,
+        "reason": reason if plan is not None else "",
+    }
+
+
 def _safe_turn(turn) -> int:
     try:
         return int(turn)

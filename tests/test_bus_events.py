@@ -255,3 +255,44 @@ def test_tracker_never_raises_on_bad_input(tmp_path):
     tracker.observe([bus], 1, None)
     assert tracker.complete(bus, 2, None) is not None
     tracker.complete(object(), 3, None)
+
+
+def test_every_request_leaves_a_reason_and_dbl_has_its_own_column(tmp_path):
+    """Run 8 audit: 38 of 83 requested-but-not-granted arrivals carried an
+    empty denial_reason (a request that ended COMPLETED untreated, the bus
+    crossing on its own) and DBL revocations landed in the TSP column. A
+    requested arrival now always names its terminal outcome, and a DBL-only
+    request reports through dbl_requested / dbl_denial_reason."""
+    log_path = tmp_path / "bus_events.jsonl"
+    tracker = BusEventTracker(log_path)
+    route = control_panel.bus_routes_config["R1_EB_A_NB"]
+    route["tsp_enabled"] = True
+    route["dbl_enabled"] = False
+    controller = make_controller()
+    controller.phase = 0
+    controller.timer = 0          # long green: the bus crosses untreated
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "GREEN_BUS")
+    record, _ = run_bus_to_completion(bus, controller, tracker)
+    node = record["nodes"][0]
+    assert node["tsp_requested"] is True
+    assert node["tsp_treated"] is False
+    assert node["denial_reason"] != ""
+    assert node["dbl_requested"] is False
+    assert node["dbl_denial_reason"] == ""
+
+    # DBL-only request: its reason never touches the TSP column.
+    route["tsp_enabled"] = False
+    route["dbl_enabled"] = True
+    tracker = BusEventTracker(log_path)
+    controller = make_controller()
+    controller.phase = 0
+    controller.timer = 0
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "DBL_BUS")
+    record, _ = run_bus_to_completion(bus, controller, tracker)
+    node = record["nodes"][0]
+    assert node["dbl_requested"] is True
+    assert node["tsp_requested"] is False
+    assert node["denial_reason"] == ""
+    assert node["dbl_denial_reason"] != ""
+    flat = dict(zip(BUS_EVENT_HEADERS, flatten_bus_event(record)))
+    assert "node1_dbl_denial_reason" in flat

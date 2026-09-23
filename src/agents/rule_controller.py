@@ -61,8 +61,21 @@ APPROACHES = ("EB", "WB", "NB", "SB")
 
 
 def is_rule_model(model) -> bool:
-    """True when the operator selected the rule instead of a model."""
-    return isinstance(model, str) and model.strip().lower() == RULE_MODEL_NAME
+    """True when the operator selected a non-LLM decider (the rule, the
+    passenger-pressure gate or the trained RL policy) instead of a model. All
+    three share what this flag gates: no inference latency, no sampling,
+    no tokens, and a decision that lands on the very next merge tick."""
+    return (
+        isinstance(model, str)
+        and model.strip().lower() in (*control_panel.NON_LLM_MODELS, "max-pressure")
+    )
+
+
+def is_max_pressure_model(model) -> bool:
+    return (
+        isinstance(model, str)
+        and model.strip().lower() in (control_panel.MAX_PRESSURE_MODEL, "max-pressure")
+    )
 
 
 def _agent_module():
@@ -171,11 +184,17 @@ def _candidates(telemetry, decision_lag_sec):
                 "approach": approach,
                 "passengers": passengers,
                 "landed_eta_sec": landed_eta,
+                "eta_sec": nearest.get("eta_to_stop_bar_sec_freeflow"),
+                "movement": leg.get("movement", "STRAIGHT"),
+                "exit_direction": leg.get("exit_direction"),
                 "actionable": bool(agent.is_actionable(landed_eta)),
                 "cross_pax": cross_street_passengers(telemetry, node_key, approach),
                 # Older telemetry without the field: assume it would stop, the
                 # pre-existing behaviour.
                 "would_stop": bool(nearest.get("would_have_stopped", True)),
+                # The bus's own receiving lane (its movement, its lane), not
+                # the approach's straight-through average.
+                "receiving_blocked": bool(nearest.get("receiving_blocked", False)),
             }
         )
     return records
@@ -187,17 +206,13 @@ def _route_flag(telemetry, route_id, key):
     return bool(route.get(key, False)) if isinstance(route, dict) else False
 
 
-def rule_based_decision(
-    telemetry,
-    decision_lag_sec=None,
-    cross_queue_threshold_pax=RULE_CROSS_QUEUE_THRESHOLD_PAX,
-    max_tsp_grants_per_node=MAX_TSP_GRANTS_PER_NODE,
-):
-    """Decide TSP/DBL flags by rule, in the model's own output shape.
+def _decide(telemetry, decision_lag_sec, label, tsp_score, max_tsp_grants_per_node):
+    """Shared decision core for every deterministic comparator.
 
-    Returns ``{"tsp": [6 bools], "dbl": [6 bools], "reason": str}`` with the
-    booleans positioned by guard.ROUTE_ORDER -- the identical structure
-    guard.validate_flags_positional accepts from an LLM.
+    ``tsp_score(record)`` returns ``(score, note)``: a numeric score when the
+    bus qualifies for TSP (higher wins the per-node cap), or ``None`` with a
+    withheld note. DBL handling and the per-node cap are identical across
+    comparators, so only the TSP criterion differs between arms.
     """
     if not isinstance(telemetry, dict):
         telemetry = {}
@@ -228,26 +243,27 @@ def rule_based_decision(
     for record in records:
         if not record["actionable"]:
             continue
-        if not record["would_stop"]:
+        if record["receiving_blocked"]:
+            # A green bought for a bus with nowhere to go releases nothing;
+            # the controller would refuse it (DOWNSTREAM_BLOCKED) anyway.
             withheld_notes.append(
-                f"TSP {record['route_id']}@{record['node_key']} arrives on green"
+                f"TSP {record['route_id']}@{record['node_key']} receiving lane blocked"
             )
             continue
-        if record["cross_pax"] >= cross_queue_threshold_pax:
-            withheld_notes.append(
-                f"TSP {record['route_id']}@{record['node_key']} cross "
-                f"{record['cross_pax']}>={cross_queue_threshold_pax}"
-            )
+        score, note = tsp_score(record)
+        if score is None:
+            withheld_notes.append(note)
             continue
+        record["score"], record["note"] = score, note
         by_node.setdefault(record["node_key"], []).append(record)
 
     for node_key in sorted(by_node):
         qualifying = by_node[node_key]
-        # Highest net passenger benefit first; ETA then route id break ties
-        # so the same telemetry always yields the same decision.
+        # Highest score first; ETA then route id break ties so the same
+        # telemetry always yields the same decision.
         qualifying.sort(
             key=lambda item: (
-                -(item["passengers"] - item["cross_pax"]),
+                -item["score"],
                 item["landed_eta_sec"]
                 if item["landed_eta_sec"] is not None
                 else float("inf"),
@@ -257,11 +273,7 @@ def rule_based_decision(
         for rank, record in enumerate(qualifying):
             if rank < max_tsp_grants_per_node:
                 tsp_routes.add(record["route_id"])
-                granted_notes.append(
-                    f"TSP {record['route_id']}@{node_key} "
-                    f"{record['passengers']}pax vs cross {record['cross_pax']}"
-                    f"<{cross_queue_threshold_pax}"
-                )
+                granted_notes.append(record["note"])
             else:
                 withheld_notes.append(
                     f"TSP {record['route_id']}@{node_key} node cap "
@@ -272,9 +284,9 @@ def rule_based_decision(
         granted_notes.append(f"DBL {route_id}")
 
     if granted_notes:
-        reason = "rule: " + "; ".join(granted_notes)
+        reason = f"{label}: " + "; ".join(granted_notes)
     else:
-        reason = "rule: no grant"
+        reason = f"{label}: no grant"
     if withheld_notes:
         reason += " | withheld: " + "; ".join(withheld_notes)
 
@@ -283,3 +295,96 @@ def rule_based_decision(
         "dbl": [route_id in dbl_routes for route_id in guard.ROUTE_ORDER],
         "reason": reason[: guard.MAX_REASON_LEN],
     }
+
+
+def rule_based_decision(
+    telemetry,
+    decision_lag_sec=None,
+    cross_queue_threshold_pax=RULE_CROSS_QUEUE_THRESHOLD_PAX,
+    max_tsp_grants_per_node=MAX_TSP_GRANTS_PER_NODE,
+):
+    """Decide TSP/DBL flags by rule, in the model's own output shape.
+
+    Returns ``{"tsp": [6 bools], "dbl": [6 bools], "reason": str}`` with the
+    booleans positioned by guard.ROUTE_ORDER -- the identical structure
+    guard.validate_flags_positional accepts from an LLM.
+    """
+
+    def score(record):
+        where = f"{record['route_id']}@{record['node_key']}"
+        if not record["would_stop"]:
+            return None, f"TSP {where} arrives on green"
+        if record["cross_pax"] >= cross_queue_threshold_pax:
+            return None, (
+                f"TSP {where} cross {record['cross_pax']}>={cross_queue_threshold_pax}"
+            )
+        return record["passengers"] - record["cross_pax"], (
+            f"TSP {where} {record['passengers']}pax vs cross "
+            f"{record['cross_pax']}<{cross_queue_threshold_pax}"
+        )
+
+    return _decide(telemetry, decision_lag_sec, "rule", score, max_tsp_grants_per_node)
+
+
+# --- max-pressure comparator ---------------------------------------------------
+#
+# This passenger-pressure comparator gates bus TSP; it does not select the
+# network's phases. The arms here differ only in who sets the TSP/DBL flags -- Webster and the
+# SignalController stay the mechanism -- so max-pressure is applied as the
+# TSP gate: the bus approach is served when its passenger pressure beats the
+# pressure of the cross street a grant would hold. A movement whose
+# downstream is blocked carries no pressure (serving it releases nothing),
+# which is the spillback term of the original.
+#
+# ponytail: downstream is a blocked/not-blocked veto from telemetry rather
+# than a pax-weighted downstream queue; use downstream_space_m if the arm
+# needs a graded downstream term.
+
+
+def _node_state(telemetry, node_key):
+    nodes = (telemetry.get("signal_state") or {}).get("nodes") or {}
+    node = nodes.get(str(node_key)) if isinstance(nodes, dict) else None
+    return node if isinstance(node, dict) else {}
+
+
+def approach_pressure(telemetry, node_key, approach, extra_pax=0):
+    """Queued passengers upstream of ``approach`` plus ``extra_pax``, or 0
+    when its downstream is blocked."""
+    blocked = _node_state(telemetry, node_key).get("downstream_blocked") or {}
+    if isinstance(blocked, dict) and blocked.get(str(approach)):
+        return 0
+    positions = _node_positions(telemetry)
+    waiting = _node_queue_passengers(
+        telemetry, node_key, positions.get(str(node_key), 0)
+    )
+    return waiting.get(str(approach), 0) + int(extra_pax)
+
+
+def cross_street_pressure(telemetry, node_key, approach):
+    return sum(
+        approach_pressure(telemetry, node_key, name)
+        for name in CONFLICTING_APPROACHES.get(str(approach), ())
+    )
+
+
+def max_pressure_decision(
+    telemetry, decision_lag_sec=None, max_tsp_grants_per_node=MAX_TSP_GRANTS_PER_NODE
+):
+    """Grant TSP where the bus approach's pressure exceeds the cross street's."""
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+
+    def score(record):
+        where = f"{record['route_id']}@{record['node_key']}"
+        own = approach_pressure(
+            telemetry, record["node_key"], record["approach"], record["passengers"]
+        )
+        cross = cross_street_pressure(telemetry, record["node_key"], record["approach"])
+        pressure = own - cross
+        if pressure <= 0:
+            return None, f"TSP {where} pressure {own}-{cross}<=0"
+        return pressure, f"TSP {where} pressure {own}-{cross}={pressure}"
+
+    return _decide(
+        telemetry, decision_lag_sec, control_panel.MAX_PRESSURE_MODEL, score, max_tsp_grants_per_node
+    )

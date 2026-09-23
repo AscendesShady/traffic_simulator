@@ -13,6 +13,7 @@ import hashlib
 import statistics
 import datetime
 import copy
+from collections import deque
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
@@ -27,6 +28,7 @@ from src.ui import control_panel
 from src.core import guard
 from src.core import webster
 from src.experiments import batch_runner
+from src.agents import rule_controller
 from src.core import vehicle as vehicle_module
 from src.core.vehicle import (
     Vehicle, Bus, DBL_LANE_INDEX, BUS_PASSENGERS, lane_changes_suspended,
@@ -34,6 +36,7 @@ from src.core.vehicle import (
 from src.core.signal_controller import SignalController, TSP_MAX_ADJUST_FRACTION, MIN_GREEN_FRAMES
 from src.ui.telemetry_dashboard import TelemetryDashboard, build_excel_export_filename
 from src.telemetry.telemetry_exporter import TelemetryExporter
+from src.telemetry.gridlock_monitor import GridlockMonitor, report_path_for
 from src.telemetry.bus_event_log import (
     BUS_NODE_EVENT_HEADERS,
     BusEventTracker,
@@ -62,7 +65,16 @@ post_discharge_meter_frames_remaining = 0
 
 def _new_spawner_state():
     return {
-        "burst_queue": 0,
+        # Exogenous demand: one seeded stream per source, and every offered
+        # arrival is drawn complete (turn, lane, type, speed, color) at offer
+        # time and queued at the source until the entry is clear, so what the
+        # network does downstream can never change what is offered upstream.
+        # Seeded off the global RNG once, at reset, so a test that seeds
+        # `random` gets deterministic sources; a run reseeds them per source
+        # from its own seed (seed_demand_streams) and never touches them again.
+        "rng": random.Random(random.getrandbits(64)),
+        "clock": 0,
+        "arrivals": deque(),
         "frames_since_spawn": 999,
         "pending_arrivals": 0,
         "congestion_cycle_frame": 0,
@@ -82,6 +94,8 @@ spawner_states = {
 }
 
 bus_dispatch_counters = { r_id: 0.0 for r_id in control_panel.bus_routes_config.keys() }
+bus_pending_trips = {r_id: deque() for r_id in control_panel.bus_routes_config}
+bus_schedule_time_s = 0.0
 bus_sequence_counter = 0
 network_throughput = {
     "passengers_served_total": 0,
@@ -103,6 +117,21 @@ network_throughput = {
     # look better by turning stops into creeping. Floats.
     "bus_passenger_travel_delay_frames": 0.0,
     "car_passenger_travel_delay_frames": 0.0,
+    # Passenger-frames in the network (every vehicle, every frame): the
+    # exposure a censored (unfinished) vehicle contributes.
+    "passenger_frames_in_network": 0,
+    # The same delays, but only for vehicles that have completed: the
+    # counters above include vehicles still in the network, whose delay is
+    # in the numerator while they are missing from the served denominator,
+    # so every per-vehicle / per-passenger MEAN divides these instead.
+    # Filled by _record_completed_vehicle_delay.
+    "completed_stopped_vehicle_frames": 0,
+    "completed_bus_passenger_delay_frames": 0,
+    "completed_car_passenger_delay_frames": 0,
+    # Arrival-to-departure delay of completed vehicles, vehicle-weighted:
+    # frames lost below own free-flow speed over the whole route (HCM
+    # control delay summed over the nodes the vehicle crossed). Float.
+    "completed_control_delay_frames": 0.0,
     # Congestion sampled once per simulated frame, for a run-long mean/max.
     "vehicles_in_network_frame_sum": 0,
     "vehicles_in_network_sample_count": 0,
@@ -128,6 +157,9 @@ def _new_run_metrics():
     """Exact per-run counters that do not belong in sampled telemetry."""
     return {
         "buses_spawned": 0,
+        "bus_trips_scheduled": 0,
+        "bus_trips_missed": 0,
+        "bus_source_delay_sec": 0.0,
         "vehicles_in_network_current": 0,
         "vehicles_in_network_steady_sum": 0,
         "vehicles_in_network_steady_samples": 0,
@@ -146,6 +178,9 @@ def _new_run_metrics():
         "spillback_events": 0,
         "spillback_active_ids": set(),
         "node_stopped_vehicle_frames": {str(node_x): 0 for node_x in canvas.INT_X},
+        # Stopped frames on the approach, credited to the node once the
+        # vehicle has crossed it (completed cohort for node_*_mean_delay_sec).
+        "node_completed_stopped_frames": {str(node_x): 0 for node_x in canvas.INT_X},
         "node_throughput_veh": {str(node_x): 0 for node_x in canvas.INT_X},
         "node_phase_failures": {str(node_x): 0 for node_x in canvas.INT_X},
         "node_max_queue_len": {str(node_x): 0 for node_x in canvas.INT_X},
@@ -178,45 +213,106 @@ def snapshot_warmup_baseline(master_frame_count):
     network_throughput_at_warmup["frame"] = int(master_frame_count)
 
 
-# Realised-demand fingerprint: updated once per admitted vehicle spawn
-# (try_spawn_vehicle) so "same seed = same demand" is a one-column check
-# instead of re-deriving it from six approach_configs fields. Reset each run.
-_demand_draw_state = {"hash": hashlib.sha256()}
+# Offered-demand fingerprint: every offered arrival (source, offer frame and
+# the complete attribute draw) so "same seed = same demand" is a one-column
+# check, and pair_against_baseline refuses a pair whose schedules differ.
+# Reset each run.
+# (offer frame, fingerprint) per exogenous arrival, in draw order. Not a
+# rolling digest: see _demand_draw_hash_hex.
+_demand_draw_state = {"offers": []}
+DEMAND_MODEL_SIGNATURE = "per_source_streams_queued_v2"
+VEHICLE_COLORS = [(50, 150, 250), (250, 100, 50), (250, 200, 50), (150, 50, 250), (50, 200, 150)]
 
 
-def _record_demand_draw(approach_key, lane_idx, target_turn, is_heavy, speed):
-    _demand_draw_state["hash"].update(
-        f"{approach_key}|{lane_idx}|{target_turn}|{int(is_heavy)}|{speed:.4f}|".encode(
-            "utf-8"
-        )
-    )
+def _demand_draw_hash_hex(up_to_frame=None):
+    """Fingerprint of the offered demand schedule through ``up_to_frame``.
 
-
-def _demand_draw_hash_hex():
-    return _demand_draw_state["hash"].copy().hexdigest()[:16]
-
-
-def _record_demand_offer(approach_key, state, count=1):
-    """Count and fingerprint exogenous arrivals before source admission.
-
-    Offered passenger demand uses the configured heavy-vehicle mixture's
-    expected occupancy (car=4, truck=1). This remains independent of source
-    blockage; served passenger totals continue to use each admitted vehicle's
-    actual draw.
+    Keyed by the frame each arrival was offered on, never by "everything
+    drawn so far": a running digest read at export made the fingerprint
+    depend on the frame the export happened to land on, and a single frame
+    of overshoot changed it. Campaign 2026-09-22 split every seed into two
+    groups one offered car apart (2803 vs 2802 at seed 234) whose demand was
+    in fact identical, and pair_against_baseline refused 13 of 29 arms on
+    it. The 5- and 10-minute checkpoints agreed exactly; only the final
+    export drifted, which is why the earlier at_export_boundary fix reduced
+    the damage without ending it. Hashing by frame makes the fingerprint a
+    property of the schedule, so an overshoot cannot change it at all.
     """
-    count = max(0, int(count))
-    if not count:
-        return
-    cfg = control_panel.approach_configs.get(approach_key, {})
-    heavy_ratio = min(1.0, max(0.0, float(cfg.get("heavy_ratio", 0.10) or 0.0)))
-    expected_pax = (1.0 - heavy_ratio) * 4.0 + heavy_ratio * 1.0
-    start = int(state["requested_arrivals"])
-    state["requested_arrivals"] += count
-    state["offered_passengers"] += expected_pax * count
-    for sequence in range(start + 1, start + count + 1):
-        _demand_draw_state["hash"].update(
-            f"{approach_key}|{sequence}|{state.get('last_model')}|".encode("utf-8")
-        )
+    digest = hashlib.sha256()
+    for frame, fingerprint in _demand_draw_state["offers"]:
+        if up_to_frame is not None and frame > up_to_frame:
+            continue
+        digest.update(fingerprint)
+    return digest.hexdigest()[:16]
+
+
+def seed_demand_streams(seed):
+    """Give every source its own stream, derived from the run seed, so the
+    demand a seed produces is independent of every other random consumer
+    (other sources, behavioural draws such as lane changes)."""
+    for approach_key, state in spawner_states.items():
+        state["rng"].seed(None if seed is None else f"{seed}:{approach_key}")
+
+
+def _draw_arrival(approach_key, state, approach_cfg):
+    rng = state["rng"]
+    direction = approach_key.rsplit("_", 1)[-1]
+    straight_ratio = approach_cfg.get("turn_split", 0.80)
+    far_share = approach_cfg.get("left_far_share", 0.0)
+    options = control_panel.APPROACH_TURN_OPTIONS[approach_key]
+    draw = rng.random()
+    if draw < straight_ratio:
+        target_turn = "STRAIGHT"
+        left_nodes = ()
+        lane_idx = rng.choice([0, 1])
+    else:
+        # Second option only where the approach has one (else it is the
+        # first); which option decides the left nodes (control_panel table).
+        far = len(options) > 1 and draw >= 1.0 - far_share
+        left_nodes = options[1 if far else 0][1]
+        first_node = canvas.INT_X[0] if direction == "EB" else canvas.INT_X[-1]
+        if direction in ("EB", "WB") and left_nodes[0] != first_node:
+            # Turns at the far node: runs with through traffic and merges
+            # into the turn lane on the approach to that node.
+            target_turn = "STRAIGHT"
+            lane_idx = rng.choice([0, 1])
+        else:
+            target_turn = "LEFT"
+            lane_idx = DBL_LANE_INDEX
+    is_heavy = rng.random() < approach_cfg.get("heavy_ratio", 0.10)
+    base_speed = rng.uniform(0.8, 1.1) if is_heavy else rng.uniform(1.0, 1.4)
+    color = (120, 120, 140) if is_heavy else rng.choice(VEHICLE_COLORS)
+    return {
+        "frame": state["clock"], "target_turn": target_turn, "left_nodes": left_nodes,
+        "lane_idx": lane_idx, "is_heavy": is_heavy,
+        "speed": base_speed * get_active_vehicle_speed_scale(), "color": color,
+    }
+
+
+def _record_demand_offer(approach_key, state, count=1, approach_cfg=None):
+    """Draw, count and fingerprint exogenous arrivals before source admission.
+
+    Each arrival is drawn complete here and queued at the source; a blocked
+    entry delays it, never loses or redraws it. Offered passengers use the
+    drawn vehicle type (car=4, truck=1), independent of source blockage.
+    """
+    if approach_cfg is None:
+        approach_cfg = control_panel.approach_configs.get(approach_key, {})
+    for _ in range(max(0, int(count))):
+        arrival = _draw_arrival(approach_key, state, approach_cfg)
+        state["requested_arrivals"] += 1
+        state["offered_passengers"] += 1.0 if arrival["is_heavy"] else 4.0
+        _demand_draw_state["offers"].append((
+            int(arrival["frame"]),
+            f"{approach_key}|{state['requested_arrivals']}|{arrival['frame']}|"
+            f"{arrival['target_turn']}|{arrival['lane_idx']}|{int(arrival['is_heavy'])}|"
+            f"{arrival['speed']:.4f}|".encode("utf-8"),
+        ))
+        if state["pending_arrivals"] < MAX_PENDING_ARRIVALS:
+            state["pending_arrivals"] += 1
+            state["arrivals"].append(arrival)
+        else:
+            state["overflow_arrivals"] += 1
 
 
 # git_sha/git_dirty describe the code the CURRENT process is running, which
@@ -248,24 +344,33 @@ def _git_info():
 
 # Regime fields hashed into config_hash: everything that must stay frozen for
 # the whole campaign (demand, geometry/timing-derived state, run length).
-# Deliberately excludes per-run/per-arm values (seed, test_model, timestamps).
+# Deliberately excludes per-run/per-arm values (seed, test_model, timestamps)
+# and treatment: a route's tsp/dbl flags are what the arm *does*, recorded
+# in the model/llm_* columns, never part of the regime. The hash is frozen
+# once per run at reset (config["_regime_hash"]); a checkpoint re-hashing
+# live config could otherwise describe a different regime mid-run.
 _CONFIG_HASH_GLOBAL_KEYS = (
     "vehicle_speed_scale", "priority_eligibility_px", "measured_saturation_flow",
     "warmup_discard_frames", "cycle_time_sec", "test_duration_sim_seconds",
 )
+_ROUTE_TREATMENT_KEYS = ("tsp_enabled", "dbl_enabled", "manual_dispatch")
 
 
 def _config_regime_hash(config):
     payload = {
         "global": {key: config.get(key) for key in _CONFIG_HASH_GLOBAL_KEYS},
         "approach_configs": control_panel.approach_configs,
-        "bus_routes_config": control_panel.bus_routes_config,
+        "bus_routes_config": {
+            route_id: {k: v for k, v in cfg.items() if k not in _ROUTE_TREATMENT_KEYS}
+            for route_id, cfg in control_panel.bus_routes_config.items()
+        },
         # Geometry is part of the regime: rows from a different network
         # length must never pair with these.
         "geometry": [canvas.WIDTH, canvas.HEIGHT, canvas.H_Y, list(canvas.INT_X)],
         # So are the movement-model tunables: following law and lane-change
         # incentives change capacity, so rows across a retune never pair.
         "movement": vehicle_module.movement_model_signature(),
+        "demand": DEMAND_MODEL_SIGNATURE,
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
@@ -298,6 +403,9 @@ def _record_node_crossings(vehicle):
         key = str(node_x)
         if key in run_metrics["node_throughput_veh"]:
             run_metrics["node_throughput_veh"][key] += 1
+            run_metrics["node_completed_stopped_frames"][key] += int(
+                getattr(vehicle, "_experiment_node_stopped_frames", {}).get(key, 0)
+            )
     vehicle._experiment_nodes_counted = set(getattr(vehicle, "passed_nodes", set()))
 
 
@@ -307,6 +415,15 @@ def _record_completed_vehicle_delay(vehicle):
         float(getattr(vehicle, "_experiment_steady_stopped_frames", 0)) / 60.0
     )
     passengers = max(0, int(getattr(vehicle, "passengers", 0) or 0))
+    stopped_frames = int(getattr(vehicle, "_experiment_stopped_frames", 0))
+    network_throughput["completed_stopped_vehicle_frames"] += stopped_frames
+    network_throughput["completed_control_delay_frames"] += float(
+        getattr(vehicle, "_experiment_travel_delay_frames", 0.0)
+    )
+    network_throughput[
+        "completed_bus_passenger_delay_frames" if isinstance(vehicle, Bus)
+        else "completed_car_passenger_delay_frames"
+    ] += stopped_frames * passengers
     target = (
         run_metrics["bus_delay_samples_sec"]
         if isinstance(vehicle, Bus)
@@ -353,6 +470,9 @@ def accumulate_frame_metrics(vehicles, signal_controller=None):
         free_flow = float(getattr(v, "max_speed", 0.0) or 0.0)
         if free_flow > 0:
             lost = 1.0 - min(max(float(v.speed), 0.0), free_flow) / free_flow
+            v._experiment_travel_delay_frames = (
+                float(getattr(v, "_experiment_travel_delay_frames", 0.0)) + lost
+            )
             if isinstance(v, Bus):
                 travel_bus_pax += int(getattr(v, "passengers", 0)) * lost
             else:
@@ -383,12 +503,16 @@ def accumulate_frame_metrics(vehicles, signal_controller=None):
                     if approach_key in queue_counts:
                         queue_counts[approach_key] += 1
                     run_metrics["node_stopped_vehicle_frames"][str(target_node)] += 1
+                    per_node = getattr(v, "_experiment_node_stopped_frames", None)
+                    if per_node is None:
+                        per_node = v._experiment_node_stopped_frames = {}
+                    per_node[str(target_node)] = per_node.get(str(target_node), 0) + 1
                     if v.direction in cross_requests.get(target_node, set()):
                         run_metrics["cross_street_vehicle_delay_frames"] += 1
                         run_metrics["cross_street_passenger_delay_frames"] += pax
-                        run_metrics["cross_street_vehicle_ids"].add(id(v))
-                        if pax and id(v) not in run_metrics["cross_street_passenger_ids"]:
-                            run_metrics["cross_street_passenger_ids"].add(id(v))
+                        run_metrics["cross_street_vehicle_ids"].add(v.serial)
+                        if pax and v.serial not in run_metrics["cross_street_passenger_ids"]:
+                            run_metrics["cross_street_passenger_ids"].add(v.serial)
                             run_metrics["cross_street_unique_pax"] += pax
             except Exception:
                 pass
@@ -400,7 +524,7 @@ def accumulate_frame_metrics(vehicles, signal_controller=None):
             if upstream and v.is_spillback_blocked(
                 target_node, canvas.H_Y, canvas.ROAD_W, vehicles
             ):
-                spillback_now.add(id(v))
+                spillback_now.add(v.serial)
         except Exception:
             pass
     network_throughput["stopped_vehicle_frames"] += stopped_count
@@ -408,6 +532,9 @@ def accumulate_frame_metrics(vehicles, signal_controller=None):
     network_throughput["car_passenger_delay_frames"] += stopped_car_pax
     network_throughput["bus_passenger_travel_delay_frames"] += travel_bus_pax
     network_throughput["car_passenger_travel_delay_frames"] += travel_car_pax
+    network_throughput["passenger_frames_in_network"] += sum(
+        int(getattr(v, "passengers", 0)) for v in vehicles
+    )
     network_throughput["vehicles_in_network_frame_sum"] += len(vehicles)
     network_throughput["vehicles_in_network_sample_count"] += 1
     if len(vehicles) > network_throughput["vehicles_in_network_max"]:
@@ -462,12 +589,35 @@ DECISION_STALE_MULTIPLIER = 3
 DECISION_STALE_FLOOR_SEC = 12.0
 AGENT_TURN_LOG_PATH = LOGS_DIR / "agent_turn_log.jsonl"
 TELEMETRY_LOG_PATH = LOGS_DIR / "telemetry_log.jsonl"
+# Samples every exported telemetry payload; its report is written beside
+# each run workbook as <workbook>_gridlock.xlsx.
+gridlock_monitor = GridlockMonitor()
 BUS_EVENTS_LOG_PATH = LOGS_DIR / "bus_events.jsonl"
 EXCEL_EXPORT_DIR = RESULTS_DIR
 # The master cross-run comparison dataset: one row per checkpoint of every
 # run, appended forever. Never cleared by RESET -- only the operator deleting
 # the file starts a new dataset. See append_experiment_summary_row.
 EXPERIMENT_SUMMARY_PATH = RESULTS_DIR / "experiment_summary.csv"
+
+
+def experiment_summary_path():
+    """The dated dataset this run's rows go to: experiment_summary_<YYYYMMDD>.csv,
+    stamped with the day its campaign started (a batch crossing midnight stays
+    in one file; a single run is a campaign of one). One undated file across
+    every day mixed regimes that could never pair -- rows from before and
+    after a fix share a header but not a git_sha -- so each day is its own
+    dataset and the paired-DV file sits beside it."""
+    config = control_panel.global_config
+    batch_runtime = config.get("batch_runtime") or {}
+    stamp = batch_runtime.get("campaign_stamp") if batch_runtime.get("campaign_id") else None
+    if not stamp:
+        started = config.get("_run_started_wall")
+        if not isinstance(started, (int, float)):
+            started = time.time()
+        stamp = time.strftime("%Y%m%d", time.localtime(started))
+    return EXPERIMENT_SUMMARY_PATH.with_name(
+        f"{EXPERIMENT_SUMMARY_PATH.stem}_{stamp}{EXPERIMENT_SUMMARY_PATH.suffix}"
+    )
 TELEMETRY_LOG_INTERVAL = 60
 SESSION_ROUTE_IDS = (
     "R1_EB_A_NB",
@@ -490,8 +640,10 @@ def apply_configured_random_seed():
     if seed is not None:
         normalized_seed = int(seed)
         random.seed(normalized_seed)
+        seed_demand_streams(normalized_seed)
         print(f"[SIM] Deterministic run, seed={normalized_seed}")
         return normalized_seed
+    seed_demand_streams(None)
     print("[SIM] Nondeterministic run (no seed set)")
     return None
 
@@ -912,6 +1064,9 @@ def _audit_row(decision, telemetry, outcome=None):
     telemetry = telemetry if isinstance(telemetry, dict) else {}
     outcome = outcome if isinstance(outcome, dict) else {}
     flags = decision.get("flags") if isinstance(decision.get("flags"), dict) else {}
+    if decision.get("schema") == "signal_plan":
+        # AI Configured: the plan is the action; the route columns stay empty.
+        flags = {"plan": decision.get("plan")}
     routes = telemetry.get("routes") if isinstance(telemetry.get("routes"), dict) else {}
     signals = telemetry.get("signal_state")
     signal_nodes = signals.get("nodes", {}) if isinstance(signals, dict) else {}
@@ -1266,11 +1421,15 @@ def export_session_excel(output_path=None):
                     ),
                 ),
                 control_panel.global_config.get("random_seed"),
+                control_mode=control_panel.global_config.get(
+                    "ai_runtime", {}
+                ).get("control_mode"),
             )
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
         workbook.save(destination)
         workbook.close()
+        gridlock_monitor.write_workbook(report_path_for(destination))
         print(f"Session exported: {destination}")
         return destination
     except Exception as exc:
@@ -1338,6 +1497,7 @@ def control_panel_input_rows():
                 (section, "generation_model", approach.get("model")),
                 (section, "inflow_rate_veh_per_min", approach.get("rate")),
                 (section, "turn_split", approach.get("turn_split")),
+                (section, "left_far_share", approach.get("left_far_share", 0.0)),
                 (section, "heavy_ratio", approach.get("heavy_ratio")),
             )
         )
@@ -1358,10 +1518,19 @@ def control_panel_input_rows():
 
 
 def write_control_panel_inputs_sheet(sheet):
-    """Write the operator-input table onto an open worksheet."""
+    """Write the operator-input table onto an open worksheet, and beside it
+    the same table as it stood at run start (snapshot taken by
+    perform_full_reset). In an assisted run the per-route tsp/dbl flags on
+    this end-of-run sheet are the decider's last decision, not operator
+    configuration; the start sheet is the run's verifiable setup."""
     sheet.append(list(CONTROL_INPUT_HEADERS))
     for row in control_panel_input_rows():
         sheet.append(list(row))
+    if getattr(sheet, "parent", None) is not None:
+        start_sheet = sheet.parent.create_sheet("Control Panel Inputs (start)")
+        start_sheet.append(list(CONTROL_INPUT_HEADERS))
+        for row in control_panel.global_config.get("_initial_input_rows") or []:
+            start_sheet.append(list(row))
     return sheet
 
 
@@ -1388,7 +1557,7 @@ def write_unit_conversions_sheet(sheet, telemetry=None):
 
 # Bumped whenever a column is added/removed/redefined. append_experiment_summary_row
 # rotates the CSV (never appends ragged) when either this or config_hash changes.
-EXPERIMENT_SUMMARY_SCHEMA_VERSION = 5
+EXPERIMENT_SUMMARY_SCHEMA_VERSION = 7
 
 # PRIMARY DV: total_person_hours_travel_delay_steady, compared as a paired
 # per-seed difference against the baseline arm (pair_against_baseline ->
@@ -1414,13 +1583,14 @@ EXPERIMENT_SUMMARY_HEADERS = (
     # Configuration echo (section B): frozen inputs, so cross-run comparison
     # never requires opening a workbook's Control Panel Inputs sheet.
     "decision_interval_sec", "sim_speed", "random_seed", "llm_model", "llm_armed",
+    "movement_model", "control_mode",
     "test_duration_sim_sec",
     "priority_eligibility_px", "link_length_px", "tsp_max_adjust_fraction",
     "min_green_frames", "TSP_MAX_ADJUST_FRACTION", "MIN_GREEN_FRAMES",
     "yellow_time_frames", "red_clearance_time_frames",
     "lost_time_sec", "min_cycle_sec", "discharge_selection",
     "measured_saturation_flow_veh_per_hr", "bus_occupancy_pax", "demand_model",
-    "demand_draw_hash", "sampling_params_json",
+    "demand_draw_hash", "export_frame", "sampling_params_json",
     # Throughput
     "passengers_served_total", "passengers_served_bus", "passengers_served_car",
     "buses_served", "cars_served", "pax_per_min",
@@ -1429,6 +1599,11 @@ EXPERIMENT_SUMMARY_HEADERS = (
     "total_person_hours_travel_delay", "bus_person_hours_travel_delay",
     "car_person_hours_travel_delay",
     "mean_bus_passenger_delay_sec", "mean_car_passenger_delay_sec",
+    # Completed-cohort per-vehicle delay (the LOS input) and the censored
+    # exposure of vehicles still in the network at the checkpoint, reported
+    # apart so an early checkpoint cannot inflate a mean.
+    "mean_stopped_delay_sec_per_vehicle", "mean_control_delay_sec_per_vehicle",
+    "passenger_hours_in_network", "unfinished_stopped_person_hours",
     # Congestion
     "mean_vehicles_in_network", "max_vehicles_in_network",
     # Mechanism (the causal proof, from Bus Events)
@@ -1447,7 +1622,8 @@ EXPERIMENT_SUMMARY_HEADERS = (
     "offered_veh", "offered_pax", "served_veh", "served_pax",
     "served_fraction_veh", "served_fraction_pax",
     "vehicles_still_in_network_at_end", "buses_spawned", "buses_completed",
-    "bus_completion_rate",
+    "bus_completion_rate", "bus_trips_scheduled", "bus_trips_pending",
+    "bus_trips_missed", "bus_source_delay_sec",
     # LOS
     "level_of_service",
     # Steady-state DVs: the same quantities over the post-warm-up window only.
@@ -1462,6 +1638,7 @@ EXPERIMENT_SUMMARY_HEADERS = (
     "total_person_hours_travel_delay_steady", "bus_person_hours_travel_delay_steady",
     "car_person_hours_travel_delay_steady",
     "mean_bus_passenger_delay_sec_steady", "mean_car_passenger_delay_sec_steady",
+    "delay_sec_per_pax_served_steady",
     "bus_passenger_delay_sec_p50", "bus_passenger_delay_sec_p90",
     "car_passenger_delay_sec_p50", "car_passenger_delay_sec_p90",
     "bus_passenger_delay_sec_p50_steady", "bus_passenger_delay_sec_p90_steady",
@@ -1515,7 +1692,7 @@ def _node_breakdown_columns(config, controller_metrics):
         key = str(node_x)
         served = run_metrics["node_throughput_veh"][key]
         out[f"node_{name}_mean_delay_sec"] = (
-            round(run_metrics["node_stopped_vehicle_frames"][key] / 60.0 / served, 3)
+            round(run_metrics["node_completed_stopped_frames"][key] / 60.0 / served, 3)
             if served else None
         )
         out[f"node_{name}_throughput_veh"] = served
@@ -1558,8 +1735,11 @@ def _time_to_converge_sec(telemetry_rows, checkpoint_seconds):
 
 
 def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
-    """Post-warm-up DVs from the warm-up snapshot, plus a convergence flag
-    on the cumulative pax/min (within 5% between 0.8T and T)."""
+    """Post-warm-up DVs from the warm-up snapshot, plus a convergence flag:
+    cumulative pax/min within 5% between 0.8T and T *and* vehicles in the
+    network within 10% over the same span. A cumulative mean is stable by
+    construction, so alone it flagged runs whose accumulation was still
+    climbing monotonically at the horizon (Run 8: 5 of 22 "converged")."""
     warm = network_throughput_at_warmup
     warmup_sec = warmup_discard_frames() / 60.0
     steady_sec = checkpoint_seconds - warmup_sec
@@ -1586,6 +1766,7 @@ def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
         "car_person_hours_travel_delay_steady": None,
         "mean_bus_passenger_delay_sec_steady": None,
         "mean_car_passenger_delay_sec_steady": None,
+        "delay_sec_per_pax_served_steady": None,
     }
     if warm and steady_sec > 0:
         def delta(key):
@@ -1594,6 +1775,8 @@ def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
         car_pax = int(delta("passengers_served_car"))
         bus_delay_sec = delta("bus_passenger_delay_frames") / 60.0
         car_delay_sec = delta("car_passenger_delay_frames") / 60.0
+        bus_done_sec = delta("completed_bus_passenger_delay_frames") / 60.0
+        car_done_sec = delta("completed_car_passenger_delay_frames") / 60.0
         bus_travel_h = delta("bus_passenger_travel_delay_frames") / 60.0 / 3600.0
         car_travel_h = delta("car_passenger_travel_delay_frames") / 60.0 / 3600.0
         out.update({
@@ -1611,10 +1794,17 @@ def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
             "bus_person_hours_travel_delay_steady": round(bus_travel_h, 4),
             "car_person_hours_travel_delay_steady": round(car_travel_h, 4),
             "mean_bus_passenger_delay_sec_steady": (
-                round(bus_delay_sec / bus_pax, 2) if bus_pax else None
+                round(bus_done_sec / bus_pax, 2) if bus_pax else None
             ),
             "mean_car_passenger_delay_sec_steady": (
-                round(car_delay_sec / car_pax, 2) if car_pax else None
+                round(car_done_sec / car_pax, 2) if car_pax else None
+            ),
+            # Travel delay per passenger actually served in the window: raw
+            # person-hours reward serving fewer people, and served_fraction
+            # moves with the offered demand, which differs between arms.
+            "delay_sec_per_pax_served_steady": (
+                round((bus_travel_h + car_travel_h) * 3600.0 / (bus_pax + car_pax), 2)
+                if (bus_pax + car_pax) else None
             ),
         })
     served_total = int(network_throughput.get("passengers_served_total", 0) or 0)
@@ -1627,8 +1817,21 @@ def _steady_state_metrics(checkpoint_seconds, telemetry_rows):
         and isinstance(row.get("pax_per_min_cumulative"), (int, float))
     ]
     if earlier and ppm_now > 0:
-        ppm_then = max(earlier, key=lambda row: row["sim_time_s"])["pax_per_min_cumulative"]
-        out["converged"] = abs(ppm_now - ppm_then) / ppm_now < 0.05
+        then = max(earlier, key=lambda row: row["sim_time_s"])
+        ppm_stable = abs(ppm_now - then["pax_per_min_cumulative"]) / ppm_now < 0.05
+        latest = [
+            row for row in telemetry_rows
+            if isinstance(row, dict)
+            and isinstance(row.get("sim_time_s"), (int, float))
+            and row["sim_time_s"] <= checkpoint_seconds
+            and isinstance(row.get("vehicles_in_network"), (int, float))
+        ]
+        load_stable = True
+        if latest and isinstance(then.get("vehicles_in_network"), (int, float)):
+            n_now = max(latest, key=lambda row: row["sim_time_s"])["vehicles_in_network"]
+            n_then = then["vehicles_in_network"]
+            load_stable = abs(n_now - n_then) <= 0.10 * max(n_now, n_then, 1)
+        out["converged"] = ppm_stable and load_stable
     return out
 
 
@@ -1716,7 +1919,12 @@ def _decisions_effective_count(decisions):
     previous = frozenset()
     effective = 0
     for decision in decisions:
-        flags = normalize(decision.get("flags", {}))
+        if decision.get("schema") == "signal_plan":
+            # AI Configured: a turn counts when the plan it wrote differs.
+            plan = decision.get("plan")
+            flags = frozenset([json.dumps(plan, sort_keys=True)]) if plan else frozenset()
+        else:
+            flags = normalize(decision.get("flags", {}))
         if flags != previous:
             effective += 1
         previous = flags
@@ -1785,10 +1993,10 @@ def _decision_schedule_metrics(
 
 
 def _sampling_params_json(config):
-    """Temperature/top_p/etc for an LLM arm; null for rule-based and baseline,
-    which have no sampling to report."""
+    """Temperature/top_p/etc for an LLM arm; null for the non-LLM comparators
+    and baseline, which have no sampling to report."""
     model = config.get("test_model", "None")
-    if is_baseline_run(config) or model == control_panel.RULE_BASED_MODEL:
+    if is_baseline_run(config) or model in control_panel.NON_LLM_MODELS:
         return None
     # Every provider call in agent.py (_call_gemini/_call_openai/_call_grok/
     # _call_ollama) is hardcoded to temperature=0.2; update here if that ever
@@ -1942,11 +2150,12 @@ def _qa_unbalanced_seed(campaign_id, model, seed):
     seed set (so far) does not match the union of seeds seen anywhere in the
     campaign. Necessarily partial mid-campaign; accurate once the campaign's
     last (seed, model) combination has been appended."""
-    if not campaign_id or not EXPERIMENT_SUMMARY_PATH.exists():
+    summary_path = experiment_summary_path()
+    if not campaign_id or not summary_path.exists():
         return False
     try:
         seeds_by_model = {}
-        with EXPERIMENT_SUMMARY_PATH.open("r", encoding="utf-8", newline="") as handle:
+        with summary_path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             if not reader.fieldnames or "campaign_id" not in reader.fieldnames:
                 return False
@@ -2029,12 +2238,19 @@ def build_experiment_summary_row(
     car_delay_sec = int(throughput.get("car_passenger_delay_frames", 0) or 0) / 60.0
     bus_travel_h = float(throughput.get("bus_passenger_travel_delay_frames", 0) or 0) / 60.0 / 3600.0
     car_travel_h = float(throughput.get("car_passenger_travel_delay_frames", 0) or 0) / 60.0 / 3600.0
-    stopped_frames = int(throughput.get("stopped_vehicle_frames", 0) or 0)
+    bus_done_sec = int(throughput.get("completed_bus_passenger_delay_frames", 0) or 0) / 60.0
+    car_done_sec = int(throughput.get("completed_car_passenger_delay_frames", 0) or 0) / 60.0
     vehicles_served_total = int(throughput.get("vehicles_served_total", 0) or 0)
-    mean_stopped_delay_sec_per_vehicle = (
-        round(stopped_frames / 60.0 / vehicles_served_total, 2)
-        if vehicles_served_total else None
-    )
+    mean_stopped_delay_sec_per_vehicle = mean_control_delay_sec_per_vehicle = None
+    if vehicles_served_total:
+        mean_stopped_delay_sec_per_vehicle = round(
+            int(throughput.get("completed_stopped_vehicle_frames", 0) or 0)
+            / 60.0 / vehicles_served_total, 2
+        )
+        mean_control_delay_sec_per_vehicle = round(
+            float(throughput.get("completed_control_delay_frames", 0.0) or 0.0)
+            / 60.0 / vehicles_served_total, 2
+        )
     sample_count = int(throughput.get("vehicles_in_network_sample_count", 0) or 0)
     frame_sum = int(throughput.get("vehicles_in_network_frame_sum", 0) or 0)
     total_served = int(throughput.get("passengers_served_total", 0) or 0)
@@ -2146,7 +2362,7 @@ def build_experiment_summary_row(
         "campaign_id": campaign_id,
         "git_sha": git_sha,
         "git_dirty": git_dirty,
-        "config_hash": _config_regime_hash(config),
+        "config_hash": config.get("_regime_hash") or _config_regime_hash(config),
         "run_started_utc": (
             datetime.datetime.fromtimestamp(run_started_wall, datetime.timezone.utc).isoformat()
             if run_started_wall else None
@@ -2157,6 +2373,8 @@ def build_experiment_summary_row(
         ),
         "workbook_filename": workbook_filename or "",
         "schema_version": EXPERIMENT_SUMMARY_SCHEMA_VERSION,
+        "movement_model": vehicle_module.movement_model(),
+        "control_mode": str(config.get("test_control_mode", control_panel.CONTROL_MODE_ASSISTED)),
         "vehicle_speed_scale": config.get(
             "_active_vehicle_speed_scale", config.get("vehicle_speed_scale")
         ),
@@ -2199,7 +2417,13 @@ def build_experiment_summary_row(
         "measured_saturation_flow_veh_per_hr": config.get("measured_saturation_flow"),
         "bus_occupancy_pax": BUS_PASSENGERS,
         "demand_model": _network_demand_model(control_panel.approach_configs),
-        "demand_draw_hash": _demand_draw_hash_hex(),
+        "demand_draw_hash": _demand_draw_hash_hex(
+            up_to_frame=int(round(checkpoint_seconds * 60.0))
+        ),
+        # The frame the export actually landed on. Equal to the mark when
+        # the loop breaks on the boundary; recorded so an overshoot is
+        # visible instead of silently moving a fingerprint again.
+        "export_frame": int(round(float(actual_sim_seconds or checkpoint_seconds) * 60.0)),
         "sampling_params_json": _sampling_params_json(config),
         "passengers_served_total": total_served,
         "passengers_served_bus": bus_pax_served,
@@ -2207,22 +2431,33 @@ def build_experiment_summary_row(
         "buses_served": buses_served,
         "cars_served": cars_served,
         "pax_per_min": round(total_served / max(checkpoint_seconds / 60.0, 1e-9), 2),
+        # Totals are the sum of the rounded parts, so the total == bus + car
+        # export assertion holds exactly: rounding the raw sum instead lands
+        # 1e-4 off the parts' sum about one run in seven (7 of 20 runs failed
+        # this way in the 2026-09-21 batch).
         "total_person_hours_delay": round(
-            (bus_delay_sec + car_delay_sec) / 3600.0, 4
+            round(bus_delay_sec / 3600.0, 4) + round(car_delay_sec / 3600.0, 4), 4
         ),
         "bus_person_hours_delay": round(bus_delay_sec / 3600.0, 4),
         "car_person_hours_delay": round(car_delay_sec / 3600.0, 4),
-        # Sum of the rounded parts, so the total == bus + car assertion holds exactly.
         "total_person_hours_travel_delay": round(
             round(bus_travel_h, 4) + round(car_travel_h, 4), 4
         ),
         "bus_person_hours_travel_delay": round(bus_travel_h, 4),
         "car_person_hours_travel_delay": round(car_travel_h, 4),
         "mean_bus_passenger_delay_sec": (
-            round(bus_delay_sec / bus_pax_served, 2) if bus_pax_served else None
+            round(bus_done_sec / bus_pax_served, 2) if bus_pax_served else None
         ),
         "mean_car_passenger_delay_sec": (
-            round(car_delay_sec / car_pax_served, 2) if car_pax_served else None
+            round(car_done_sec / car_pax_served, 2) if car_pax_served else None
+        ),
+        "mean_stopped_delay_sec_per_vehicle": mean_stopped_delay_sec_per_vehicle,
+        "mean_control_delay_sec_per_vehicle": mean_control_delay_sec_per_vehicle,
+        "passenger_hours_in_network": round(
+            int(throughput.get("passenger_frames_in_network", 0) or 0) / 60.0 / 3600.0, 4
+        ),
+        "unfinished_stopped_person_hours": round(
+            (bus_delay_sec + car_delay_sec - bus_done_sec - car_done_sec) / 3600.0, 4
         ),
         "mean_vehicles_in_network": (
             round(frame_sum / sample_count, 2) if sample_count else None
@@ -2274,13 +2509,17 @@ def build_experiment_summary_row(
             run_metrics["vehicles_in_network_current"]
         ),
         "buses_spawned": int(run_metrics["buses_spawned"]),
+        "bus_trips_scheduled": int(run_metrics["bus_trips_scheduled"]),
+        "bus_trips_pending": sum(len(q) for q in bus_pending_trips.values()),
+        "bus_trips_missed": int(run_metrics["bus_trips_missed"]),
+        "bus_source_delay_sec": round(run_metrics["bus_source_delay_sec"], 3),
         "buses_completed": buses_served,
         "bus_completion_rate": (
             round(buses_served / run_metrics["buses_spawned"], 6)
             if run_metrics["buses_spawned"] else None
         ),
         "level_of_service": real_world_units.hcm_level_of_service(
-            mean_stopped_delay_sec_per_vehicle
+            mean_control_delay_sec_per_vehicle
         ),
         **steady,
         "pax_per_min_cumulative": round(
@@ -2433,26 +2672,24 @@ def append_experiment_summary_row(
     if row is None:
         return False
     try:
-        EXPERIMENT_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        is_new = not EXPERIMENT_SUMMARY_PATH.exists()
+        summary_path = experiment_summary_path()
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not summary_path.exists()
         if not is_new:
-            with EXPERIMENT_SUMMARY_PATH.open("r", encoding="utf-8") as handle:
+            with summary_path.open("r", encoding="utf-8") as handle:
                 header = handle.readline().strip().split(",")
             if header != list(EXPERIMENT_SUMMARY_HEADERS):
                 # A schema change never rewrites or misaligns old rows: the
-                # old dataset is set aside under a dated name and a new one
-                # begins with the current header.
+                # old dataset is set aside under a time-stamped name and a
+                # new one begins with the current header.
                 stamp = time.strftime("%Y%m%d_%H%M%S")
-                EXPERIMENT_SUMMARY_PATH.rename(
-                    EXPERIMENT_SUMMARY_PATH.with_name(
-                        f"{EXPERIMENT_SUMMARY_PATH.stem}_{stamp}"
-                        f"{EXPERIMENT_SUMMARY_PATH.suffix}"
+                summary_path.rename(
+                    summary_path.with_name(
+                        f"{summary_path.stem}_schema_{stamp}{summary_path.suffix}"
                     )
                 )
                 is_new = True
-        with EXPERIMENT_SUMMARY_PATH.open(
-            "a", newline="", encoding="utf-8"
-        ) as handle:
+        with summary_path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=EXPERIMENT_SUMMARY_HEADERS)
             if is_new:
                 writer.writeheader()
@@ -2464,22 +2701,29 @@ def append_experiment_summary_row(
 
 
 def build_test_export_filename(
-    model, duration_sim_seconds, seed, timestamp=None, checkpoint_sim_seconds=None
+    model, duration_sim_seconds, seed, timestamp=None, checkpoint_sim_seconds=None,
+    control_mode=None,
 ):
-    """Return ``model_runtime_seed_DDMMYYYY_HHMMSS.xlsx``.
+    """Return ``model[-mode]_runtime_seed_DDMMYYYY_HHMMSS.xlsx``.
 
     For a checkpoint workbook, runtime is the cumulative checkpoint horizon.
     That keeps a 30-minute test's 5/10/15/30-minute exports distinct while
-    retaining the exact field order used by every other Excel export.
+    retaining the exact field order used by every other Excel export. An LLM
+    arm also carries its control mode, since that is the one decider that can
+    run either way; ``control_mode`` defaults to the mode captured for this
+    test at start (``test_control_mode``), which is what the row exports.
     """
     runtime_seconds = (
         duration_sim_seconds if checkpoint_sim_seconds is None else checkpoint_sim_seconds
     )
+    if control_mode is None:
+        control_mode = control_panel.global_config.get("test_control_mode")
     return build_excel_export_filename(
         model,
         runtime_seconds,
         seed,
         timestamp,
+        control_mode=control_mode,
     )
 
 
@@ -2538,6 +2782,7 @@ def export_test_workbook(
         destination.parent.mkdir(parents=True, exist_ok=True)
         workbook.save(destination)
         workbook.close()
+        gridlock_monitor.write_workbook(report_path_for(destination))
         global _run_exported_workbook
         _run_exported_workbook = True
         print(f"Timed test exported: {destination}")
@@ -2581,6 +2826,28 @@ def compute_checkpoint_marks(duration_sim_seconds):
     return sorted(mark for mark in CHECKPOINT_MARKS_SEC if mark < duration)
 
 
+def at_export_boundary(master_frame_count):
+    """True once this frame has reached the next checkpoint or the duration.
+
+    The fixed-step loop breaks here so an export always lands on exactly its
+    mark. It used to run its whole catch-up burst first and only then look,
+    overshooting by up to ``max_steps_per_callback`` frames -- a per-run
+    amount that varied with render speed. ``demand_draw_hash`` is a running
+    digest read at export, so an arm that overshot by 3 frames hashed in one
+    more arrival than one that overshot by 2 and ``pair_against_baseline``
+    refused the pair (campaign 2026-09-22: 29 of 33 arms refused, on demand
+    that was in fact identical). Cheap enough to call every frame.
+    """
+    config = control_panel.global_config
+    if not config.get("test_running", False):
+        return False
+    seconds = master_frame_count / 60.0
+    if pending_checkpoints_sec and seconds >= pending_checkpoints_sec[0]:
+        return True
+    duration = config.get("test_duration_sim_seconds")
+    return bool(duration) and seconds >= float(duration)
+
+
 def fire_due_checkpoints(master_frame_count):
     """Export one cumulative, non-stopping workbook per standard mark reached.
 
@@ -2609,7 +2876,8 @@ def _export_checkpoint(config, mark_sim_seconds, actual_sim_seconds):
     duration = config.get("test_duration_sim_seconds")
     seed = config.get("test_seed")
     destination = EXCEL_EXPORT_DIR / build_test_export_filename(
-        model, duration, seed, checkpoint_sim_seconds=mark_sim_seconds
+        model, duration, seed, checkpoint_sim_seconds=mark_sim_seconds,
+        control_mode=config.get("test_control_mode"),
     )
     row = build_experiment_summary_row_safely(
         mark_sim_seconds, destination.name, actual_sim_seconds
@@ -2686,6 +2954,17 @@ def _is_batch_api_model(model):
     return model in control_panel.get_api_models()
 
 
+def _arm_uses_a_model(arm_label):
+    """True when this batch arm is served by an LLM, so its turn can block
+    for AGENT_CALL_TIMEOUT_CEILING_SEC. The baseline and the deterministic
+    comparators answer on the merge tick and never skip a grid point."""
+    model = control_panel.split_arm_label(arm_label)[0]
+    return not (
+        model in ("None", control_panel.BATCH_BASELINE_LABEL)
+        or rule_controller.is_rule_model(model)
+    )
+
+
 def _batch_run_hit_rate_limit(model):
     """Scan the just-finished run's own turn log (perform_full_reset clears
     it every run) for this model's rate-limit/quota signature."""
@@ -2730,10 +3009,11 @@ def print_campaign_summary(campaign_id):
     """End-of-batch readout from the CSV's final-checkpoint rows of this
     campaign: what a reviewer would otherwise have to compute by hand
     before trusting the numbers."""
-    if not campaign_id or not EXPERIMENT_SUMMARY_PATH.exists():
+    summary_path = experiment_summary_path()
+    if not campaign_id or not summary_path.exists():
         return
     try:
-        with EXPERIMENT_SUMMARY_PATH.open("r", encoding="utf-8", newline="") as handle:
+        with summary_path.open("r", encoding="utf-8", newline="") as handle:
             rows = [
                 row for row in csv.DictReader(handle)
                 if row.get("campaign_id") == campaign_id
@@ -2754,7 +3034,7 @@ def print_campaign_summary(campaign_id):
         f"no-op arms (decisions_effective == 0): {len(noop)} {noop if noop else ''}",
         f"git_dirty rows: {sum(1 for r in rows if r.get('git_dirty') == 'True')}",
     ]
-    pairs, unpaired = pair_against_baseline(rows)
+    pairs, unpaired, mismatched = pair_against_baseline(rows)
     if pairs:
         path = write_paired_dv_csv(campaign_id, pairs)
         lines.append(f"primary DV (net_person_hours_saved vs baseline, same seed) -> {path}")
@@ -2768,9 +3048,16 @@ def print_campaign_summary(campaign_id):
             )
     if unpaired:
         lines.append(f"seeds without a baseline row (not paired): {unpaired}")
+    if mismatched:
+        lines.append(f"REFUSED (differs from baseline, not paired): {mismatched}")
     print("\n" + "\n".join(lines) + "\n")
 
 
+# Columns a baseline and an arm row must agree on before their difference
+# can be attributed to the controller.
+PAIRING_MUST_MATCH = (
+    "config_hash", "git_sha", "demand_draw_hash", "checkpoint_min", "test_duration_min",
+)
 PAIRED_DV_HEADERS = (
     "campaign_id", "seed", "model", "baseline_run_uuid", "arm_run_uuid",
     "net_person_hours_saved", "bus_person_hours_saved", "car_person_hours_saved",
@@ -2781,24 +3068,36 @@ PAIRED_DV_HEADERS = (
 def pair_against_baseline(rows):
     """The primary DV. For every non-baseline final-checkpoint row that has a
     baseline (model == "None") row on the same seed, return
-    ``baseline − arm`` of the steady travel-delay person-hours (positive =
+    ``baseline âˆ’ arm`` of the steady travel-delay person-hours (positive =
     the arm saved person-hours), its bus/car split, and the same difference
-    on the stopped-delay measure. Returns ``(pairs, seeds_without_baseline)``.
-    Pure: takes CSV DictReader rows, so it can be re-run on any dataset."""
+    on the stopped-delay measure. Returns ``(pairs, seeds_without_baseline,
+    mismatches)``: a pair is refused, and listed with the offending columns,
+    unless everything but the treatment matches (PAIRING_MUST_MATCH: campaign,
+    frozen regime hash, code revision, offered-demand schedule, duration and
+    measurement window), since the difference would otherwise not be the
+    controller's. Pure: takes CSV DictReader rows, so it can be re-run on
+    any dataset."""
     def num(row, key):
         try:
             return float(row.get(key))
         except (TypeError, ValueError):
             return None
 
-    baselines = {row.get("seed"): row for row in rows if row.get("model") == "None"}
-    pairs, unpaired = [], set()
+    baselines = {
+        (row.get("campaign_id"), row.get("seed")): row
+        for row in rows if row.get("model") == "None"
+    }
+    pairs, unpaired, mismatched = [], set(), []
     for row in rows:
         if row.get("model") == "None":
             continue
-        base = baselines.get(row.get("seed"))
+        base = baselines.get((row.get("campaign_id"), row.get("seed")))
         if base is None:
             unpaired.add(row.get("seed"))
+            continue
+        differing = [key for key in PAIRING_MUST_MATCH if base.get(key) != row.get(key)]
+        if differing:
+            mismatched.append(f"{row.get('model')}/{row.get('seed')}: {', '.join(differing)}")
             continue
 
         def diff(key):
@@ -2819,12 +3118,12 @@ def pair_against_baseline(rows):
                 base.get("converged") == "True" and row.get("converged") == "True"
             ),
         })
-    return pairs, sorted(unpaired, key=str)
+    return pairs, sorted(unpaired, key=str), mismatched
 
 
 def write_paired_dv_csv(campaign_id, pairs):
     """Atomically write paired_dv_<campaign>.csv beside experiment_summary.csv."""
-    path = EXPERIMENT_SUMMARY_PATH.with_name(f"paired_dv_{campaign_id}.csv")
+    path = experiment_summary_path().with_name(f"paired_dv_{campaign_id}.csv")
     tmp = path.with_suffix(".csv.tmp")
     with tmp.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=PAIRED_DV_HEADERS)
@@ -2853,6 +3152,7 @@ def poll_batch_runner():
         # One campaign id for every run of this batch: what the summary
         # rows, manifests and the end-of-batch checks group by.
         runtime["campaign_id"] = str(uuid.uuid4())
+        runtime["campaign_stamp"] = time.strftime("%Y%m%d")
         _, dirty = _git_info()
         if dirty:
             print(
@@ -2864,7 +3164,17 @@ def poll_batch_runner():
                 "\n!!! BATCH DURATION < 30 min: steady-state DVs rarely converge this "
                 "short (see converged / time_to_converge_sec).\n"
             )
-        runner.start(list(runtime.get("models", [])), list(runtime.get("seeds", [])))
+        queued_models = list(runtime.get("models", []))
+        tick = int(runtime.get("tick_seconds", control_panel.DEFAULT_TICK_SECONDS))
+        floor = control_panel.MIN_UNSKIPPED_TICK_SECONDS
+        if tick < floor and any(_arm_uses_a_model(model) for model in queued_models):
+            print(
+                f"\n!!! DECISION TICK {tick}s IS BELOW {floor}s: a model call can run for "
+                f"{control_panel.AGENT_CALL_TIMEOUT_CEILING_SEC}s, so a slow arm spends the run "
+                "skipping grid points (decisions_skipped_slow) instead of sharing one decision "
+                "schedule with the other arms. Raise the batch Decision interval.\n"
+            )
+        runner.start(queued_models, list(runtime.get("seeds", [])))
         runtime["current"] = dict(runner.current) if runner.current else None
 
     runner = _batch_engine.get("runner")
@@ -2876,11 +3186,50 @@ def poll_batch_runner():
             _batch_engine["runner"] = None
             print_campaign_summary(runtime.get("campaign_id"))
             runtime["campaign_id"] = None
+            runtime["campaign_stamp"] = None
+        return
+
+    if config.get("batch_end_requested", False):
+        # END: drop the run in flight and the queue, then the same full
+        # reset RESET performs (consumed by the loop on its next tick).
+        # Nothing is exported: a partial run has no summary row to pair.
+        config["batch_end_requested"] = False
+        config["batch_stop_requested"] = False
+        config["batch_resume_requested"] = False
+        _batch_engine["runner"] = None
+        runtime.update({
+            "active": False, "paused": False, "current": None,
+            "results": [], "total": 0, "campaign_id": None,
+        })
+        config.update({
+            "is_running": False, "test_running": False, "is_paused": False,
+            "start_requested": False, "reset_triggered": True,
+        })
+        control_panel.set_active_ai_model("None", persist=False)
+        config["ai_runtime"]["armed"] = False
+        control_panel.write_ai_control()
         return
 
     if config.get("batch_stop_requested", False):
-        runner.request_stop()
         config["batch_stop_requested"] = False
+        if not runtime.get("paused", False):
+            runtime["paused"] = True
+            _batch_engine["paused_wall"] = time.monotonic()
+    if config.get("batch_resume_requested", False):
+        config["batch_resume_requested"] = False
+        if runtime.get("paused", False):
+            runtime["paused"] = False
+            config["is_paused"] = False
+            # The run's wall-clock timeout budget must not count the pause.
+            _batch_engine["run_started_wall"] = (
+                _batch_engine.get("run_started_wall") or time.monotonic()
+            ) + time.monotonic() - _batch_engine.get("paused_wall", time.monotonic())
+    if runtime.get("paused", False):
+        # Frozen in place: hold the run in flight (or one that started on
+        # the tick the stop landed) and start no other.
+        if config.get("is_running", False):
+            config["is_paused"] = True
+        return
 
     phase = _batch_engine["phase"]
     if phase == "IDLE":
@@ -2939,16 +3288,41 @@ def poll_batch_runner():
         runtime["current"] = dict(runner.current)
 
 
-def _set_ai_flags(flags):
+def _set_ai_flags(flags, signals=None):
+    """Apply decided route flags. A route with a live request in ``signals``
+    keeps its current flags (see SignalController.routes_with_live_requests):
+    the lock agent.check_locked applies from a telemetry snapshot is enforced
+    here from the live controller, so neither a stale/held all-off nor a
+    request raised after the snapshot can cancel a committed treatment."""
+    held = signals.routes_with_live_requests() if signals is not None else set()
     for route_id, route_flags in flags.items():
+        if route_id in held:
+            continue
         route_config = control_panel.bus_routes_config[route_id]
         route_config["tsp_enabled"] = route_flags["tsp"]
         route_config["dbl_enabled"] = route_flags["dbl"]
 
 
-def merge_ai_decision(path=None):
-    """Validate and merge one file-based AI decision into live route config."""
+# The controller step_simulation last drove: merge_live_decision needs it to
+# apply (or withdraw) an AI Configured plan without changing the decide()
+# contract headless_run and the trainer share.
+_live_signals = None
+
+
+def _hold_all_off(signals):
+    """Fail closed in both modes: no new route-flag treatment, plan withdrawn
+    (Webster). A request already live finishes under the safety authority."""
+    _set_ai_flags(guard.all_off_flags(), signals)
+    if signals is not None:
+        signals.clear_plan()
+
+
+def merge_ai_decision(path=None, signals=None):
+    """Validate and merge one file-based AI decision: route flags (AI
+    Assisted) into live route config, or a timing plan (AI Configured) into
+    ``signals``. Every refusal holds all-off / Webster."""
     runtime = control_panel.global_config.setdefault("ai_runtime", {})
+    configured = runtime.get("control_mode") == control_panel.CONTROL_MODE_CONFIGURED
     # Only an explicitly recorded "None" selection means a baseline run. An
     # absent key leaves the generic merge path alone, so callers that drive
     # decisions without a model selector keep working.
@@ -2982,22 +3356,61 @@ def merge_ai_decision(path=None):
     except (TypeError, ValueError, OverflowError):
         age = None
     if age is None or not math.isfinite(age) or age > stale_after:
-        _set_ai_flags(guard.all_off_flags())
+        _hold_all_off(signals)
         runtime["last_status"] = "STALE_DECISION"
         return False
 
+    # Identity: the decision must have been made for this run and by the
+    # selected model. A file left by an earlier run, arm or model (or one
+    # written by another simulator sharing data/) is rejected, all-off.
+    run_uuid = control_panel.global_config.get("_run_uuid")
+    if (run_uuid and decision.get("run_uuid") != run_uuid) or (
+        "model" in runtime and str(decision.get("model")) != str(runtime["model"])
+    ) or configured != (decision.get("schema") == "signal_plan"):
+        # A decision of the other mode is a straggler from before the
+        # mode changed: never a plan for this run.
+        _hold_all_off(signals)
+        runtime["last_status"] = "FOREIGN_DECISION"
+        return False
+
     try:
-        runtime["last_turn"] = int(decision.get("turn", 0))
+        turn = int(decision.get("turn", 0))
     except (AttributeError, TypeError, ValueError, OverflowError):
-        runtime["last_turn"] = 0
+        turn = 0
+    last_turn = int(runtime.get("last_turn", 0) or 0)
+    if turn < last_turn:
+        # Ordering: an older turn than the one already merged is a
+        # regression (an out-of-order or replayed file), never a new decision.
+        _hold_all_off(signals)
+        runtime["last_status"] = "STALE_DECISION"
+        return False
+
+    if configured:
+        plan = guard.validate_signal_plan(decision)
+        if plan is None and decision.get("status") != "HELD_WEBSTER":
+            _hold_all_off(signals)
+            runtime["last_status"] = "INVALID_DECISION"
+            return False
+        _set_ai_flags(guard.all_off_flags(), signals)   # no route-flag TSP under a plan
+        if signals is not None:
+            if plan is None:
+                signals.clear_plan()
+            elif turn != runtime.get("last_turn") or not signals.plan_active:
+                # Once per decision: end_current_green_now must not re-fire
+                # on every 30-frame merge of the same file.
+                signals.apply_plan(plan)
+        runtime["last_turn"] = turn
+        runtime["last_status"] = "OK" if plan is not None else "HELD_WEBSTER"
+        return plan is not None
 
     flags = guard.validate_flags(decision)
     if flags is None:
-        _set_ai_flags(guard.all_off_flags())
+        _hold_all_off(signals)
         runtime["last_status"] = "INVALID_DECISION"
         return False
 
-    _set_ai_flags(flags)
+    runtime["last_turn"] = turn
+    _set_ai_flags(flags, signals)
     decision_status = decision.get("status", "OK")
     runtime["last_status"] = (
         decision_status
@@ -3009,18 +3422,28 @@ def merge_ai_decision(path=None):
 
 def reset_all_spawner_states():
     """Clear vehicle and bus source state for a fresh traffic episode."""
-    global post_discharge_meter_frames_remaining, bus_sequence_counter
+    global post_discharge_meter_frames_remaining, bus_sequence_counter, bus_schedule_time_s
     for state in spawner_states.values():
         state.clear()
         state.update(_new_spawner_state())
     for route_id in bus_dispatch_counters:
         bus_dispatch_counters[route_id] = 0.0
+        bus_pending_trips[route_id].clear()
+    bus_schedule_time_s = 0.0
     bus_sequence_counter = 0
     post_discharge_meter_frames_remaining = 0
 
 
 def reset_traffic_generation():
-    """Reset every traffic source and restart its configured RNG sequence."""
+    """Reset every traffic source, its RNG sequence and its vehicle numbering.
+
+    Clears the offered-demand fingerprint too. perform_full_reset calls this
+    AFTER calibrate_and_apply_webster, and it has to: the calibrator spawns
+    through the same sources, so a fingerprint cleared before it ran
+    described "calibration draws plus the run" rather than the run.
+    """
+    _demand_draw_state["offers"].clear()
+    vehicle_module.reset_vehicle_serials()
     reset_all_spawner_states()
     # Freeze motion tuning for the episode. Slider changes made during a run
     # therefore cannot change the speed of only later arrivals.
@@ -3078,6 +3501,7 @@ def calibrate_saturation_flow(
             "model": "Poisson",
             "rate": CALIBRATION_BUILD_VEH_PER_MIN,
             "turn_split": 1.0,          # all straight: a single-lane measure
+            "left_far_share": 0.0,
             "heavy_ratio": heavy_ratio,
         }
     )
@@ -3088,8 +3512,16 @@ def calibrate_saturation_flow(
         "_active_vehicle_speed_scale", speed_scale
     )
     control_panel.global_config["_active_vehicle_speed_scale"] = speed_scale
-    random.seed(CALIBRATION_SEED_FALLBACK if seed is None else seed)
+    # Always the fixed calibration seed, never the run seed: S describes the
+    # regime (speed scale, vehicle mix, movement engine), not which seed
+    # happens to be running. Seeding it from the run seed made S a function
+    # of the seed -- 1887 veh/hr at seed 234 against 2338 at seed 764, a 24%
+    # swing that drove the Webster cycle to 81.6 s against 40.0 s (its floor)
+    # and put two config_hash values inside one campaign, so the two halves
+    # of the sweep were benchmarking different signal plans.
+    random.seed(CALIBRATION_SEED_FALLBACK)
     reset_all_spawner_states()
+    seed_demand_streams(CALIBRATION_SEED_FALLBACK)
 
     controller = SignalController(
         {"green_time": 240, "is_running": True},
@@ -3175,16 +3607,38 @@ def representative_heavy_ratio():
     return sum(ratios) / len(ratios) if ratios else 0.1
 
 
-def calibrate_and_apply_webster(signals):
-    """Measure S and publish Webster splits before the run clock starts."""
+# Measured S per regime key, so one sweep measures each regime once. The key
+# is everything calibrate_saturation_flow's answer depends on.
+_saturation_cache = {}
+
+
+def _calibration_key(config):
+    return (
+        round(float(config.get("vehicle_speed_scale", 0.5) or 0.5), 6),
+        round(float(representative_heavy_ratio()), 6),
+        str(config.get("movement_model", vehicle_module.MOVEMENT_MODEL_LEGACY)),
+        json.dumps(vehicle_module.movement_model_signature(), sort_keys=True, default=str),
+    )
+
+
+def calibrate_and_apply_webster(signals, force=False):
+    """Measure S and publish Webster splits before the run clock starts.
+
+    S is cached per regime: it is a property of the speed scale, vehicle mix
+    and movement engine, none of which vary within a sweep, so re-measuring
+    it per run only added setup time and a chance to disagree with itself.
+    """
     config = control_panel.global_config
     config["calibrating"] = True
     try:
-        saturation = calibrate_saturation_flow(
-            config.get("vehicle_speed_scale", 0.5),
-            representative_heavy_ratio(),
-            config.get("random_seed"),
-        )
+        key = _calibration_key(config)
+        if force or key not in _saturation_cache:
+            _saturation_cache[key] = calibrate_saturation_flow(
+                config.get("vehicle_speed_scale", 0.5),
+                representative_heavy_ratio(),
+                None,
+            )
+        saturation = _saturation_cache[key]
         config["measured_saturation_flow"] = round(saturation, 0)
         # Tolerate controllers that do not expose the interlock timings,
         # falling back to the production defaults rather than failing a reset.
@@ -3219,6 +3673,7 @@ def perform_full_reset(vehicles, signals, telemetry=None):
     """Restore all per-run simulation state and return the frame-zero value."""
     global _run_exported_workbook
     _run_exported_workbook = False
+    gridlock_monitor.reset()
     vehicles.clear()
     signals.reset_all_state()
     if telemetry is not None:
@@ -3228,14 +3683,23 @@ def perform_full_reset(vehicles, signals, telemetry=None):
     network_throughput_at_warmup.clear()
     reset_run_metrics()
     _run_summary_rows.clear()
-    _demand_draw_state["hash"] = hashlib.sha256()
     control_panel.global_config["_run_uuid"] = str(uuid.uuid4())
     control_panel.global_config["_run_started_wall"] = time.time()
     control_panel.global_config["test_failed_reason"] = ""
-    if control_panel.global_config.get("test_running", False) and is_baseline_run():
-        # The baseline arm has no controller: route flags left on by the
-        # previous run's last decision must not carry into it.
+    if control_panel.global_config.get("test_running", False):
+        # A run's flags come only from decisions made for it: those left on
+        # by the previous run's last decision must not carry into it.
         _set_ai_flags(guard.all_off_flags())
+    runtime = control_panel.global_config.setdefault("ai_runtime", {})
+    runtime["last_turn"] = 0
+    # The previous run's decision file would only be refused as
+    # FOREIGN_DECISION until this run's first turn lands; remove it so the
+    # status honestly reads WAITING_FOR_DECISION, and drop the old status.
+    runtime["last_status"] = None
+    try:
+        DECISION_PATH.unlink()
+    except OSError:
+        pass
     # A fresh run gets a fresh checkpoint schedule -- only when this reset is
     # starting a timed test; a plain START or a mid-test manual RESET both
     # restart the sim clock at frame zero, so the marks must restart too.
@@ -3246,14 +3710,134 @@ def perform_full_reset(vehicles, signals, telemetry=None):
                 control_panel.global_config.get("test_duration_sim_seconds")
             )
         )
+    # The movement engine is fixed for the run before saturation flow is
+    # measured, so S (and Webster) describe the engine that will drive.
+    vehicle_module.set_movement_model(
+        control_panel.global_config.get("movement_model", vehicle_module.MOVEMENT_MODEL_LEGACY)
+    )
     # Calibration consumes its own seeded RNG, so traffic generation is
     # reset afterwards and the measured run still starts from the
     # configured seed.
     calibrate_and_apply_webster(signals)
     reset_traffic_generation()
+    # The regime is frozen here, after calibration: every checkpoint row of
+    # this run reports the same config_hash whatever the panel does later.
+    control_panel.global_config["_regime_hash"] = _config_regime_hash(
+        control_panel.global_config
+    )
+    # The setup this run starts from, for the workbook's start sheet: the
+    # end-of-run table shows the decider's terminal route flags, not these.
+    control_panel.global_config["_initial_input_rows"] = [
+        list(row) for row in control_panel_input_rows()
+    ]
+    global _discharge_was_active
+    _discharge_was_active = False
     # Frame zero is returned only after S is locked: calibration is
     # setup, not part of the measured run.
     return 0
+
+
+LANE_OPTIONS = {
+    "EB": [canvas.H_Y - (i + 0.5) * canvas.LANE for i in range(3)],
+    "WB": [canvas.H_Y + (i + 0.5) * canvas.LANE for i in range(3)],
+    "A_NB": [canvas.INT_X[0] - (i + 0.5) * canvas.LANE for i in range(3)],
+    "A_SB": [canvas.INT_X[0] + (i + 0.5) * canvas.LANE for i in range(3)],
+    "B_NB": [canvas.INT_X[1] - (i + 0.5) * canvas.LANE for i in range(3)],
+    "B_SB": [canvas.INT_X[1] + (i + 0.5) * canvas.LANE for i in range(3)],
+}
+SPAWN_AT = {
+    "EB": ("EB", -20), "WB": ("WB", canvas.WIDTH + 20),
+    "A_NB": ("NB", canvas.HEIGHT + 20), "A_SB": ("SB", -20),
+    "B_NB": ("NB", canvas.HEIGHT + 20), "B_SB": ("SB", -20),
+}
+# Discharge edge detection between frames; reset with the run.
+_discharge_was_active = False
+
+
+def merge_live_decision(frame_number):
+    """Production's decision source: the guarded decision.json, every 30
+    frames while the panel has the agent armed; disarmed, any AI Configured
+    plan is withdrawn so the signals fall back to Webster."""
+    if frame_number % 30 == 0:
+        if control_panel.global_config.get("ai_runtime", {}).get("armed", False):
+            merge_ai_decision(signals=_live_signals)
+        elif _live_signals is not None and _live_signals.plan_active:
+            _live_signals.clear_plan()
+
+
+def step_simulation(vehicles, signals, frame_number, decide=merge_live_decision):
+    """One 60 Hz frame of the simulation -- the single authoritative step,
+    run identically by the Tk loop and by headless_run. Order: spawn and
+    dispatch, decision merge, signals, vehicles (crossings, completions,
+    throughput, bus events), per-frame metrics, warm-up snapshot.
+
+    ``decide(frame_number)`` is the decision source; production reads the
+    guarded decision file, a trainer or replay supplies its own. It is
+    called at the same point of the frame either way, so a headless
+    experiment sees exactly what a windowed run would.
+    """
+    global _discharge_was_active, _live_signals
+    _live_signals = signals
+    # Last frame's neighbour index is further out of date than its staleness
+    # margin covers, and spawning is about to change the list anyway.
+    vehicle_module.index_frame(None)
+    cfgs = control_panel.approach_configs
+    if not is_discharge_demand_suspended(signals):
+        if post_discharge_admission_allowed():
+            for key, (direction, spawn_coord) in SPAWN_AT.items():
+                if cfgs[key]["active"]:
+                    try_spawn_vehicle(
+                        vehicles, key, direction, spawn_coord, LANE_OPTIONS[key],
+                        cfgs[key], signal_controller=signals,
+                    )
+        if post_discharge_meter_frames_remaining <= 0:
+            check_and_dispatch_buses(vehicles, LANE_OPTIONS, 1.0 / 60.0)
+    # Every spawn and dispatch for this frame is in, so the neighbour index
+    # can be built once and shared by the controller and every vehicle.
+    vehicle_module.index_frame(vehicles)
+    if decide is not None:
+        decide(frame_number)
+    signals.update(vehicles=vehicles)
+    discharge_is_active = signals.is_discharge_active()
+    if _discharge_was_active and not discharge_is_active:
+        begin_post_discharge_metering()
+    if not discharge_is_active:
+        advance_post_discharge_metering()
+    _discharge_was_active = discharge_is_active
+
+    active_signal_data = signals.get_all_signals(canvas.INT_X)
+    for v in vehicles[:]:
+        v.update(
+            signal_data=active_signal_data,
+            int_x_list=canvas.INT_X,
+            h_y=canvas.H_Y,
+            road_w=canvas.ROAD_W,
+            stop_offset=canvas.STOP,
+            lane_w=canvas.LANE,
+            all_vehicles=vehicles,
+            signal_controller=signals,
+        )
+        _record_node_crossings(v)
+        if v.x < -60 or v.x > canvas.WIDTH + 60 or v.y < -60 or v.y > canvas.HEIGHT + 60:
+            if len(getattr(v, "passed_nodes", set())) > 0:
+                _record_completed_vehicle_delay(v)
+                passengers = int(getattr(v, "passengers", 0))
+                network_throughput["passengers_served_total"] += passengers
+                network_throughput["vehicles_served_total"] += 1
+                if isinstance(v, Bus):
+                    network_throughput["passengers_served_bus"] += passengers
+                    network_throughput["buses_served"] += 1
+                    bus_event_tracker.complete(v, frame_number, signals)
+                else:
+                    network_throughput["passengers_served_car"] += passengers
+                    network_throughput["cars_served"] += 1
+            vehicles.remove(v)
+            vehicle_module.drop_from_index(v)
+    # Instrumentation only: samples post-update bus state and the
+    # controller's live priority requests for this frame.
+    bus_event_tracker.observe(vehicles, frame_number, signals)
+    accumulate_frame_metrics(vehicles, signals)
+    snapshot_warmup_baseline(frame_number)
 
 
 def begin_post_discharge_metering():
@@ -3282,21 +3866,9 @@ def advance_post_discharge_metering():
 def _reset_state_for_model_change(state, model_type):
     if state["last_model"] == model_type:
         return
-    state.update(
-        {
-            "burst_queue": 0,
-            "frames_since_spawn": 999,
-            "pending_arrivals": 0,
-            "congestion_cycle_frame": 0,
-            "peak_active": False,
-            "effective_rate_vpm": 0.0,
-            "requested_arrivals": 0,
-            "offered_passengers": 0.0,
-            "admitted_arrivals": 0,
-            "overflow_arrivals": 0,
-            "last_model": model_type,
-        }
-    )
+    rng = state["rng"]
+    state.clear()
+    state.update(_new_spawner_state(), rng=rng, last_model=model_type)
 
 
 def get_demand_telemetry():
@@ -3330,9 +3902,15 @@ def is_discharge_demand_suspended(signal_controller):
         or control_panel.global_config.get("discharge_start_requested", False)
     )
 
-def should_spawn_vehicle(approach_key, model_type, rate_v_m):
+def should_spawn_vehicle(approach_key, model_type, rate_v_m, approach_cfg=None):
+    """Advance the source one frame: draw this frame's offers into the
+    source queue, then say whether an arrival may enter now."""
     state = spawner_states[approach_key]
     _reset_state_for_model_change(state, model_type)
+    state["clock"] += 1
+    rng = state["rng"]
+    if approach_cfg is None:
+        approach_cfg = control_panel.approach_configs.get(approach_key, {})
 
     if rate_v_m <= 0:
         state["effective_rate_vpm"] = 0.0
@@ -3359,29 +3937,20 @@ def should_spawn_vehicle(approach_key, model_type, rate_v_m):
         )
         state["effective_rate_vpm"] = effective_rate
         arrival_probability = 1.0 - math.exp(-effective_rate / 3600.0)
-        if random.random() < arrival_probability:
-            _record_demand_offer(approach_key, state)
-            if state["pending_arrivals"] < MAX_PENDING_ARRIVALS:
-                state["pending_arrivals"] += 1
-            else:
-                state["overflow_arrivals"] += 1
+        if rng.random() < arrival_probability:
+            _record_demand_offer(approach_key, state, 1, approach_cfg)
 
-        # A blocked spawn does not consume this demand. try_spawn_vehicle()
-        # decrements the backlog only after safely adding a vehicle.
-        return state["pending_arrivals"] > 0
-
-    if model_type == "Neg Binomial":
+    elif model_type == "Neg Binomial":
         state["effective_rate_vpm"] = float(rate_v_m)
         state["peak_active"] = False
         MEAN_BURST_SIZE = 2.0
         p_burst_start = lam_frame / MEAN_BURST_SIZE
 
-        if random.random() < p_burst_start:
-            burst = random.randint(1, 3)
-            state["burst_queue"] += burst
-            _record_demand_offer(approach_key, state, burst)
+        if rng.random() < p_burst_start:
+            _record_demand_offer(approach_key, state, rng.randint(1, 3), approach_cfg)
 
-        if state["burst_queue"] > 0 and state["frames_since_spawn"] >= 18:
+        # Bursts release one vehicle every 18 frames.
+        if state["arrivals"] and state["frames_since_spawn"] >= 18:
             state["frames_since_spawn"] = 0
             return True
         return False
@@ -3390,34 +3959,29 @@ def should_spawn_vehicle(approach_key, model_type, rate_v_m):
         state["effective_rate_vpm"] = float(rate_v_m)
         state["peak_active"] = False
         min_gap_frames = int(1800.0 / rate_v_m) if rate_v_m > 0 else 999
-        if state["frames_since_spawn"] < min_gap_frames:
-            return False
-
         p_metered = lam_frame * 2.0
-        if random.random() < p_metered:
-            _record_demand_offer(approach_key, state)
+        if state["frames_since_spawn"] >= min_gap_frames and rng.random() < p_metered:
+            _record_demand_offer(approach_key, state, 1, approach_cfg)
             state["frames_since_spawn"] = 0
-            return True
-        return False
 
     elif model_type == "Poisson":
         state["effective_rate_vpm"] = float(rate_v_m)
         state["peak_active"] = False
         prob = 1.0 - math.exp(-lam_frame)
-        if random.random() < prob:
-            _record_demand_offer(approach_key, state)
+        if rng.random() < prob:
+            _record_demand_offer(approach_key, state, 1, approach_cfg)
             state["frames_since_spawn"] = 0
-            return True
-        return False
 
     else:
         state["effective_rate_vpm"] = float(rate_v_m)
         state["peak_active"] = False
-        if random.random() < lam_frame:
-            _record_demand_offer(approach_key, state)
+        if rng.random() < lam_frame:
+            _record_demand_offer(approach_key, state, 1, approach_cfg)
             state["frames_since_spawn"] = 0
-            return True
-        return False
+
+    # A blocked entry does not consume the arrival: it waits in the source
+    # queue and try_spawn_vehicle() dequeues it only after adding a vehicle.
+    return bool(state["arrivals"])
 
 
 def try_spawn_vehicle(
@@ -3433,16 +3997,14 @@ def try_spawn_vehicle(
     model_type = approach_cfg.get("model", "Poisson")
     rate_v_m = approach_cfg.get("rate", 12)
 
-    if not should_spawn_vehicle(approach_key, model_type, rate_v_m):
+    if not should_spawn_vehicle(approach_key, model_type, rate_v_m, approach_cfg):
         return
 
-    straight_ratio = approach_cfg.get("turn_split", 0.80)
-    if random.random() < straight_ratio:
-        target_turn = "STRAIGHT"
-        lane_idx = random.choice([0, 1])
-    else:
-        target_turn = "LEFT"
-        lane_idx = DBL_LANE_INDEX
+    state = spawner_states[approach_key]
+    arrival = state["arrivals"][0]
+    target_turn, left_nodes, lane_idx = (
+        arrival["target_turn"], arrival["left_nodes"], arrival["lane_idx"]
+    )
 
     # The outer horizontal lane is the general left-turn lane and the DBL
     # lane. Once DBL is active it is reserved for the priority bus: retain a
@@ -3450,7 +4012,7 @@ def try_spawn_vehicle(
     # lane that the controller is unconditionally clearing.
     if target_turn == "LEFT" and direction in ("EB", "WB") and signal_controller:
         target_node_x = canvas.INT_X[0] if direction == "EB" else canvas.INT_X[-1]
-        if signal_controller.is_dbl_active_for_approach(target_node_x, direction):
+        if signal_controller.dbl_excludes_left_turns(target_node_x, direction):
             return
 
     target_lane_coord = lane_coords[lane_idx]
@@ -3465,30 +4027,17 @@ def try_spawn_vehicle(
             elif direction in ("NB", "SB") and abs(v.y - spawn_coord) < min_gap and abs(v.x - target_lane_coord) < SPAWN_LATERAL_BLOCK_PX:
                 return
 
-    state = spawner_states[approach_key]
+    state["arrivals"].popleft()
+    state["pending_arrivals"] = max(0, state["pending_arrivals"] - 1)
     if model_type == CONGESTION_MODEL:
-        state["pending_arrivals"] = max(0, state["pending_arrivals"] - 1)
         state["frames_since_spawn"] = 0
-    elif model_type == "Neg Binomial" and state["burst_queue"] > 0:
-        state["burst_queue"] -= 1
-
-    heavy_ratio = approach_cfg.get("heavy_ratio", 0.10)
-    is_heavy = random.random() < heavy_ratio
-
-    base_speed = (
-        random.uniform(0.8, 1.1)
-        if is_heavy
-        else random.uniform(1.0, 1.4)
-    )
-    speed = base_speed * get_active_vehicle_speed_scale()
-    colors = [(50, 150, 250), (250, 100, 50), (250, 200, 50), (150, 50, 250), (50, 200, 150)]
-    color = (120, 120, 140) if is_heavy else random.choice(colors)
+    is_heavy, speed, color = arrival["is_heavy"], arrival["speed"], arrival["color"]
 
     if direction in ("EB", "WB"):
         vehicles.append(Vehicle(
             x=spawn_coord, y=target_lane_coord, direction=direction,
             max_speed=speed, color=color, is_heavy=is_heavy,
-            target_turn=target_turn, lane_index=lane_idx
+            target_turn=target_turn, lane_index=lane_idx, left_nodes=left_nodes,
         ))
     else:
         assigned_node_x = min(canvas.INT_X, key=lambda node_x: abs(node_x - target_lane_coord))
@@ -3496,38 +4045,45 @@ def try_spawn_vehicle(
             x=target_lane_coord, y=spawn_coord, direction=direction,
             max_speed=speed, color=color, is_heavy=is_heavy,
             target_turn=target_turn, lane_index=lane_idx,
-            assigned_node_x=assigned_node_x
+            assigned_node_x=assigned_node_x, left_nodes=left_nodes,
         ))
     state["admitted_arrivals"] += 1
 
 
 def check_and_dispatch_buses(vehicles, lane_options, dt):
-    global bus_sequence_counter
+    global bus_sequence_counter, bus_schedule_time_s
+
+    bus_schedule_time_s += max(0.0, dt)
 
     for r_id, r_cfg in control_panel.bus_routes_config.items():
         if not r_cfg["active"]:
             r_cfg["manual_dispatch"] = False
             bus_dispatch_counters[r_id] = 0.0  # Reset headway retention when inactive
+            bus_pending_trips[r_id].clear()
             continue
 
-        should_dispatch = False
-
+        pending = bus_pending_trips[r_id]
         if r_cfg["manual_dispatch"]:
-            should_dispatch = True
+            pending.append({"scheduled_time_s": bus_schedule_time_s, "manual": True, "missed": False})
+            run_metrics["bus_trips_scheduled"] += 1
             r_cfg["manual_dispatch"] = False
-
-        elif r_cfg["headway_sec"] > 0:
+            # Manual departures restart the automatic headway clock.
+            bus_dispatch_counters[r_id] = 0.0
+        if r_cfg["headway_sec"] > 0:
             bus_dispatch_counters[r_id] += dt
-            if bus_dispatch_counters[r_id] >= r_cfg["headway_sec"]:
-                should_dispatch = True
-                bus_dispatch_counters[r_id] = 0.0
+            headway = float(r_cfg["headway_sec"])
+            while bus_dispatch_counters[r_id] + 1e-9 >= headway:
+                bus_dispatch_counters[r_id] -= headway
+                pending.append({
+                    "scheduled_time_s": bus_schedule_time_s - bus_dispatch_counters[r_id],
+                    "manual": False, "missed": False,
+                })
+                run_metrics["bus_trips_scheduled"] += 1
         else:
             # Headway OFF means a fresh interval begins when re-enabled.
             bus_dispatch_counters[r_id] = 0.0
 
-        if should_dispatch:
-            # A manual departure also restarts the automatic headway clock.
-            bus_dispatch_counters[r_id] = 0.0
+        if pending:
             direction = r_cfg["origin"]
             spawn_coord = -40 if direction == "EB" else canvas.WIDTH + 40
             
@@ -3557,9 +4113,15 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
                         break
 
             if entry_blocked:
-                r_cfg["manual_dispatch"] = True
+                for trip in pending:
+                    if not trip["missed"]:
+                        trip["missed"] = True
+                        run_metrics["bus_trips_missed"] += 1
                 continue
 
+            trip = pending.popleft()
+            source_delay = max(0.0, bus_schedule_time_s - trip["scheduled_time_s"])
+            run_metrics["bus_source_delay_sec"] += source_delay
             bus_sequence_counter += 1
             unique_bus_id = f"BUS_{r_id}_{bus_sequence_counter:03d}"
 
@@ -3569,6 +4131,11 @@ def check_and_dispatch_buses(vehicles, lane_options, dt):
                 "destination": r_cfg["destination"],
                 "waypoints": waypoints,
                 "lanes": dict(r_cfg.get("lanes", {})),
+                "scheduled_departure_s": trip["scheduled_time_s"],
+                "actual_departure_s": bus_schedule_time_s,
+                "source_delay_s": source_delay,
+                "pending_trips_at_departure": len(pending),
+                "missed_trips_to_date": run_metrics["bus_trips_missed"],
             }
 
             vehicles.append(Bus(
@@ -3650,10 +4217,11 @@ def main_window_height_for(screen_height):
 # --- Window shapes -----------------------------------------------------------
 # Three sizes the operator cycles through from the control-panel header (the
 # OS maximize/restore buttons land on the same three). "compact" is the
-# fitted window above with the canvas at native 1:1; "large" is a centred
-# window of ~75% of the screen; "maximized" is the OS zoomed state. In the
-# two bigger shapes the side panes widen to their maxima and the canvas is
-# scaled up (5:3 kept) to fill the centre pane minus the same gutter.
+# fitted window above; "large" is a centred window of ~75% of the screen;
+# "maximized" is the OS zoomed state. In the two bigger shapes the side
+# panes widen to their maxima. In every shape the whole network is scaled
+# (aspect kept) to fill the centre pane minus the same gutter; the wheel
+# zoom looks closer.
 WINDOW_SHAPES = ("compact", "large", "maximized")
 LARGE_WINDOW_SCREEN_FRACTION = 0.75
 # A window this close to the compact size (after the OS restores it, say)
@@ -3661,10 +4229,19 @@ LARGE_WINDOW_SCREEN_FRACTION = 0.75
 COMPACT_SHAPE_TOLERANCE_PX = 8
 # Below the taskbar and title bar the OS keeps for itself.
 LARGE_WINDOW_SCREEN_MARGIN_Y = 80
-# Scaled canvas pushes beyond this many native pixel counts are halved to
-# ~15Hz (see build_simulation_canvas). Maximized on a 2560-wide screen is
-# ~3.2x and stays at the full push rate.
-SCALED_PUSH_SKIP_FACTOR = 4
+# A pushed frame costs Tk about 14 ms per megapixel to paint (PhotoImage
+# blit, measured), so frames above this many pixels are pushed every other
+# tick (~30 Hz) to leave the 60 Hz physics its budget; the compact and
+# large shapes (0.25-0.45 MP) stay at the full rate, maximized on a 1080p
+# screen (~0.9 MP) halves. See build_simulation_canvas.
+FULL_RATE_PUSH_MAX_PIXELS = 600_000
+# Ticks per painted frame while an unattended batch sweep is running: at
+# TICK_MS this is ~4 fps, enough to watch progress, and it hands the render
+# side's share of the wall clock back to the fixed-step loop.
+BATCH_RENDER_EVERY = 15
+# Simulation tick period (physics catch-up, draw, push), measured from the
+# tick's start so the work inside it does not lengthen the period.
+TICK_MS = 16
 # Mouse-wheel view zoom ceiling: 6x shows a 400x100 px window of the world,
 # one node and its approaches at ~3x display size.
 MAX_VIEW_ZOOM = 6.0
@@ -3895,9 +4472,9 @@ class WindowShapeController:
     def _fit(self):
         if self._fit_canvas is None:
             return
-        if self.shape == "compact":
-            self._fit_canvas(canvas.WIDTH, canvas.HEIGHT)
-            return
+        # Every shape, compact included, shows the whole network scaled to
+        # the centre pane (compact is laid out for CANVAS_DISPLAY_WIDTH, less
+        # than the 2400 px surface); the wheel zoom is how to look closer.
         # Hairline frame (1px each side) plus the gutter all round.
         available_width = self.simulation_pane.winfo_width() - 2 * SIMULATION_PANE_GUTTER - 2
         available_height = self.simulation_pane.winfo_height() - 2 * SIMULATION_PANE_GUTTER - 2
@@ -4082,10 +4659,10 @@ def build_simulation_canvas(parent):
 
     # Per-target state, rebuilt only when the target size changes: PPM header,
     # a reused destination surface for smoothscale (None at native size), and
-    # how many pushes to skip. Pushing a scaled frame costs roughly its pixel
-    # count (~14ms at 4K vs ~3ms native), so past SCALED_PUSH_SKIP_FACTOR x
-    # native pixels only every other push is written, keeping the 60Hz
-    # physics loop and the Tk thread responsive.
+    # how many pushes to skip. A push costs roughly its pixel count (Tk's
+    # paint dominates), so past FULL_RATE_PUSH_MAX_PIXELS only every other
+    # push is written, keeping the 60Hz physics loop and the Tk thread
+    # responsive.
     state = {
         "target": native_size,
         "header": f"P6 {canvas.WIDTH} {canvas.HEIGHT} 255 ".encode("ascii"),
@@ -4166,20 +4743,29 @@ def build_simulation_canvas(parent):
             None if target == native_size and state["zoom"] == 1.0
             else pygame.Surface(target)
         )
-        native_pixels = canvas.WIDTH * canvas.HEIGHT
-        state["push_every"] = (
-            2 if target[0] * target[1] > SCALED_PUSH_SKIP_FACTOR * native_pixels else 1
-        )
+        state["push_every"] = 2 if target[0] * target[1] > FULL_RATE_PUSH_MAX_PIXELS else 1
 
-    def push_frame(surface):
-        state["pushes"] += 1
-        if state["pushes"] % state["push_every"]:
-            return
+    def push_frame(surface, draw_vehicles=None):
+        """Push ``surface`` (the network, already drawn) to the Tk canvas.
+
+        ``draw_vehicles(target, view, scale)`` draws the vehicles: on the
+        native surface (view None, scale 1) when the view shows at most one
+        screen px per world px, so the smoothscale's filtering carries their
+        sub-pixel motion; but straight onto the scaled frame when zoomed in
+        past that, so a vehicle at a fractional world x lands on the right
+        screen pixel instead of hopping a whole (magnified) world pixel.
+        """
         scaled = state["scaled"]
+        view = view_rect() if state["zoom"] != 1.0 else surface.get_rect()
+        scale = state["target"][0] / float(view.width)
+        if draw_vehicles is not None and scale <= 1.0:
+            draw_vehicles(surface, None, 1.0)
         if scaled is not None:
             if state["zoom"] != 1.0:
-                surface = surface.subsurface(view_rect())
+                surface = surface.subsurface(view)
             surface = pygame.transform.smoothscale(surface, state["target"], scaled)
+        if draw_vehicles is not None and scale > 1.0:
+            draw_vehicles(surface, view, scale)
         photo.configure(
             data=state["header"] + pygame.image.tostring(surface, "RGB"),
             format="PPM",
@@ -4192,14 +4778,62 @@ def build_simulation_canvas(parent):
         # widget redraw -- actually reach the screen.
         simulation_canvas.update_idletasks()
 
+    def frame_is_due():
+        """Whether this tick paints. Display only -- the physics step, the
+        telemetry snapshot and the agent never see it, exactly like the
+        view zoom. Gates the network draw and the DBL-state scan too, not
+        just the push: both are render-only work that cost as much as the
+        paint they feed.
+
+        An unattended batch drops to BATCH_RENDER_EVERY because nobody is
+        watching 60 fps of it, and at the campaign's demand the render side
+        was a fifth of every run's wall clock (2026-09-23 audit)."""
+        state["pushes"] += 1
+        every = state["push_every"]
+        if (control_panel.global_config.get("batch_runtime") or {}).get("active", False):
+            every = max(every, BATCH_RENDER_EVERY)
+        return state["pushes"] % every == 0
+
+    simulation_canvas.frame_is_due = frame_is_due
     simulation_canvas.set_target_size = set_target_size
     simulation_canvas.set_view_zoom = set_zoom
     simulation_canvas.view_rect = view_rect
     return simulation_canvas, push_frame
 
 
+INSTANCE_LOCK_PATH = DATA_DIR / "simulator.lock"
+_instance_lock = None
+
+
+def acquire_instance_lock(path=None):
+    """One simulator per data/ directory. Two instances would share the
+    telemetry, control, decision and log files and drive each other; the
+    lock is an OS byte lock, so a crashed instance releases it. The default
+    is read at call time so a test that redirects INSTANCE_LOCK_PATH never
+    contends with a live simulator's lock."""
+    path = INSTANCE_LOCK_PATH if path is None else path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise SystemExit(
+            f"Another simulator is already running on {path.parent}; "
+            "it owns the telemetry/decision files there. Close it first."
+        )
+    return handle
+
+
 def main():
-    global _active_signal_controller
+    global _active_signal_controller, _instance_lock
+    _instance_lock = acquire_instance_lock()
     # Seeding makes traffic generation reproducible, not LLM inference. The
     # valid benchmark is the same seed with one ARMED and one DISARMED run;
     # same-seed ARMED runs may diverge because model decisions can differ.
@@ -4218,15 +4852,6 @@ def main():
     signals = SignalController(global_config=control_panel.global_config, yellow_time=60, red_clearance_time=60)
     _active_signal_controller = signals
     telemetry = TelemetryExporter(filename=TELEMETRY_PATH, export_interval_frames=10)
-
-    lane_options = {
-        "EB": [canvas.H_Y - (0.5 * canvas.LANE), canvas.H_Y - (1.5 * canvas.LANE), canvas.H_Y - (2.5 * canvas.LANE)],
-        "WB": [canvas.H_Y + (0.5 * canvas.LANE), canvas.H_Y + (1.5 * canvas.LANE), canvas.H_Y + (2.5 * canvas.LANE)],
-        "A_NB": [canvas.INT_X[0] - (0.5 * canvas.LANE), canvas.INT_X[0] - (1.5 * canvas.LANE), canvas.INT_X[0] - (2.5 * canvas.LANE)],
-        "A_SB": [canvas.INT_X[0] + (0.5 * canvas.LANE), canvas.INT_X[0] + (1.5 * canvas.LANE), canvas.INT_X[0] + (2.5 * canvas.LANE)],
-        "B_NB": [canvas.INT_X[1] - (0.5 * canvas.LANE), canvas.INT_X[1] - (1.5 * canvas.LANE), canvas.INT_X[1] - (2.5 * canvas.LANE)],
-        "B_SB": [canvas.INT_X[1] + (0.5 * canvas.LANE), canvas.INT_X[1] + (1.5 * canvas.LANE), canvas.INT_X[1] + (2.5 * canvas.LANE)],
-    }
 
     vehicles = []
 
@@ -4248,8 +4873,8 @@ def main():
     # 2b. The simulation canvas: a Tk Canvas holding one PhotoImage that
     # every render mutates in place (itemconfig'd once, never recreated or
     # replaced) so Tk redraws it without ever losing the reference mid-
-    # frame. Native 1000x600 in the compact shape; the shape controller
-    # resizes it (and the pushed, smoothscaled pixels) in the larger shapes.
+    # frame. The shape controller fits it (and the pushed, smoothscaled
+    # pixels) to the centre pane in every shape.
     _simulation_canvas, push_simulation_frame = build_simulation_canvas(
         simulation_pane
     )
@@ -4315,19 +4940,8 @@ def main():
     # Normal 3x operation needs about three steps per 16 ms callback; six gives
     # headroom without allowing a long catch-up burst to monopolize the UI.
     max_steps_per_callback = 6
-    discharge_was_active = False
-    # Pushing a rendered frame into the Tk PhotoImage costs several ms (a PPM
-    # round-trip over the full canvas), far more than the cheap pygame draw
-    # calls that fill the offscreen surface. Halving how often that push
-    # happens keeps the visual rate at 30 Hz while the fixed-timestep sim
-    # loop above keeps stepping at a full 60 Hz -- unaffected either way,
-    # since it measures real elapsed wall time and catches up independently
-    # of how often a frame is actually shown.
-    visual_frame_counter = 0
-
     def simulation_step():
         nonlocal master_frame_count, time_accumulator, last_wall_time
-        nonlocal discharge_was_active, visual_frame_counter
 
         now = time.monotonic()
         elapsed = min(max(0.0, now - last_wall_time), max_catchup_seconds)
@@ -4337,7 +4951,6 @@ def main():
         if control_panel.global_config.get("start_requested", False):
             master_frame_count = perform_full_reset(vehicles, signals, telemetry)
             time_accumulator = 0.0
-            discharge_was_active = False
             control_panel.global_config["is_paused"] = False
             control_panel.global_config["reset_triggered"] = False
             control_panel.global_config["is_running"] = True
@@ -4349,7 +4962,6 @@ def main():
         elif control_panel.global_config["reset_triggered"]:
             master_frame_count = perform_full_reset(vehicles, signals, telemetry)
             time_accumulator = 0.0
-            discharge_was_active = False
             # Export before RESET to preserve the previous run: RESET clears
             # both session logs so the next benchmark run is isolated.
             control_panel.global_config["reset_triggered"] = False
@@ -4369,68 +4981,14 @@ def main():
                 and steps_this_callback < max_steps_per_callback
             ):
                 master_frame_count += 1
-                cfgs = control_panel.approach_configs
-
-                discharge_suspended = is_discharge_demand_suspended(signals)
-                if not discharge_suspended:
-                    if post_discharge_admission_allowed():
-                        if cfgs["EB"]["active"]: try_spawn_vehicle(vehicles, "EB", "EB", -20, lane_options["EB"], cfgs["EB"], signal_controller=signals)
-                        if cfgs["WB"]["active"]: try_spawn_vehicle(vehicles, "WB", "WB", canvas.WIDTH + 20, lane_options["WB"], cfgs["WB"], signal_controller=signals)
-                        if cfgs["A_NB"]["active"]: try_spawn_vehicle(vehicles, "A_NB", "NB", canvas.HEIGHT + 20, lane_options["A_NB"], cfgs["A_NB"], signal_controller=signals)
-                        if cfgs["A_SB"]["active"]: try_spawn_vehicle(vehicles, "A_SB", "SB", -20, lane_options["A_SB"], cfgs["A_SB"], signal_controller=signals)
-                        if cfgs["B_NB"]["active"]: try_spawn_vehicle(vehicles, "B_NB", "NB", canvas.HEIGHT + 20, lane_options["B_NB"], cfgs["B_NB"], signal_controller=signals)
-                        if cfgs["B_SB"]["active"]: try_spawn_vehicle(vehicles, "B_SB", "SB", -20, lane_options["B_SB"], cfgs["B_SB"], signal_controller=signals)
-
-                    if post_discharge_meter_frames_remaining <= 0:
-                        check_and_dispatch_buses(vehicles, lane_options, dt_step)
-                if master_frame_count % 30 == 0:
-                    ai_runtime = control_panel.global_config.get("ai_runtime", {})
-                    if ai_runtime.get("armed", False):
-                        merge_ai_decision()
-                signals.update(vehicles=vehicles)
-                discharge_is_active = signals.is_discharge_active()
-                if discharge_was_active and not discharge_is_active:
-                    begin_post_discharge_metering()
-                if not discharge_is_active:
-                    advance_post_discharge_metering()
-                discharge_was_active = discharge_is_active
-
-                active_signal_data = signals.get_all_signals(canvas.INT_X)
-                
-                for v in vehicles[:]:
-                    v.update(
-                        signal_data=active_signal_data,
-                        int_x_list=canvas.INT_X,
-                        h_y=canvas.H_Y,
-                        road_w=canvas.ROAD_W,
-                        stop_offset=canvas.STOP,
-                        lane_w=canvas.LANE,
-                        all_vehicles=vehicles,
-                        signal_controller=signals
-                    )
-                    _record_node_crossings(v)
-                    if (v.x < -60 or v.x > canvas.WIDTH + 60 or v.y < -60 or v.y > canvas.HEIGHT + 60):
-                        if len(getattr(v, "passed_nodes", set())) > 0:
-                            _record_completed_vehicle_delay(v)
-                            passengers = int(getattr(v, "passengers", 0))
-                            network_throughput["passengers_served_total"] += passengers
-                            network_throughput["vehicles_served_total"] += 1
-                            if isinstance(v, Bus):
-                                network_throughput["passengers_served_bus"] += passengers
-                                network_throughput["buses_served"] += 1
-                                bus_event_tracker.complete(v, master_frame_count, signals)
-                            else:
-                                network_throughput["passengers_served_car"] += passengers
-                                network_throughput["cars_served"] += 1
-                        vehicles.remove(v)
-                # Instrumentation only: samples post-update bus state and the
-                # controller's live priority requests for this frame.
-                bus_event_tracker.observe(vehicles, master_frame_count, signals)
-                accumulate_frame_metrics(vehicles, signals)
-                snapshot_warmup_baseline(master_frame_count)
-                
+                step_simulation(vehicles, signals, master_frame_count)
                 time_accumulator -= dt_step
                 steps_this_callback += 1
+                # Never step past a checkpoint or the duration: the export
+                # below must see the mark's own frame, not the end of this
+                # catch-up burst. See at_export_boundary.
+                if at_export_boundary(master_frame_count):
+                    break
 
             # If the desktop held the callback during a window move, discard
             # excessive wall-time debt instead of freezing the UI to replay it.
@@ -4444,7 +5002,7 @@ def main():
         # in progress the frame counter, the published sim clock and the
         # timed-test countdown all stay frozen at zero.
         if control_panel.global_config.get("calibrating", False):
-            root.after(16, simulation_step)
+            root.after(TICK_MS, simulation_step)
             return
 
         # Publish the simulation clock so the control panel can count a timed
@@ -4470,20 +5028,6 @@ def main():
         # finish_timed_test just flipped above, so it is polled here.
         poll_batch_runner()
 
-        active_signal_data = signals.get_all_signals(canvas.INT_X)
-        active_dbl_data = signals.get_all_dbl_states(canvas.INT_X, vehicles)
-
-        canvas.draw_network(
-            screen, 
-            signal_data=active_signal_data, 
-            dbl_states=active_dbl_data, 
-            font=font,
-            is_paused=is_paused or not is_running
-        )
-
-        for v in vehicles:
-            v.draw(screen)
-
         telemetry_exported = telemetry.export(
             signal_controller=signals,
             vehicles=vehicles,
@@ -4499,20 +5043,43 @@ def main():
                     exported_payload.get("frame_number", master_frame_count),
                     exported_payload,
                 )
+                gridlock_monitor.sample(exported_payload)
             except (OSError, json.JSONDecodeError, AttributeError, TypeError):
                 pass
 
-        # Every frame is drawn onto the offscreen surface above (cheap), but
-        # the far more expensive PPM push into the visible Tk canvas only
-        # happens every other tick: 30 Hz visual against the 60 Hz sim.
-        visual_frame_counter += 1
-        if visual_frame_counter % 2 == 0:
-            push_simulation_frame(screen)
+        # Render only on a due tick (build_simulation_canvas.frame_is_due):
+        # the network draw, the DBL-state scan and the push all hang off the
+        # one gate, which halves the rate past FULL_RATE_PUSH_MAX_PIXELS and
+        # drops to BATCH_RENDER_EVERY while a batch sweep is running.
+        if _simulation_canvas.frame_is_due():
+            # Vehicles are drawn by the push: at the position interpolated
+            # between the last two physics steps, so the 60 Hz sim and the
+            # display's own cadence never beat against each other into a hop.
+            alpha = (
+                max(0.0, min(1.0, time_accumulator / dt_step))
+                if is_running and not is_paused else 1.0
+            )
 
-        # Constant GUI polling rate (~60 FPS) decoupled from simulation speed
-        root.after(16, simulation_step)
+            def draw_vehicles(target, view, scale):
+                for v in vehicles:
+                    v.draw(target, alpha, view, scale)
 
-    root.after(16, simulation_step)
+            canvas.draw_network(
+                screen,
+                signal_data=signals.get_all_signals(canvas.INT_X),
+                dbl_states=signals.get_all_dbl_states(canvas.INT_X, vehicles),
+                font=font,
+                is_paused=is_paused or not is_running,
+            )
+            push_simulation_frame(screen, draw_vehicles)
+
+        # ~60 Hz cadence measured from the start of this tick, so the work
+        # done here (physics steps, the push, a telemetry write) does not
+        # stretch the period and jitter the frame spacing.
+        work_ms = (time.monotonic() - now) * 1000.0
+        root.after(max(1, int(TICK_MS - work_ms)), simulation_step)
+
+    root.after(TICK_MS, simulation_step)
     root.mainloop()
 
 if __name__ == "__main__":

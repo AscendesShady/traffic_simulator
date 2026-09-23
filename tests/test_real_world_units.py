@@ -12,7 +12,7 @@ import src.ui.control_panel as control_panel
 import src.core.main as main
 import src.telemetry.real_world_units as units
 from src.core.vehicle import Vehicle
-from tests.helpers import NODE_A, NODE_B
+from tests.helpers import NODE_A, NODE_B, reference_flows
 
 
 def test_time_conversion_exact():
@@ -100,7 +100,8 @@ def test_table_values_follow_the_anchor():
         "simulation_time_seconds": 10.0,
         "network_summary": {"mean_speed_px_per_frame": 0.4},
         "network_throughput": {
-            "mean_stopped_delay_sec_per_vehicle": 25.0, "vehicles_served_total": 40,
+            "mean_stopped_delay_sec_per_vehicle": 25.0,
+            "mean_control_delay_sec_per_vehicle": 40.0, "vehicles_served_total": 40,
         },
     }
     sections = {s["title"]: {r["quantity"]: r for r in s["rows"]}
@@ -119,7 +120,9 @@ def test_table_values_follow_the_anchor():
         f"{0.4 * 60 * mpp * 3.6:.1f} km/h"
     )
     assert sections["Delay / LOS"]["Mean stopped delay per vehicle"]["real"] == "25.0 s/veh"
-    assert sections["Delay / LOS"]["Level of service (HCM signalized)"]["real"] == "LOS C"
+    assert sections["Delay / LOS"]["Mean control delay per vehicle"]["real"] == "40.0 s/veh"
+    # LOS from control delay (40 s -> D), not from the 25 s stopped proxy (C).
+    assert sections["Delay / LOS"]["Level of service (HCM signalized)"]["real"] == "LOS D"
 
 
 def test_units_vc_agrees_with_webster_by_construction():
@@ -129,18 +132,16 @@ def test_units_vc_agrees_with_webster_by_construction():
 
     config = dict(control_panel.global_config)
     config["measured_saturation_flow"] = 1291.0
-    config["webster_splits"] = webster.compute_all_nodes(
-        control_panel.approach_configs, s=1291.0, lost_time_sec=4.0
-    )
-    sections = units.build_conversion_table(
-        config, control_panel.approach_configs, control_panel.APPROACH_NAMES
-    )
+    flows = reference_flows()
+    config["webster_splits"] = webster.compute_all_nodes(flows, s=1291.0, lost_time_sec=4.0)
+    sections = units.build_conversion_table(config, flows, control_panel.APPROACH_NAMES)
     flow_rows = {r["quantity"]: r for s in sections if s["title"] == "Flow" for r in s["rows"]}
     split = config["webster_splits"][NODE_A]
     g_over_c = split["EW_green_sec"] / split["cycle_time_sec"]
     expected = split["y_ew"] / g_over_c
     note = flow_rows["EB Corridor demand"]["note"]
-    assert "critical lane 40% of flow" in note
+    # EB's busiest lane is at Node A: straight + far-node left in lanes 0/1.
+    assert "critical lane 45% of flow" in note
     assert f"v/c = {expected:.2f}" in note
 
 

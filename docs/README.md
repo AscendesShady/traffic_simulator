@@ -106,7 +106,9 @@ Compile-check the application modules:
 
 ## Documentation
 
-- [Simulator guide and complete source documentation](TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md)
+- [Methodology and architecture](TRAFFIC_SIMULATOR_METHODOLOGY_AND_ARCHITECTURE.md) — the single current description of the model and the code
+- [Model validation and verification note](MODEL_VALIDATION_AND_VERIFICATION_NOTE.md)
+- [Simulation input parameters](SIMULATION_INPUT_PARAMETERS.md)
 - [Audit report index](audits/README.md)
 - [Audit and step-by-step fix report](audits/TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)
 - [Gridlock incident report](audits/TRAFFIC_SIMULATOR_GRIDLOCK_INCIDENT_REPORT.md)

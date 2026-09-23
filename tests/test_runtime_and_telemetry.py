@@ -95,6 +95,48 @@ def test_same_seed_same_spawns(preserve_sim_random_state):
     assert first == second
 
 
+def test_demand_schedule_is_independent_of_other_random_consumers(
+    preserve_sim_random_state,
+):
+    # Common random numbers: a controller arm that changes congestion changes
+    # how often behavioural draws (lane changes) hit the global RNG. That must
+    # not touch what any source offers, or baseline-vs-arm pairs compare two
+    # different demand realisations.
+    def run(perturb):
+        control_panel.global_config["random_seed"] = 4242
+        main.reset_traffic_generation()
+        main._demand_draw_state["offers"].clear()
+        vehicles, offered = [], []
+        config = {"model": "Poisson", "rate": 600, "turn_split": 0.7, "heavy_ratio": 0.25}
+        for _ in range(240):
+            if perturb:
+                main.random.random()
+                main.spawner_states["WB"]["rng"].random()  # another source's stream
+            main.try_spawn_vehicle(vehicles, "EB", "EB", -20, lane_options()["EB"], config, min_gap=0)
+            offered.append(main.spawner_states["EB"]["requested_arrivals"])
+        return offered, [(v.is_heavy, v.max_speed, v.lane_index, v.target_turn) for v in vehicles], main._demand_draw_hash_hex()
+
+    assert run(False) == run(True)
+
+
+def test_blocked_poisson_arrival_waits_at_the_source_instead_of_being_lost(monkeypatch):
+    main.reset_all_spawner_states()
+    state = main.spawner_states["EB"]
+    monkeypatch.setattr(state["rng"], "random", lambda: 0.0)
+    monkeypatch.setattr(state["rng"], "choice", lambda values: values[0])
+    lanes = lane_options()
+    config = {"model": "Poisson", "rate": 30, "turn_split": 1.0, "heavy_ratio": 0.0}
+    vehicles = [Vehicle(-20, lanes["EB"][0], "EB", lane_index=0)]
+    main.try_spawn_vehicle(vehicles, "EB", "EB", -20, lanes["EB"], config)
+    assert state["requested_arrivals"] == 1 and state["pending_arrivals"] == 1
+    assert len(vehicles) == 1
+    vehicles.clear()
+    main.try_spawn_vehicle(vehicles, "EB", "EB", -20, lanes["EB"], config)
+    assert state["requested_arrivals"] == 2 and state["admitted_arrivals"] == 1
+    assert state["pending_arrivals"] == 1
+    main.reset_all_spawner_states()
+
+
 def test_different_seed_differs(preserve_sim_random_state):
     first = _seeded_spawn_sequence(101)
     second = _seeded_spawn_sequence(202)
@@ -331,7 +373,8 @@ def test_throughput_counts_truck_as_one(monkeypatch):
         key: {"active": key == "EB"}
         for key in ("EB", "WB", "A_NB", "A_SB", "B_NB", "B_SB")
     }
-    monotonic_values = iter((100.0, 100.02))
+    # Loop start, tick start, tick end (the re-arm measures its own work).
+    monotonic_values = iter((100.0, 100.02, 100.025))
 
     monkeypatch.setattr(main, "reset_session_logs", lambda: None)
     monkeypatch.setattr(main, "SignalController", FakeSignals)
@@ -360,9 +403,16 @@ def test_throughput_counts_truck_as_one(monkeypatch):
     # parented to simulation_pane), same reasoning as the other three mounted
     # components above -- FakePane is not a real widget and cannot be a
     # valid Tk master.
+    class FakeCanvas:
+        """The real canvas answers frame_is_due(): the loop renders only on
+        a due tick. Always due here, so the assertions see every frame."""
+
+        def frame_is_due(self):
+            return True
+
     monkeypatch.setattr(
         main, "build_simulation_canvas",
-        lambda _pane: (object(), lambda _surface: None),
+        lambda _pane: (FakeCanvas(), lambda _surface, _draw=None: None),
     )
     monkeypatch.setattr(main.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr(main.atexit, "register", lambda callback: callback)
@@ -705,17 +755,74 @@ def test_downstream_space_decreases_as_downstream_road_fills():
     assert empty_space[str(NODE_B)]["WB"] == empty_space[str(NODE_A)]["EB"]
     assert not any(any(row.values()) for row in empty_blocked.values())
 
-    # Filling the EB road between the nodes lowers Node A's EB downstream
-    # space monotonically, and touches nothing else.
+    # A standing queue whose tail creeps back toward Node A's box lowers the
+    # EB receiving space of that lane, and touches nothing else. Moving
+    # traffic on the stretch is not spillback and takes no room.
     previous = empty_space[str(NODE_A)]["EB"]
-    for count in (3, 6, 9):
-        cars = _downstream_eb_cars(range(NODE_A + 80, NODE_A + 80 + 30 * count, 30))
+    for tail_x in (NODE_B - 200, NODE_B - 400, NODE_B - 600):
+        cars = _downstream_eb_cars(range(tail_x, NODE_B - 66, 30), lanes=(0, 1, 2))
         space, _blocked = exporter.compute_downstream_space_by_node(cars)
         assert space[str(NODE_A)]["EB"] < previous
         previous = space[str(NODE_A)]["EB"]
         assert space[str(NODE_A)]["WB"] == empty_space[str(NODE_A)]["WB"]
         assert space[str(NODE_B)]["EB"] == empty_space[str(NODE_B)]["EB"]
         assert space[str(NODE_A)]["NB"] == empty_space[str(NODE_A)]["NB"]
+    moving = _downstream_eb_cars(range(NODE_A + 80, NODE_B - 66, 30), lanes=(0, 1, 2))
+    for car in moving:
+        car.speed = 1.0
+    assert exporter.compute_downstream_space_by_node(moving)[0] == empty_space
+
+
+def test_receiving_space_is_per_lane_and_per_movement():
+    """The audit's case: a left-turning bus whose exit lane is full while
+    the approach's straight lanes are empty. The approach reads open, the
+    bus's own receiving lane reads blocked, and the TSP gate refuses."""
+    from src.core.signal_controller import TSP_DENY_DOWNSTREAM_BLOCKED
+    from src.core.vehicle import receiving_space_px
+    exporter = TelemetryExporter(export_interval_frames=1)
+    # NB exit of an EB left at Node A lands on lane 2 of the NB road,
+    # x = NODE_A - 2.5 lanes; queue it solid from the box edge northward.
+    exit_x = NODE_A - 2.5 * LANE
+    queue = []
+    for y in range(int(H_Y - 66 - 9), 0, -30):
+        car = Vehicle(exit_x, y, "NB", lane_index=2)
+        car.speed = 0.0
+        queue.append(car)
+    by_lane = exporter.compute_downstream_space_by_lane(queue)
+    assert by_lane[str(NODE_A)]["EB"] == [pytest.approx(NODE_B - NODE_A - 132)] * 3
+    assert by_lane[str(NODE_A)]["NB"][2] < DOWNSTREAM_BLOCKED_PX
+    assert by_lane[str(NODE_A)]["NB"][0] > DOWNSTREAM_BLOCKED_PX
+    _space, blocked = exporter.compute_downstream_space_by_node(queue)
+    assert blocked[str(NODE_A)]["EB"] is False and blocked[str(NODE_A)]["NB"] is False
+    # Movement-specific: EB straight has the whole link, EB left has nothing.
+    assert receiving_space_px(NODE_A, "EB", "STRAIGHT", H_Y - 1.5 * LANE, queue) > 600
+    assert receiving_space_px(NODE_A, "EB", "LEFT", H_Y - 2.5 * LANE, queue) < 1.0
+
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "LEFT_BUS")  # EB left at A
+    bus.x = NODE_A - 66 - 10 - bus.length / 2 - 150
+    route = control_panel.bus_routes_config["R1_EB_A_NB"]
+    route["active"] = route["tsp_enabled"] = True
+    controller = SignalController({"green_time": 240, "is_running": True}, yellow_time=60, red_clearance_time=60)
+    vehicles = queue + [bus]
+    controller.update(vehicles)
+    request = controller.nodes[NODE_A].active_request
+    assert request is not None and request.tsp_requested
+    payload = exporter.build_payload(controller, vehicles, 60)
+    bus_row = next(b for b in payload["active_buses"] if b["bus_id"] == "LEFT_BUS")
+    assert bus_row["receiving_blocked"] is True and bus_row["receiving_space_m"] == 0.0
+    # Cross street green now: without the gate the bus's early green would cut it.
+    controller.nodes[NODE_A].phase = 3
+    controller.nodes[NODE_A].timer = 0
+    for _ in range(30):
+        controller.update(vehicles)
+    assert request.tsp_gate_reason == TSP_DENY_DOWNSTREAM_BLOCKED
+    assert controller.nodes[NODE_A].priority_state == "NORMAL"
+    assert request.tsp_action == "none"
+    # The lane clears: the gate lifts on the next frame.
+    for car in queue:
+        car.speed = 1.0
+    controller.update(vehicles)
+    assert request.tsp_gate_reason != TSP_DENY_DOWNSTREAM_BLOCKED
 
 
 def test_downstream_blocked_when_downstream_road_nearly_full():
@@ -1540,6 +1647,7 @@ def test_export_all_creates_core_sheets(tmp_path, monkeypatch):
         assert workbook.sheetnames == session_sheets + [
             "AI Decision Audit",
             "Control Panel Inputs",
+            "Control Panel Inputs (start)",
             "Bus Events",
             "Unit Conversions",
         ]
@@ -1916,10 +2024,11 @@ def test_session_trends_export_uses_only_in_memory_history(tmp_path):
 def test_excel_export_filename_uses_requested_field_order():
     assert build_excel_export_filename(
         "gemini2.5", 300, 42, timestamp="20260914_112746"
-    ) == "gemini2.5_5min_42seed_14092026_112746.xlsx"
+    ) == "gemini2.5-assisted_5min_42seed_14092026_112746.xlsx"
 
 
-def test_runtime_paths_are_repo_root_relative():
+def test_runtime_paths_are_repo_root_relative(monkeypatch):
+    monkeypatch.undo()  # conftest's isolate_runtime_files: check the real defaults
     repo_root = main.BASE_DIR
     # DASHBOARD_PATH no longer exists: the telemetry dashboard mounts
     # in-process (TelemetryDashboard imported directly) instead of being
@@ -1967,9 +2076,10 @@ def test_congestion_backlog_survives_blocked_spawn_and_drains_on_admission(
     monkeypatch,
 ):
     main.reset_all_spawner_states()
-    monkeypatch.setattr(main.random, "random", lambda: 0.0)
-    monkeypatch.setattr(main.random, "choice", lambda values: values[0])
-    monkeypatch.setattr(main.random, "uniform", lambda low, high: low)
+    rng = main.spawner_states["EB"]["rng"]
+    monkeypatch.setattr(rng, "random", lambda: 0.0)
+    monkeypatch.setattr(rng, "choice", lambda values: values[0])
+    monkeypatch.setattr(rng, "uniform", lambda low, high: low)
     lanes = lane_options()
     config = {
         "model": main.CONGESTION_MODEL,
@@ -2007,32 +2117,28 @@ def test_active_dbl_retains_new_general_left_turn_at_source(monkeypatch):
     controller.update([bus])
     assert controller.is_dbl_active_for_approach(NODE_A, "EB")
 
+    main.reset_all_spawner_states()
+    config = {"model": "Poisson", "rate": 60, "turn_split": 0.0, "heavy_ratio": 0.0}
+    state = main.spawner_states["EB"]
+    monkeypatch.setattr(state["rng"], "random", lambda: 0.5)  # a near-node left turn
+    main._record_demand_offer("EB", state, 1, config)
     monkeypatch.setattr(main, "should_spawn_vehicle", lambda *args: True)
-    monkeypatch.setattr(main.random, "random", lambda: 0.5)
     spawned = []
     main.try_spawn_vehicle(
-        spawned,
-        "EB",
-        "EB",
-        -20,
-        lane_options()["EB"],
-        {
-            "model": "Poisson",
-            "rate": 60,
-            "turn_split": 0.0,
-            "heavy_ratio": 0.0,
-        },
+        spawned, "EB", "EB", -20, lane_options()["EB"], config,
         signal_controller=controller,
     )
 
     assert spawned == []
+    assert state["pending_arrivals"] == 1  # retained at the source, not lost
+    main.reset_all_spawner_states()
 
 
 def test_congestion_peak_cycles_to_recovery_and_caps_backlog(monkeypatch):
     main.reset_all_spawner_states()
-    monkeypatch.setattr(main.random, "random", lambda: 1.0)
-    assert not main.should_spawn_vehicle("EB", main.CONGESTION_MODEL, 30)
     state = main.spawner_states["EB"]
+    monkeypatch.setattr(state["rng"], "random", lambda: 1.0)
+    assert not main.should_spawn_vehicle("EB", main.CONGESTION_MODEL, 30)
     assert state["peak_active"] is True
     assert state["effective_rate_vpm"] == 120.0
 
@@ -2043,10 +2149,11 @@ def test_congestion_peak_cycles_to_recovery_and_caps_backlog(monkeypatch):
 
     state["congestion_cycle_frame"] = 0
     state["pending_arrivals"] = main.MAX_PENDING_ARRIVALS
-    monkeypatch.setattr(main.random, "random", lambda: 0.0)
-    assert main.should_spawn_vehicle("EB", main.CONGESTION_MODEL, 30)
+    monkeypatch.setattr(state["rng"], "random", lambda: 0.0)
+    assert not main.should_spawn_vehicle("EB", main.CONGESTION_MODEL, 30)
     assert state["pending_arrivals"] == main.MAX_PENDING_ARRIVALS
     assert state["overflow_arrivals"] == 1
+    assert state["requested_arrivals"] == 1  # still counted as offered demand
     main.reset_all_spawner_states()
 
 
@@ -2056,7 +2163,8 @@ def test_llm_callbacks_write_runtime_control_instead_of_remaining_placeholders()
     functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
     for callback_name in (
         "on_run_llm",
-        "on_llm_engine_selected",
+        "on_strategy_selected",
+        "on_decider_selected",
         "on_tick_seconds_changed",
     ):
         callback = functions[callback_name]

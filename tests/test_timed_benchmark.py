@@ -181,7 +181,7 @@ def test_test_autoexports_with_correct_filename(tmp_path, monkeypatch):
 
     assert destination is not None and destination.exists()
     assert re.fullmatch(
-        r"nemotron-3-nano-4b_30min_43seed_\d{8}_\d{6}\.xlsx",
+        r"nemotron-3-nano-4b-assisted_30min_43seed_\d{8}_\d{6}\.xlsx",
         destination.name,
     ), destination.name
     assert control_panel.global_config["test_last_export"] == destination.name
@@ -194,6 +194,9 @@ def test_test_autoexports_with_correct_filename(tmp_path, monkeypatch):
         "LLM Performance",
         "LLM Summary",
         "Control Panel Inputs",
+        # The run's verifiable setup, from the snapshot perform_full_reset
+        # stores in global_config["_initial_input_rows"] (main.py).
+        "Control Panel Inputs (start)",
         "Bus Events",
         "Unit Conversions",
         "Experiment Summary",
@@ -265,7 +268,7 @@ def test_filename_sanitises_model_separators():
     name = main.build_test_export_filename(
         "vendor/family:8b", 900, 5, timestamp="20260908_143005"
     )
-    assert name == "vendor-family-8b_15min_5seed_08092026_143005.xlsx"
+    assert name == "vendor-family-8b-assisted_15min_5seed_08092026_143005.xlsx"
 
 
 def test_arming_without_a_model_reports_baseline_not_waiting(monkeypatch):

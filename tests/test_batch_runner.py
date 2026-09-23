@@ -341,3 +341,99 @@ def test_model_picker_lists_local_api_rule_and_none(monkeypatch):
     assert "gemini-2.5-flash" in choices
     assert "gpt-5" not in choices  # OPENAI_API_KEY not set
     assert "None" not in choices  # bare "None" never appears; only the label does
+
+
+# --------------------------------------------------------------------------
+# Stop = pause in place; Resume continues; End discards and resets
+# --------------------------------------------------------------------------
+
+def _start_two_run_batch(monkeypatch):
+    monkeypatch.setattr(control_panel, "write_ai_control", lambda *a, **k: None)
+    monkeypatch.setattr(control_panel, "get_api_models", lambda: ["None"])
+    monkeypatch.setattr(main, "_read_jsonl_rows", lambda path: [])
+    control_panel.global_config["test_duration_sim_seconds"] = 300
+    control_panel.global_config["sim_speed"] = 1.0
+    control_panel.global_config["batch_runtime"] = dict(control_panel.DEFAULT_BATCH_RUNTIME)
+
+    def fake_start_test():
+        control_panel.global_config["start_requested"] = True
+        return 300
+
+    monkeypatch.setattr(control_panel, "request_start_test", fake_start_test)
+
+    def reset_tick():
+        cfg = control_panel.global_config
+        if cfg.get("start_requested"):
+            cfg["start_requested"] = False
+            cfg["is_running"] = True
+            cfg["test_running"] = True
+            cfg["is_paused"] = False
+
+    assert control_panel.request_start_batch(["rule-based"], [1, 2]) == 2
+    main.poll_batch_runner()
+    reset_tick()
+    main.poll_batch_runner()  # RUN_ACTIVE
+    return reset_tick
+
+
+def test_stop_batch_pauses_in_place_and_resume_continues(monkeypatch):
+    reset_tick = _start_two_run_batch(monkeypatch)
+    cfg = control_panel.global_config
+    runtime = cfg["batch_runtime"]
+
+    control_panel.request_stop_batch()
+    main.poll_batch_runner()
+    assert runtime["paused"] is True and runtime["active"] is True
+    assert cfg["is_paused"] is True                      # the run froze
+    assert cfg["is_running"] is True                     # ...but was not stopped
+    assert runtime["current"] == {"model": "rule-based", "seed": 1}
+    # Un-pausing from the Pause button is overridden while the batch is stopped.
+    cfg["is_paused"] = False
+    main.poll_batch_runner()
+    assert cfg["is_paused"] is True
+
+    control_panel.request_resume_batch()
+    main.poll_batch_runner()
+    assert runtime["paused"] is False and cfg["is_paused"] is False
+    # The run finishes and the batch goes on to seed 2 as if never stopped.
+    cfg["is_running"] = False
+    cfg["test_running"] = False
+    main.poll_batch_runner()
+    assert [r["status"] for r in runtime["results"]] == ["COMPLETED"]
+    assert cfg["random_seed"] == 2 and runtime["active"] is True
+    control_panel.request_end_batch()
+    main.poll_batch_runner()
+
+
+def test_end_batch_discards_the_sweep_and_resets(monkeypatch):
+    _start_two_run_batch(monkeypatch)
+    cfg = control_panel.global_config
+    runtime = cfg["batch_runtime"]
+    control_panel.request_stop_batch()
+    main.poll_batch_runner()
+
+    control_panel.request_end_batch()
+    main.poll_batch_runner()
+    assert runtime["active"] is False and runtime["paused"] is False
+    assert runtime["current"] is None and runtime["results"] == []
+    assert cfg["is_running"] is False and cfg["test_running"] is False
+    assert cfg["is_paused"] is False
+    assert cfg["reset_triggered"] is True                # full reset next tick
+    assert cfg["ai_runtime"]["model"] == "None" and cfg["ai_runtime"]["armed"] is False
+    main.poll_batch_runner()                             # idle, no runner left
+    assert main._batch_engine.get("runner") is None
+    cfg["reset_triggered"] = False
+
+
+def test_batch_choices_group_by_control_strategy(monkeypatch):
+    monkeypatch.setattr(control_panel, "get_ollama_models", lambda: ["None", "llama3.1:8b"])
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    by_strategy = {}
+    for choice in control_panel.get_batch_model_choices():
+        by_strategy.setdefault(control_panel.strategy_of(choice), []).append(choice)
+    assert by_strategy[control_panel.STRATEGY_BASELINE] == [control_panel.BATCH_BASELINE_LABEL]
+    assert by_strategy[control_panel.STRATEGY_RULE] == [
+        control_panel.RULE_BASED_MODEL, control_panel.MAX_PRESSURE_MODEL
+    ]
+    assert "llama3.1:8b" in by_strategy[control_panel.STRATEGY_LLM_ASSISTED]
+    assert any(m.startswith("gemini") for m in by_strategy[control_panel.STRATEGY_LLM_ASSISTED])

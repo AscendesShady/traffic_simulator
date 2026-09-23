@@ -63,7 +63,10 @@ DEFAULT_CONTROL = {
     "model": "None",
     "tick_seconds": 5,
     "simulation_running": False,
+    "control_mode": "assisted",
 }
+CONTROL_MODE_ASSISTED = "assisted"
+CONTROL_MODE_CONFIGURED = "configured"
 FRAME_RESET_MARGIN = 100
 # A decision does not land instantly: the model needs seconds to answer, and
 # traffic keeps moving meanwhile. The previous turn's measured latency is the
@@ -73,6 +76,22 @@ DEFAULT_DECISION_LAG_SEC = 8.0
 # Beyond this many seconds a bus is too far out for a flag decided now to be
 # the right call; it will be reconsidered on a later turn.
 ACTIONABLE_HORIZON_SEC = 45.0
+class ModelBusyError(RuntimeError):
+    """The previous turn's call is still occupying the provider lock, so
+    this turn never reached the model.
+
+    Distinct from every other failure because it is not one: nothing was
+    asked and nothing answered. A provider timeout abandons its worker
+    thread (the HTTP request cannot be killed) and that thread keeps the
+    lock until it finishes, so one slow call used to poison every tick
+    behind it -- each recorded as a guarded REJECT that published an
+    all-off decision. In campaign 2026-09-22 that was 611 of grok-4.6's
+    787 rejects, a 98.6% "reject rate" and decisions_effective = 0 for an
+    arm whose model was working. A busy tick is a skipped grid point
+    (SKIPPED_SLOW): it is counted, and decision.json is left alone.
+    """
+
+
 GEMINI_TIMEOUT_SECONDS = 30.0
 OPENAI_TIMEOUT_SECONDS = 30.0
 GROK_TIMEOUT_SECONDS = 30.0
@@ -124,6 +143,120 @@ ROUTE_ORDER_TEXT = "\n".join(
     f"{position}) {route_id}"
     for position, route_id in enumerate(guard.ROUTE_ORDER, start=1)
 )
+
+# --- AI Configured: the model writes the timing plan --------------------------
+_NODE_PLAN_EXAMPLE = {
+    "ew_green_sec": 30, "ns_green_sec": 15, "end_current_green_now": False,
+    "dbl": {approach: False for approach in guard.PLAN_APPROACHES},
+}
+PLAN_OUTPUT_SCHEMA = json.dumps(
+    {
+        "reason": "<one sentence: the passenger comparison behind this plan>",
+        "plan": {node: dict(_NODE_PLAN_EXAMPLE) for node in guard.PLAN_NODES},
+    },
+    indent=2,
+)
+PLAN_OLLAMA_FORMAT = {
+    "type": "object",
+    "properties": {
+        "reason": {"type": "string"},
+        "plan": {
+            "type": "object",
+            "properties": {
+                node: {
+                    "type": "object",
+                    "properties": {
+                        "ew_green_sec": {"type": "number"},
+                        "ns_green_sec": {"type": "number"},
+                        "end_current_green_now": {"type": "boolean"},
+                        "dbl": {
+                            "type": "object",
+                            "properties": {a: {"type": "boolean"} for a in guard.PLAN_APPROACHES},
+                            "required": list(guard.PLAN_APPROACHES),
+                            "additionalProperties": False,
+                        },
+                    },
+                    "required": ["ew_green_sec", "ns_green_sec", "end_current_green_now", "dbl"],
+                    "additionalProperties": False,
+                }
+                for node in guard.PLAN_NODES
+            },
+            "required": list(guard.PLAN_NODES),
+            "additionalProperties": False,
+        },
+    },
+    "required": ["reason", "plan"],
+    "additionalProperties": False,
+}
+
+
+def signal_plan_prompt(telemetry: dict | None = None) -> str:
+    """The AI Configured system prompt, with the run's fixed intervals and
+    measured saturation flow filled in from telemetry."""
+    timing = ((telemetry or {}).get("signal_state") or {}).get("timing") or {}
+    yellow_s = (timing.get("yellow_frames") or 60) / 60.0
+    all_red_s = (timing.get("all_red_frames") or 60) / 60.0
+    sat_flow = (telemetry or {}).get("measured_saturation_flow_veh_per_hr") or 1900
+    return f"""You are the signal controller for two signalized nodes on an arterial
+(NODE {control_panel.NODE_A_X} is upstream of NODE {control_panel.NODE_B_X}
+for eastbound traffic, the reverse westbound; each node also has a
+north-south side street). There is no fixed timing plan: every turn you write
+the plan both nodes run until your next turn.
+
+OBJECTIVE: the most passengers moved through the nodes per minute and the
+fewest person-hours of delay for everyone - arterial, side street, bus riders,
+drivers. A bus carries 45 passengers, a car 4, a truck 1. Judge every choice
+by passengers, not vehicles.
+
+HOW THE SIGNALS WORK. Each node has two phases. EW green serves eastbound and
+westbound (straight, and left turns when a gap opens) while NB/SB are red; NS
+green serves the side street while EB/WB are red. Phases alternate; you set
+the length of each green in seconds ({guard.MIN_GREEN_SEC} to
+{guard.MAX_GREEN_SEC}). Every switch costs a fixed lost time of {yellow_s:g}s
+yellow plus {all_red_s:g}s all-red during which nobody moves - short greens
+waste more of the cycle in lost time, long greens make the other side queue.
+A lane discharges at most about {int(sat_flow)} vehicles per hour of green
+(one every {3600.0 / max(1.0, float(sat_flow)):.1f}s), so a queue longer than
+its green can serve grows every cycle. end_current_green_now ends the running
+green right now (through its yellow and all-red) - use it when the running
+phase is serving nobody and the other side is queued; it cannot cut a green
+below {guard.MIN_GREEN_SEC}s. Your plan applies immediately: if the running
+green is already longer than the value you set, it ends now. Setting the same
+plan again does not restart anything.
+
+HOW THE BUS-LANE FLASHER WORKS. dbl=true on an approach reserves that
+approach's left-most lane (lane 2) for buses: the lane flashes, every
+through-car in it moves out, and buses on that approach move into it and pass
+the car queue. It costs that approach one of its three lanes. Left-turning
+cars keep using lane 2 (left turns are made from it), so a bus behind a
+left-turner waiting for a gap gains nothing until that left goes -
+left_turners_lane2 tells you how many are there. It helps only when a bus is
+actually queued behind through-cars on that approach; a reserved lane with no
+bus is pure lost capacity. It is re-evaluated every turn: set it again to
+keep it.
+
+WHAT YOU SEE, per node: the running phase and residual_green_s; the plan now
+in force; per approach queue_len_m (how far back it is queued), waiting_pax,
+left_turners_lane2, downstream_free_m (room beyond the node - BLOCKED means
+a green there only stalls vehicles inside the intersection: never lengthen a
+green into BLOCKED), buses approaching with passengers and eta_sec, and
+whether lane 2 is reserved. DECISION_LAG_SEC is how long your plan takes to
+land; plan for where traffic will be then.
+
+RULES OF THUMB: give each phase green roughly in proportion to the
+passengers queued on it; lengthen the green a full bus is about to reach and
+shorten the green that faces an empty approach; do not cut a green a bus is
+within a few seconds of using; keep both greens short when both sides are
+near-empty and long when both are heavy (fewer switches); reserve lane 2
+only for a bus stuck behind through-cars with room ahead.
+
+Return EXACTLY one JSON object matching this literal schema - strict JSON,
+no markdown, no analysis, no extra keys; node keys are the strings shown:
+{PLAN_OUTPUT_SCHEMA}
+
+"reason" is one sentence under about 40 words naming the passenger
+comparison behind this turn's plan, on one line with no quotation marks.
+"""
 SYSTEM_PROMPT = f"""You add transit signal priority on top of two signalized
 nodes (NODE {control_panel.NODE_A_X} is upstream of NODE
 {control_panel.NODE_B_X} for eastbound traffic, the reverse for westbound)
@@ -153,8 +286,9 @@ WHAT THE KNOBS DO:
   bus merges into it. It helps only when the bus is queued behind cars it can
   pass; it costs the cars a lane. DBL and TSP are independent: a route can
   have either, both or neither.
-- A grant applies to the whole route (all its buses), is re-evaluated by you
-  every turn, and stays in force on a bus already being served (LOCKED).
+- A grant applies to the whole route (all its buses). You decide it for a
+  bus the controller has not yet taken a request for; once it has (LOCKED),
+  the grant stays in force until that bus is served.
 
 THE TSP TEST, for each route with an approaching bus (every number is on that
 route's ROUTES line):
@@ -195,7 +329,7 @@ NETWORK: queue_len_m is how far back each approach is backed up;
 downstream_free_m is the room beyond the node for vehicles to move into.
 BLOCKED means none: giving that approach green will NOT help, the vehicles
 would stall inside the intersection, so never grant priority into it.
-LOCKED_ROUTES are grants already in progress; leave them as shown. If both
+LOCKED_ROUTES are requests the controller already holds; leave them as shown. If both
 sides of a node are long-queued, grant nothing there and let the Webster
 timing work.
 
@@ -240,6 +374,12 @@ class AgentState(TypedDict):
     scheduled_sim_time: float
     decision_interval_sec: float
     requested_flags: dict
+    control_mode: str
+    # Run identity stamped into every published decision. A TypedDict key
+    # LangGraph does not know is dropped on invoke -- these were, and every
+    # decision left as run_uuid "" and was refused FOREIGN_DECISION.
+    run_uuid: str | None
+    telemetry_frame: int | None
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -319,6 +459,10 @@ def log_turn(state: AgentState, decision: dict) -> None:
             "raw_output": state.get("raw_output", ""),
             "flags": decision.get("flags", {}),
             "requested_flags": state.get("requested_flags", {}),
+            # AI Configured: the plan is the decision (decisions_effective and
+            # the audit sheet read it from here).
+            "schema": decision.get("schema"),
+            "plan": decision.get("plan"),
             "reason": decision.get("reason", ""),
             "pax_per_min_recent": throughput.get(
                 "passengers_per_minute_recent"
@@ -377,13 +521,22 @@ def read_ai_control(path: Path = AI_CONTROL_PATH) -> dict:
             "armed": payload.get("armed") is True,
             "model": str(payload.get("model", "None")),
             "tick_seconds": min(
-                15,
-                max(2, int(payload.get("tick_seconds", 5))),
+                control_panel.TICK_SECONDS_MAX,
+                max(control_panel.TICK_SECONDS_MIN, int(payload.get("tick_seconds", 5))),
             ),
             "simulation_running": payload.get("simulation_running") is True,
+            "control_mode": (
+                CONTROL_MODE_CONFIGURED
+                if payload.get("control_mode") == CONTROL_MODE_CONFIGURED
+                else CONTROL_MODE_ASSISTED
+            ),
         }
     except Exception:
         return dict(DEFAULT_CONTROL)
+
+
+def is_configured(state) -> bool:
+    return state.get("control_mode") == CONTROL_MODE_CONFIGURED
 
 
 def _read_telemetry(path: Path = TELEMETRY_PATH) -> dict | None:
@@ -561,7 +714,67 @@ def _approach_metres(table, approach):
     return "?" if value is None else f"{value:.1f}"
 
 
+def _left_turners_lane2(node, approach):
+    table = node.get("left_turners_lane2")
+    return int(table.get(approach, 0) or 0) if isinstance(table, dict) else 0
+
+
+def read_signal_map(state: AgentState) -> dict:
+    """AI Configured's view: per node the running phase, the plan in force
+    and per approach what is waiting; buses by approach with ETA."""
+    telemetry = state.get("telemetry", {})
+    throughput = telemetry.get("network_throughput", {})
+    signal_state = telemetry.get("signal_state", {})
+    nodes = signal_state.get("nodes", {})
+    live_plan = signal_state.get("plan") or {}
+    decision_lag_sec = state.get("decision_lag_sec")
+    if _finite_nonnegative(decision_lag_sec) is None:
+        decision_lag_sec = DEFAULT_DECISION_LAG_SEC
+    buses_by_node = {}
+    for bus in telemetry.get("active_buses", []) or []:
+        leg = bus.get("route_leg") if isinstance(bus, dict) else None
+        if not leg or (bus.get("distance_to_stop_bar_px") or -1) < 0:
+            continue
+        approach = str(leg.get("approach") or bus.get("direction", "?"))
+        buses_by_node.setdefault(str(leg.get("node_x")), []).append(
+            f"{approach}:{int(bus.get('passengers', 0))}pax/eta{bus.get('eta_to_stop_bar_sec_freeflow', '?')}s"
+        )
+    lines = [
+        f"simulation_time_seconds={telemetry.get('simulation_time_seconds', 0)}",
+        f"DECISION_LAG_SEC={decision_lag_sec}",
+        f"passengers_per_minute={throughput.get('passengers_per_minute', 0)}",
+        f"passengers_per_minute_recent={throughput.get('passengers_per_minute_recent', 0)}",
+        "PLAN_IN_FORCE=" + (json.dumps(live_plan, sort_keys=True) if live_plan else "Webster (no plan yet)"),
+        "NODES:",
+    ]
+    for node_x, node in sorted(nodes.items(), key=lambda item: str(item[0])):
+        if not isinstance(node, dict):
+            continue
+        waiting = node.get("queues_passengers_est") or {}
+        signals = node.get("signals", {})
+        blocked = node.get("downstream_blocked") or {}
+        dbl = node.get("dbl_commanded") or []
+        residual_s = round((node.get("residual_green_frames") or 0) / 60.0, 1)
+        lines.append(
+            f"- NODE {node_x}: phase={node.get('phase', 'UNKNOWN')} residual_green_s={residual_s} "
+            "signals: " + " ".join(f"{a}={signals.get(a, '?')}" for a in guard.PLAN_APPROACHES)
+            + " | " + " ".join(
+                f"{a}[waiting_pax={int(_finite_nonnegative(waiting.get(a), 0) or 0)} "
+                f"queue_len_m={_approach_metres(node.get('queue_length_m'), a)} "
+                f"left_turners_lane2={_left_turners_lane2(node, a)} "
+                f"downstream_free_m={_approach_metres(node.get('downstream_space_m'), a)}"
+                f"{'(BLOCKED)' if blocked.get(a) else ''} "
+                f"lane2_reserved={a in dbl}]"
+                for a in guard.PLAN_APPROACHES
+            )
+            + " buses: " + (" ".join(buses_by_node.get(str(node_x), [])) or "none")
+        )
+    return {"minimap": "\n".join(lines)}
+
+
 def read_minimap(state: AgentState) -> dict:
+    if is_configured(state):
+        return read_signal_map(state)
     telemetry = state.get("telemetry", {})
     routes = telemetry.get("routes", {})
     throughput = telemetry.get("network_throughput", {})
@@ -716,6 +929,9 @@ def check_locked(state: AgentState) -> dict:
     if not isinstance(telemetry, dict):
         telemetry = {}
     locked = set()
+    if is_configured(state):
+        # The plan is re-issued whole every turn; nothing is locked.
+        return {"locked_routes": locked, "minimap": state.get("minimap", "")}
     active_buses = telemetry.get("active_buses", [])
     if not isinstance(active_buses, list):
         active_buses = []
@@ -726,11 +942,21 @@ def check_locked(state: AgentState) -> dict:
         if route_id not in guard.VALID_ROUTES:
             continue
         # Vehicle leg_state describes geometry (APPROACHING,
-        # IN_INTERSECTION, TURNING, ...), while these two telemetry booleans
-        # expose the controller's grant lifecycle. Keep a route locked through
-        # both the active-green and clearing portions of an accepted grant.
-        if bool(bus.get("priority_granted", False)) or bool(
-            bus.get("priority_clearing", False)
+        # IN_INTERSECTION, TURNING, ...), while these telemetry booleans
+        # expose the controller's request lifecycle. Keep a route locked from
+        # the moment the controller holds a request for one of its buses
+        # (armed for an early green, waiting on the gate) through the
+        # active-green and clearing portions of the grant: the controller
+        # reads the flag as a continuous hold and cancels a live request the
+        # turn the flag drops (FEATURE_DISABLED, and the bus's leg is then
+        # suppressed for good), so a decider that re-derives its grants from
+        # each snapshot -- cross_pax ticking over the bus load, the bus's
+        # landed ETA reaching 0 at the bar -- was withdrawing most of what it
+        # had asked for. The decider still decides every *new* request.
+        if (
+            bool(bus.get("priority_requested", False))
+            or bool(bus.get("priority_granted", False))
+            or bool(bus.get("priority_clearing", False))
         ):
             locked.add(route_id)
     minimap = state.get("minimap", "")
@@ -764,7 +990,7 @@ def _call_gemini(
         raise RuntimeError("google-genai package not installed")
     call_lock = _GEMINI_CALL_LOCK
     if not call_lock.acquire(blocking=False):
-        raise RuntimeError("previous Gemini request is still running")
+        raise ModelBusyError("previous Gemini request is still running")
 
     result_queue = queue.Queue(maxsize=1)
     prompt = system_prompt + "\n\n" + minimap
@@ -872,7 +1098,7 @@ def _call_openai_compatible(
     model: str, system_prompt: str, minimap: str,
 ) -> tuple[str, dict]:
     if not call_lock.acquire(blocking=False):
-        raise RuntimeError(f"previous {provider} request is still running")
+        raise ModelBusyError(f"previous {provider} request is still running")
 
     result_queue = queue.Queue(maxsize=1)
 
@@ -964,16 +1190,19 @@ def _get_ollama_client():
     return _OLLAMA_CLIENT
 
 
-def _call_ollama(model: str, minimap: str) -> tuple[str, dict]:
+def _call_ollama(
+    model: str, minimap: str, system_prompt: str = SYSTEM_PROMPT,
+    output_format: dict = OLLAMA_OUTPUT_FORMAT,
+) -> tuple[str, dict]:
     client = _get_ollama_client()
     call_lock = _OLLAMA_CALL_LOCK
     if not call_lock.acquire(blocking=False):
-        raise RuntimeError("previous Ollama request is still running")
+        raise ModelBusyError("previous Ollama request is still running")
 
     request = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": minimap},
         ],
         "options": {"temperature": 0.2},
@@ -984,7 +1213,7 @@ def _call_ollama(model: str, minimap: str) -> tuple[str, dict]:
     def request_ollama():
         try:
             try:
-                response = client.chat(format=OLLAMA_OUTPUT_FORMAT, **request)
+                response = client.chat(format=output_format, **request)
             except Exception as exc:
                 if not _ollama_format_is_unsupported(exc):
                     raise
@@ -1029,7 +1258,8 @@ def _call_ollama(model: str, minimap: str) -> tuple[str, dict]:
 
 
 def _call_rule(state: AgentState) -> tuple[str, dict]:
-    """Decide with the deterministic rule instead of a model.
+    """Decide with a non-LLM comparator (rule or max-pressure) instead of a
+    model.
 
     Serializes the rule's positional flags into the same JSON text an LLM is
     asked to produce, so everything downstream -- the guard, the
@@ -1038,7 +1268,12 @@ def _call_rule(state: AgentState) -> tuple[str, dict]:
     report, and the near-zero latency this reports is itself a result: the
     rule has no decision lag where a model does.
     """
-    decision = rule_controller.rule_based_decision(
+    model = state.get("model", "")
+    if rule_controller.is_max_pressure_model(model):
+        decide = rule_controller.max_pressure_decision
+    else:
+        decide = rule_controller.rule_based_decision
+    decision = decide(
         state.get("telemetry", {}),
         decision_lag_sec=state.get("decision_lag_sec"),
     )
@@ -1101,26 +1336,36 @@ def ai_turn(state: AgentState) -> dict:
                              "output_tokens": None, "eval_duration_ns": None,
                              "total_duration_ns": None},
         }
+    configured = is_configured(state)
+    system_prompt = (
+        signal_plan_prompt(state.get("telemetry")) if configured else SYSTEM_PROMPT
+    )
     try:
         if rule_controller.is_rule_model(model):
-            raw_output, call_metrics = _call_rule(state)
+            # LLM-only mode: a rule model has no plan to write; the guard
+            # holds Webster on the empty output.
+            raw_output, call_metrics = ("", {}) if configured else _call_rule(state)
         elif _is_gemini(model):
             raw_output, call_metrics = _call_gemini(
                 model,
-                SYSTEM_PROMPT,
+                system_prompt,
                 state.get("minimap", ""),
             )
         elif _is_openai(model):
             raw_output, call_metrics = _call_openai(
                 model,
-                SYSTEM_PROMPT,
+                system_prompt,
                 state.get("minimap", ""),
             )
         elif _is_grok(model):
             raw_output, call_metrics = _call_grok(
                 model,
-                SYSTEM_PROMPT,
+                system_prompt,
                 state.get("minimap", ""),
+            )
+        elif configured:
+            raw_output, call_metrics = _call_ollama(
+                model, state.get("minimap", ""), system_prompt, PLAN_OLLAMA_FORMAT
             )
         else:
             raw_output, call_metrics = _call_ollama(
@@ -1139,6 +1384,10 @@ def ai_turn(state: AgentState) -> dict:
                 "latency_ms": latency_ms,
             },
         }
+    except ModelBusyError:
+        # Not a model failure: propagate so run_forever counts a skipped
+        # grid point and leaves the standing decision in place.
+        raise
     except Exception as exc:
         latency_ms = round((time.time() - started) * 1000.0, 1)
         return {
@@ -1155,6 +1404,16 @@ def ai_turn(state: AgentState) -> dict:
 
 
 def anti_cheat(state: AgentState) -> dict:
+    if is_configured(state):
+        # The plan is validated whole and clamped by the guard; every safety
+        # interval (yellow, all-red, minimum green, clearance) is enforced by
+        # the controller, so there is nothing for the model to cheat past.
+        decision = guard.safe_signal_plan(
+            state.get("raw_output", ""),
+            state.get("turn", 0),
+            state.get("model", "None"),
+        )
+        return {"decision": decision, "requested_flags": {}, "status": decision["status"]}
     decision = guard.safe_decision(
         state.get("raw_output", ""),
         state.get("turn", 0),
@@ -1206,26 +1465,39 @@ def _remember_decision(state: AgentState, decision: dict) -> list:
     return recent[-RECENT_DECISION_LIMIT:]
 
 
+def publish_decision(decision: dict, run_uuid, telemetry_frame=None) -> dict:
+    """The only writer of decision.json. Every decision names the run (and
+    telemetry frame) it was made for, so main.merge_ai_decision can refuse
+    one left over from an earlier run, arm or model."""
+    decision["run_uuid"] = str(run_uuid or "")
+    decision["telemetry_frame"] = telemetry_frame
+    atomic_write_json(DECISION_PATH, decision)
+    return decision
+
+
 def write_decision(state: AgentState) -> dict:
     decision = guard_baseline(state["decision"], state)
-    atomic_write_json(DECISION_PATH, decision)
+    publish_decision(decision, state.get("run_uuid"), state.get("telemetry_frame"))
     log_turn(state, decision)
     return {"decision": decision, "recent_decisions": _remember_decision(state, decision)}
 
 
 def hold(state: AgentState) -> dict:
     # Locked design choice: stale or missing telemetry cannot authorize priority.
-    decision = {
-        "schema_version": 1,
-        "turn": int(state.get("turn", 0)),
-        "timestamp": round(time.time(), 3),
-        "model": str(state.get("model", "None")),
-        "status": "HELD_ALL_OFF",
-        "flags": guard.all_off_flags(),
-        "reason": "",
-    }
+    if is_configured(state):
+        decision = guard.safe_signal_plan("", state.get("turn", 0), state.get("model", "None"))
+    else:
+        decision = {
+            "schema_version": 1,
+            "turn": int(state.get("turn", 0)),
+            "timestamp": round(time.time(), 3),
+            "model": str(state.get("model", "None")),
+            "status": "HELD_ALL_OFF",
+            "flags": guard.all_off_flags(),
+            "reason": "",
+        }
     decision = guard_baseline(decision, state)
-    atomic_write_json(DECISION_PATH, decision)
+    publish_decision(decision, state.get("run_uuid"), state.get("telemetry_frame"))
     log_turn(state, decision)
     return {
         "decision": decision,
@@ -1266,11 +1538,11 @@ def build_graph():
     return workflow.compile()
 
 
-def _dependency_hold(turn: int, model: str, message: str) -> dict:
+def _dependency_hold(turn: int, model: str, message: str, run_uuid=None) -> dict:
     decision = guard_baseline(
         guard.safe_decision(message, turn, model), {"turn": turn, "model": model}
     )
-    atomic_write_json(DECISION_PATH, decision)
+    publish_decision(decision, run_uuid)
     log_turn(
         {
             "minimap": "",
@@ -1350,9 +1622,12 @@ def run_forever() -> None:
         tick_index += 1
         turn += 1
         model = control["model"]
+        run_uuid = telemetry.get("run_uuid") if isinstance(telemetry, dict) else None
         try:
             if graph is None:
-                decision = _dependency_hold(turn, model, graph_error or "Agent unavailable")
+                decision = _dependency_hold(
+                    turn, model, graph_error or "Agent unavailable", run_uuid
+                )
                 recent_decisions = (recent_decisions + [decision])[-RECENT_DECISION_LIMIT:]
             else:
                 result = graph.invoke(
@@ -1372,9 +1647,12 @@ def run_forever() -> None:
                             model, decision_lag_sec
                         ),
                         "control_path": str(AI_CONTROL_PATH),
+                        "run_uuid": run_uuid,
+                        "telemetry_frame": _telemetry_frame_number(telemetry),
                         "tick_index": tick_index,
                         "scheduled_sim_time": scheduled_time,
                         "decision_interval_sec": interval,
+                        "control_mode": control["control_mode"],
                     }
                 )
                 recent_decisions = result.get("recent_decisions", recent_decisions)
@@ -1388,11 +1666,19 @@ def run_forever() -> None:
                     decision_lag_sec = decision_lag_seconds(
                         measured.get("latency_ms")
                     )
+        except ModelBusyError:
+            # The grid point came due while the previous call still held the
+            # provider: skipped and counted, exactly like one that came due
+            # mid-call. decision.json is untouched, so the arm keeps the
+            # treatment it last decided instead of being forced all-off.
+            turn -= 1
+            log_skipped_tick(tick_index, scheduled_time, model, interval)
         except Exception as exc:
             decision = _dependency_hold(
                 turn,
                 model,
                 f"Agent turn error: {type(exc).__name__}: {str(exc)[:500]}",
+                run_uuid,
             )
             recent_decisions = (recent_decisions + [decision])[-RECENT_DECISION_LIMIT:]
 

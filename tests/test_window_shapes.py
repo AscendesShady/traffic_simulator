@@ -1,6 +1,6 @@
-"""Three window shapes: compact (fitted, canvas 1:1), large (~75% screen)
-and maximized (OS zoomed), with the side panes and the scaled canvas
-following the shape."""
+"""Three window shapes: compact (fitted window), large (~75% screen) and
+maximized (OS zoomed), with the side panes following the shape and the
+whole network scaled into the centre pane in every one of them."""
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -71,6 +71,26 @@ def test_build_main_window_exposes_the_shape_controller():
         controller = root.window_shape
         assert isinstance(controller, main.WindowShapeController)
         assert controller.shape == "compact"
+    finally:
+        root.destroy()
+
+
+def test_compact_shape_fits_the_whole_network_into_its_pane():
+    root, _control, simulation_pane, _telemetry = main.build_main_window()
+    try:
+        root.update()
+        controller = root.window_shape
+        assert controller.shape == "compact"
+        fitted = []
+        controller._fit_canvas = lambda w, h: fitted.append((w, h))
+        controller._fit()
+        (width, height), = fitted
+        assert width <= simulation_pane.winfo_width()
+        assert width < canvas.WIDTH  # never the clipped native 2400
+        assert (width, height) == main.fit_canvas_size(
+            simulation_pane.winfo_width() - 2 * main.SIMULATION_PANE_GUTTER - 2,
+            simulation_pane.winfo_height() - 2 * main.SIMULATION_PANE_GUTTER - 2,
+        )
     finally:
         root.destroy()
 
@@ -187,10 +207,10 @@ def test_push_frame_scales_only_when_the_target_differs(monkeypatch):
         surface = pygame.Surface((canvas.WIDTH, canvas.HEIGHT))
         push_frame(surface)
         assert calls == []
-        simulation_canvas.set_target_size(1150, 690)
+        simulation_canvas.set_target_size(1000, 250)
         push_frame(surface)
         push_frame(surface)
-        assert calls == [(1150, 690), (1150, 690)]
+        assert calls == [(1000, 250), (1000, 250)]
     finally:
         host.destroy()
 
@@ -226,34 +246,62 @@ def test_view_zoom_crops_the_surface_and_is_display_only(monkeypatch):
         )
         # The physics surface itself is untouched by zooming.
         assert surface.get_size() == (canvas.WIDTH, canvas.HEIGHT)
+        # Vehicles: drawn on the native surface while the view is at most
+        # 1 screen px per world px, on the scaled frame once zoomed past it.
+        simulation_canvas.set_target_size(canvas.WIDTH // 2, canvas.HEIGHT // 2)
+        calls = []
+        simulation_canvas.set_view_zoom(1.0)
+        push_frame(surface, lambda target, view, scale: calls.append((target.get_size(), view, scale)))
+        assert calls == [((canvas.WIDTH, canvas.HEIGHT), None, 1.0)]
+        calls.clear()
+        simulation_canvas.set_view_zoom(4.0)
+        push_frame(surface, lambda target, view, scale: calls.append((target.get_size(), view, scale)))
+        (size, view, scale), = calls
+        assert size == (canvas.WIDTH // 2, canvas.HEIGHT // 2)
+        assert view == simulation_canvas.view_rect() and scale == 2.0
         # Left and middle button both pan, in whatever shape the canvas is.
         for button in (1, 2):
             assert simulation_canvas.bind(f"<B{button}-Motion>")
             assert simulation_canvas.bind(f"<ButtonPress-{button}>")
         simulation_canvas.set_view_zoom(1.0)
+        simulation_canvas.set_target_size(canvas.WIDTH, canvas.HEIGHT)
         sources.clear()
         push_frame(surface)
-        assert sources == []
+        assert sources == []   # native size, zoom 1: no scaling at all
     finally:
         host.destroy()
 
 
-def test_push_frame_halves_its_rate_above_the_pixel_threshold(monkeypatch):
+def test_render_rate_halves_above_the_pixel_threshold():
+    """frame_is_due() is the one render gate: the loop calls it before the
+    network draw, the DBL-state scan AND the push, so a skipped tick costs
+    nothing at all rather than drawing a frame it then throws away."""
     host = tk.Tk()
-    pushes = []
-    real = pygame.image.tostring
-    monkeypatch.setattr(
-        main.pygame.image, "tostring",
-        lambda surface, fmt: pushes.append(surface.get_size()) or real(surface, fmt),
-    )
     try:
-        simulation_canvas, push_frame = build_canvas(host)
-        surface = pygame.Surface((canvas.WIDTH, canvas.HEIGHT))
-        big = main.fit_canvas_size(canvas.WIDTH * 3, canvas.HEIGHT * 3)  # 9x native pixels
-        simulation_canvas.set_target_size(*big)
-        for _ in range(4):
-            push_frame(surface)
-        assert len(pushes) == 2
+        simulation_canvas, _push_frame = build_canvas(host)
+        assert 1300 * 325 <= main.FULL_RATE_PUSH_MAX_PIXELS < 1900 * 475
+        simulation_canvas.set_target_size(1900, 475)   # maximized on 1080p
+        assert sum(simulation_canvas.frame_is_due() for _ in range(4)) == 2
+        simulation_canvas.set_target_size(1300, 325)   # large: full rate
+        assert sum(simulation_canvas.frame_is_due() for _ in range(4)) == 4
+    finally:
+        host.destroy()
+
+
+def test_a_batch_sweep_drops_the_render_rate(monkeypatch):
+    """Nobody watches an unattended sweep at 60 fps, and the render side was
+    a fifth of every run's wall clock. It must not touch anything the
+    simulation or the agent can see -- only how often a frame is painted."""
+    host = tk.Tk()
+    try:
+        simulation_canvas, _push_frame = build_canvas(host)
+        simulation_canvas.set_target_size(1300, 325)   # full rate otherwise
+        runtime = main.control_panel.global_config.setdefault("batch_runtime", {})
+        monkeypatch.setitem(runtime, "active", True)
+        ticks = main.BATCH_RENDER_EVERY * 3
+        assert sum(simulation_canvas.frame_is_due() for _ in range(ticks)) == 3
+        monkeypatch.setitem(runtime, "active", False)
+        assert sum(simulation_canvas.frame_is_due() for _ in range(4)) == 4
     finally:
         host.destroy()
 

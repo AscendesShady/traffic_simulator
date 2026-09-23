@@ -129,7 +129,7 @@ def test_contaminated_baseline_row_is_refused_and_fails_the_run():
     with pytest.raises(main.BaselineContaminationError):
         main.build_experiment_summary_row(300)
     assert main.append_experiment_summary_row(300) is False
-    assert not main.EXPERIMENT_SUMMARY_PATH.exists()
+    assert not main.experiment_summary_path().exists()
     assert control_panel.global_config["test_failed_reason"].startswith("baseline_contaminated")
 
     # Observation-only turns are what a watched baseline legitimately logs.

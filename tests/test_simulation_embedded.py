@@ -92,21 +92,29 @@ def test_startup_window_positioning_env_var_is_gone():
     assert hasattr(main, "calculate_startup_window_layout")
 
 
-def test_visual_push_is_throttled_to_every_other_tick():
-    """30 Hz visual against 60 Hz sim: the expensive PPM push must not run
-    on every single 16 ms callback."""
+def test_every_tick_pushes_an_interpolated_frame():
+    """Each tick pushes one frame (the pushed size is the pane, so it is
+    cheap; build_simulation_canvas halves the rate itself past the pixel
+    threshold), with vehicles drawn at the interpolated position between
+    the last two physics steps so the display cadence never beats against
+    the 60 Hz sim into a hop."""
     source = inspect.getsource(main.main)
 
-    assert "visual_frame_counter" in source
-    assert "visual_frame_counter % 2 == 0" in source
-    assert "push_simulation_frame(screen)" in source
+    assert "visual_frame_counter" not in source
+    assert "push_simulation_frame(screen, draw_vehicles)" in source
+    assert "time_accumulator / dt_step" in source
+    # One gate over every render-only step, so a skipped tick draws nothing.
+    assert "if _simulation_canvas.frame_is_due():" in source
 
 
 def test_sim_step_pacing_constants_are_unchanged():
     """The fixed-timestep loop that makes master_frame_count advance at a
-    stable rate must be untouched by the rendering change."""
+    stable rate must be untouched by the rendering change; the tick is
+    re-armed against the tick's start so work inside it does not stretch
+    the period."""
     source = inspect.getsource(main.main)
 
     assert "dt_step = 1.0 / 60.0" in source
     assert "max_steps_per_callback = 6" in source
-    assert "root.after(16, simulation_step)" in source
+    assert main.TICK_MS == 16
+    assert "root.after(max(1, int(TICK_MS - work_ms)), simulation_step)" in source

@@ -10,6 +10,7 @@ import sys
 
 from src.experiments import batch_runner
 from src.ui.canvas_gemini import INT_X
+from src.telemetry import real_world_units as units
 
 NODE_A_X, NODE_B_X = INT_X[0], INT_X[1]
 
@@ -162,6 +163,16 @@ DISCHARGE_OPTIONS = (
 # real decision sources. Maps to the ordinary "None" model when applied.
 BATCH_BASELINE_LABEL = "None (baseline)"
 
+# The largest hard call timeout agent.py imposes on any provider
+# (agent.OLLAMA_TIMEOUT_SECONDS; the API providers are 30 s). A turn can
+# never take longer than this, so a tick above it is the one interval at
+# which NO arm skips a grid point -- and the decision schedule has to be
+# one fixed interval across every arm for the paired DV to mean anything.
+# tests/test_llm_control_loop.py pins this to agent.py's own constants.
+AGENT_CALL_TIMEOUT_CEILING_SEC = 45
+MIN_UNSKIPPED_TICK_SECONDS = AGENT_CALL_TIMEOUT_CEILING_SEC + 5
+DEFAULT_TICK_SECONDS = 60
+
 DEFAULT_BATCH_RUNTIME = {
     "active": False,
     "models": [],
@@ -169,11 +180,17 @@ DEFAULT_BATCH_RUNTIME = {
     "total": 0,
     "current": None,
     "results": [],
+    # STOP BATCH freezes the sweep in place (the run in flight pauses);
+    # RESUME continues it, END discards it and resets the simulation.
+    "paused": False,
     # Independent of the Single Run card's own "Decision interval" slider:
     # applies to the single Benchmark Test and to every queued Batch
     # Benchmark run, so an unattended sweep is never silently governed by
     # whatever the Single Run panel happens to be set to.
-    "tick_seconds": 5,
+    # Defaults to MIN_UNSKIPPED_TICK_SECONDS: one tick must outlast the
+    # agent's own worst-case call timeout or a slow arm spends the run
+    # skipping grid points (campaign 2026-09-22: phi3 issued 118 of 300).
+    "tick_seconds": DEFAULT_TICK_SECONDS,
 }
 
 # Live widget references used by the periodic repaint poller. The data in
@@ -207,6 +224,9 @@ global_config = {
     # been released toward (the controller clamps and logs anything above).
     "priority_eligibility_px": 400,
     "vehicle_speed_scale": 0.5,      # Pending scale, applied on START/reset
+    # Car-following/lane-change engine, applied on START/reset: "legacy"
+    # (the pinned engine) or "idm" (physically calibrated; vehicle.py).
+    "movement_model": "legacy",
     "_active_vehicle_speed_scale": 0.5,  # Runtime snapshot for this episode
     "reset_triggered": False,# Flag to wipe canvas vehicles
     "start_requested": False,# START requests a fresh run from frame zero
@@ -222,7 +242,9 @@ global_config = {
     "test_seed": None,       # Seed captured when the test started
     "test_last_export": "",  # Filename written by the last completed test
     "batch_start_requested": False,  # RUN BATCH requests one queued sweep
-    "batch_stop_requested": False,   # STOP BATCH: finish current run, then halt
+    "batch_stop_requested": False,   # STOP BATCH: pause the sweep in place
+    "batch_resume_requested": False, # RESUME: continue the paused sweep
+    "batch_end_requested": False,    # END: discard the sweep, full reset
     "batch_runtime": dict(DEFAULT_BATCH_RUNTIME),
     "sim_time_seconds": 0.0, # Simulation clock, published by main.py
     "window_shape": "compact",  # compact | large | maximized, owned by main.py
@@ -247,7 +269,11 @@ global_config = {
     "ai_runtime": {
         "armed": False,
         "model": "None",
-        "tick_seconds": 5,
+        # "assisted": the model requests TSP/DBL per route over Webster;
+        # "configured": the model writes the timing plan and the lane-2
+        # flashers itself (AI/LLM-Based only; guard.validate_signal_plan).
+        "control_mode": "assisted",
+        "tick_seconds": DEFAULT_TICK_SECONDS,
         "last_status": "INACTIVE",
         "last_turn": 0,
     },
@@ -426,6 +452,9 @@ def request_start_test():
         global_config.get("ai_runtime", {}).get("model", "None")
     )
     global_config["test_seed"] = global_config.get("random_seed")
+    global_config["test_control_mode"] = str(
+        global_config.get("ai_runtime", {}).get("control_mode", CONTROL_MODE_ASSISTED)
+    )
     global_config["test_running"] = True
     global_config["start_requested"] = True
     return int(duration)
@@ -777,6 +806,157 @@ def add_slider_row(
     return value_label, scale
 
 
+class SplitBar(tk.Canvas):
+    """A 100 % bar cut into 2 or 3 segments by 1 or 2 draggable thumbs.
+
+    Tk has no range slider; this is the smallest one that reads like the
+    panel's thin scales. ``values`` are the thumb positions in whole percent
+    (ascending); the segments are the gaps between 0, the thumbs and 100.
+    Drag a thumb, or click it (or Tab to the bar) and use Left/Right, Home/
+    End; the focused thumb draws a ring. ``command(segments)`` fires with the
+    integer percentages of every segment on each change.
+    """
+
+    THUMB_R = 6
+    TRACK_H = 4
+    HEIGHT = 20
+    SEGMENT_COLORS = (COLOR_ACCENT, COLOR_WARNING, COLOR_SUCCESS)
+
+    def __init__(self, parent, values, command=None, **kwargs):
+        surface = parent.cget("bg")
+        # width=1: a Canvas's default 10 cm request would otherwise widen
+        # every approach card past the pane and clip it; fill="x" sizes it.
+        kwargs.setdefault("width", 1)
+        super().__init__(
+            parent, height=self.HEIGHT, bg=surface, highlightthickness=0,
+            cursor="hand2", takefocus=True, **kwargs,
+        )
+        self.values = [int(v) for v in values]
+        self.command = command
+        self.active = 0          # thumb index that drags or takes the keys
+        self._dragging = None
+        self.bind("<Configure>", lambda _e: self._draw())
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_dragging", None))
+        self.bind("<FocusIn>", lambda _e: self._draw())
+        self.bind("<FocusOut>", lambda _e: self._draw())
+        for key, delta in (("<Left>", -1), ("<Down>", -1), ("<Right>", 1), ("<Up>", 1)):
+            self.bind(key, lambda _e, d=delta: self._nudge(d))
+        self.bind("<Home>", lambda _e: self._set(self.active, 0))
+        self.bind("<End>", lambda _e: self._set(self.active, 100))
+
+    def segments(self):
+        edges = [0, *self.values, 100]
+        return [b - a for a, b in zip(edges, edges[1:])]
+
+    # --- geometry ---------------------------------------------------------
+    def _x(self, value):
+        pad = self.THUMB_R + 1
+        return pad + (self.winfo_width() - 2 * pad) * value / 100.0
+
+    def _value_at(self, x):
+        pad = self.THUMB_R + 1
+        span = max(1, self.winfo_width() - 2 * pad)
+        return int(round(max(0.0, min(100.0, (x - pad) * 100.0 / span))))
+
+    # --- interaction ------------------------------------------------------
+    def _press(self, event):
+        self.focus_set()
+        # Nearest thumb takes the press: the whole bar is the hit area.
+        self.active = min(
+            range(len(self.values)), key=lambda i: abs(self._x(self.values[i]) - event.x)
+        )
+        self._dragging = self.active
+        self._set(self.active, self._value_at(event.x))
+
+    def _drag(self, event):
+        if self._dragging is not None:
+            self._set(self._dragging, self._value_at(event.x))
+
+    def _nudge(self, delta):
+        self._set(self.active, self.values[self.active] + delta)
+
+    def _set(self, index, value):
+        # Thumbs never cross: each is clamped between its neighbours.
+        low = self.values[index - 1] if index > 0 else 0
+        high = self.values[index + 1] if index + 1 < len(self.values) else 100
+        value = max(low, min(high, int(value)))
+        if value == self.values[index]:
+            return
+        self.values[index] = value
+        self._draw()
+        if self.command:
+            self.command(self.segments())
+
+    # --- painting ---------------------------------------------------------
+    def _draw(self):
+        self.delete("all")
+        cy = self.HEIGHT / 2.0
+        edges = [0, *self.values, 100]
+        for i, (a, b) in enumerate(zip(edges, edges[1:])):
+            self.create_rectangle(
+                self._x(a), cy - self.TRACK_H / 2.0, self._x(b), cy + self.TRACK_H / 2.0,
+                fill=self.SEGMENT_COLORS[i % len(self.SEGMENT_COLORS)], width=0,
+            )
+        focused = self.focus_get() is self
+        for i, value in enumerate(self.values):
+            x = self._x(value)
+            r = self.THUMB_R
+            self.create_oval(
+                x - r, cy - r, x + r, cy + r,
+                fill=COLOR_TEXT_PRIMARY, outline=COLOR_CARD_BORDER, width=1,
+            )
+            if focused and i == self.active:
+                self.create_oval(
+                    x - r - 2, cy - r - 2, x + r + 2, cy + r + 2,
+                    outline=COLOR_ACCENT, width=2,
+                )
+
+
+def add_split_bar_row(parent, labels, segments, command):
+    """Caption naming every segment with its live percent, a SplitBar below.
+
+    ``labels`` and ``segments`` have equal length (2 or 3); the bar gets
+    ``len(labels) - 1`` thumbs at the cumulative segment edges. Returns the
+    bar; the caption updates itself.
+    """
+    surface = parent.cget("bg")
+    caption = tk.Frame(parent, bg=surface)
+    caption.pack(fill="x")
+    value_labels = []
+    for i, label in enumerate(labels):
+        # One cell per segment, value under its label in the segment's
+        # colour, spread across the width so the caption reads against the
+        # bar. Stacked, not side by side: three "label value" pairs in a
+        # row overrun the narrowest control pane and clip the card.
+        cell = tk.Frame(caption, bg=surface)
+        cell.pack(side="left", expand=True)
+        make_label(cell, label, color=COLOR_TEXT_SECONDARY).pack()
+        value = make_label(
+            cell, "", bold=True,
+            color=SplitBar.SEGMENT_COLORS[i % len(SplitBar.SEGMENT_COLORS)],
+        )
+        value.pack()
+        value_labels.append(value)
+
+    def refresh(parts):
+        for label, part in zip(value_labels, parts):
+            label.config(text=f"{int(part)}%")
+        command(parts)
+
+    edges = []
+    running = 0
+    for part in segments[:-1]:
+        running += int(part)
+        edges.append(running)
+    bar = SplitBar(parent, edges, command=refresh)
+    bar.pack(fill="x", pady=(0, ROW_GAP))
+    for label, part in zip(value_labels, segments):
+        label.config(text=f"{int(part)}%")
+    return bar
+
+
 def make_spinbox(parent, from_, to, value, width=3):
     """A dark-themed integer stepper on the card surface.
 
@@ -891,6 +1071,15 @@ def make_subsection_heading(parent, title, first=False):
 # ----------------------------------------------------------
 # 6 SIMULTANEOUS BUS ROUTES (waypoints/lanes keyed by node x from canvas.INT_X)
 # ----------------------------------------------------------
+# Headway slider ceiling: 300 s (5 min) covers an off-peak feeder service.
+# 0 is the OFF position, so the usable band is 1-300 s.
+MAX_HEADWAY_SEC = 300
+
+# Mean of the car desired-speed draw in main._draw_arrival, uniform(1.0, 1.4)
+# px/frame before the speed scale. Used only to show the operator what a
+# scale setting means in km/h.
+MEAN_CAR_BASE_SPEED_PX_PER_FRAME = 1.2
+
 bus_routes_config = {
     "R1_EB_A_NB": {
         "name": "EB \u2192 Node A (NB)",
@@ -922,8 +1111,8 @@ bus_routes_config = {
         "destination": "EB_CORRIDOR",
         "waypoints": {NODE_A_X: "STRAIGHT", NODE_B_X: "STRAIGHT"},
         "lanes": {NODE_A_X: 1, NODE_B_X: 1},
-        "active": False,
-        "headway_sec": 30,
+        "active": True,
+        "headway_sec": 90,
         "tsp_enabled": False,
         "dbl_enabled": False,
         "manual_dispatch": False
@@ -959,20 +1148,41 @@ bus_routes_config = {
         "waypoints": {NODE_B_X: "STRAIGHT", NODE_A_X: "STRAIGHT"},
         "lanes": {NODE_B_X: 1, NODE_A_X: 1},
         "active": False,
-        "headway_sec": 30,
+        "headway_sec": 90,
         "tsp_enabled": False,
         "dbl_enabled": False,
         "manual_dispatch": False
     }
 }
 
+# Turning movements per approach. ``turn_split`` is the straight share;
+# ``left_far_share`` is the share taking the approach's SECOND left option
+# (EB/WB: the left at the far node; A_SB/B_NB: a left at the first node and
+# another at the second); the remainder takes the first left option. A_NB
+# and B_SB meet one node and have no second option.
 approach_configs = {
-    "EB":   {"active": True,  "model": "Poisson", "rate": 12, "turn_split": 0.80, "heavy_ratio": 0.10},
-    "WB":   {"active": True,  "model": "Poisson", "rate": 12, "turn_split": 0.80, "heavy_ratio": 0.10},
-    "A_NB": {"active": True,  "model": "Poisson", "rate": 8,  "turn_split": 0.75, "heavy_ratio": 0.15},
-    "A_SB": {"active": True,  "model": "Poisson", "rate": 8,  "turn_split": 0.75, "heavy_ratio": 0.15},
-    "B_NB": {"active": True,  "model": "Poisson", "rate": 8,  "turn_split": 0.75, "heavy_ratio": 0.15},
-    "B_SB": {"active": True,  "model": "Poisson", "rate": 8,  "turn_split": 0.75, "heavy_ratio": 0.15},
+    "EB":   {"active": True,  "model": "Binomial", "rate": 34, "turn_split": 0.75, "left_far_share": 0.11, "heavy_ratio": 0.10},
+    "WB":   {"active": True,  "model": "Binomial", "rate": 32, "turn_split": 0.80, "left_far_share": 0.10, "heavy_ratio": 0.10},
+    "A_NB": {"active": True,  "model": "Poisson", "rate": 24,  "turn_split": 0.75, "left_far_share": 0.00, "heavy_ratio": 0.15},
+    "A_SB": {"active": True,  "model": "Poisson", "rate": 27,  "turn_split": 0.75, "left_far_share": 0.10, "heavy_ratio": 0.15},
+    "B_NB": {"active": True,  "model": "Poisson", "rate": 25,  "turn_split": 0.75, "left_far_share": 0.10, "heavy_ratio": 0.15},
+    "B_SB": {"active": True,  "model": "Poisson", "rate": 22,  "turn_split": 0.75, "left_far_share": 0.00, "heavy_ratio": 0.15},
+}
+
+# Per approach: the caption for each turning segment, and the nodes each
+# left option turns at, in travel order (first option, then second). One
+# entry means a single left option; the spawner and the turn bar both read
+# this so a new option never has to be wired twice.
+APPROACH_TURN_OPTIONS = {
+    "EB":   (("Left @A", (NODE_A_X,)), ("Left @B", (NODE_B_X,))),
+    "WB":   (("Left @B", (NODE_B_X,)), ("Left @A", (NODE_A_X,))),
+    # From the south at A a left heads west and leaves; from the south at B
+    # it heads west toward A, where it can turn left again to leave south of
+    # A. Mirrored from the north.
+    "A_NB": (("Left @A", (NODE_A_X,)),),
+    "B_NB": (("Left @B", (NODE_B_X,)), ("Left @B→A", (NODE_B_X, NODE_A_X))),
+    "B_SB": (("Left @B", (NODE_B_X,)),),
+    "A_SB": (("Left @A", (NODE_A_X,)), ("Left @A→B", (NODE_A_X, NODE_B_X))),
 }
 
 # Inflow demand per approach, vehicles per minute. 0 means no arrivals
@@ -1063,8 +1273,8 @@ def _effective_tick_seconds():
     """
     if global_config.get("test_running", False):
         batch_runtime = global_config.get("batch_runtime", DEFAULT_BATCH_RUNTIME)
-        return min(15, max(2, int(batch_runtime.get("tick_seconds", 5))))
-    return min(15, max(2, int(global_config["ai_runtime"].get("tick_seconds", 5))))
+        return min(TICK_SECONDS_MAX, max(TICK_SECONDS_MIN, int(batch_runtime.get("tick_seconds", DEFAULT_TICK_SECONDS))))
+    return min(TICK_SECONDS_MAX, max(TICK_SECONDS_MIN, int(global_config["ai_runtime"].get("tick_seconds", DEFAULT_TICK_SECONDS))))
 
 
 def write_ai_control(path=None):
@@ -1073,6 +1283,7 @@ def write_ai_control(path=None):
     payload = {
         "armed": bool(runtime.get("armed", False)),
         "model": str(runtime.get("model", "None")),
+        "control_mode": str(runtime.get("control_mode", CONTROL_MODE_ASSISTED)),
         "tick_seconds": _effective_tick_seconds(),
         "simulation_running": bool(global_config.get("is_running", False)),
     }
@@ -1109,29 +1320,121 @@ BASELINE_NO_MODEL = "BASELINE_NO_MODEL"
 # selector and written to the same ai_control.json field, because it produces
 # the same decision through the same path -- only the decider differs.
 RULE_BASED_MODEL = "rule-based"
+# Max-pressure TSP gate: grant when the bus approach's passenger pressure
+# beats the cross street's (rule_controller.max_pressure_decision).
+MAX_PRESSURE_MODEL = "passenger-pressure-tsp"
+# Every non-LLM decider: no inference latency, no sampling, no tokens.
+NON_LLM_MODELS = (RULE_BASED_MODEL, MAX_PRESSURE_MODEL)
+
+# Control strategy: the operator-facing family a decider belongs to. The
+# selector is two-level (strategy, then the concrete decider within it);
+# ai_runtime["model"] still carries the one backend-neutral model string.
+STRATEGY_BASELINE = "Baseline"
+STRATEGY_RULE = "Rule-Based"
+# The two LLM strategies are the two control modes: Assisted requests
+# TSP/DBL per route over Webster, Decided writes the timing plan and the
+# lane-2 flashers itself (ai_runtime["control_mode"] "configured").
+STRATEGY_LLM_ASSISTED = "AI/LLM Assisted"
+STRATEGY_LLM_DECIDED = "AI/LLM Decided"
+LLM_STRATEGIES = (STRATEGY_LLM_ASSISTED, STRATEGY_LLM_DECIDED)
+CONTROL_STRATEGIES = (
+    STRATEGY_BASELINE, STRATEGY_RULE, STRATEGY_LLM_ASSISTED, STRATEGY_LLM_DECIDED,
+)
+STRATEGY_HINTS = {
+    STRATEGY_BASELINE: "Webster timing only -- no TSP/DBL decisions",
+    STRATEGY_RULE: "Deterministic TSP/DBL rule, no model",
+    STRATEGY_LLM_ASSISTED: "LLM requests TSP/DBL per route; Webster keeps the timing",
+    STRATEGY_LLM_DECIDED: "LLM writes green lengths, cuts and lane-2 flashers; Webster only as fallback",
+}
+
+CONTROL_MODE_ASSISTED = "assisted"
+CONTROL_MODE_CONFIGURED = "configured"
+CONFIGURED_TICK_SECONDS = 10   # a plan is re-issued whole; give the model room
+# Decision interval bounds. The upper bound must admit one decision per
+# signal cycle (~50 s here) and a tick above the slowest model's p95 latency:
+# the agent skips-and-counts any grid point that comes due while a call is
+# still running, and main.py holds all-off once a decision is older than
+# 3 x tick, so a tick below the latency measures a disconnected loop.
+TICK_SECONDS_MIN = 2
+TICK_SECONDS_MAX = 120
+# Batch arm label for an LLM run in the Decided strategy: "<model> [decided]".
+CONFIGURED_ARM_SUFFIX = " [decided]"
+STRATEGY_CONTROL_MODE = {
+    STRATEGY_LLM_DECIDED: CONTROL_MODE_CONFIGURED,
+}
+
+
+def strategy_for(model, control_mode=CONTROL_MODE_ASSISTED):
+    """Which control strategy a model string runs under ``control_mode``."""
+    if model in ("None", BATCH_BASELINE_LABEL):
+        return STRATEGY_BASELINE
+    if model in (RULE_BASED_MODEL, MAX_PRESSURE_MODEL):
+        return STRATEGY_RULE
+    return STRATEGY_LLM_DECIDED if control_mode == CONTROL_MODE_CONFIGURED else STRATEGY_LLM_ASSISTED
+
+
+def strategy_of(label):
+    """Which control strategy a selector/batch label belongs to."""
+    return strategy_for(*split_arm_label(label))
+
+
+def is_llm_strategy(strategy):
+    return strategy in LLM_STRATEGIES
+
+
+def split_arm_label(label):
+    """(model, control_mode) from a selector/batch label."""
+    label = str(label or "None")
+    if label.endswith(CONFIGURED_ARM_SUFFIX):
+        return label[: -len(CONFIGURED_ARM_SUFFIX)], CONTROL_MODE_CONFIGURED
+    return label, CONTROL_MODE_ASSISTED
+
+
+def strategy_models(strategy):
+    """Concrete deciders selectable under one strategy, first = default.
+    Empty for AI/LLM when nothing is installed or keyed."""
+    if strategy == STRATEGY_BASELINE:
+        return ["None"]
+    if strategy == STRATEGY_RULE:
+        return [RULE_BASED_MODEL, MAX_PRESSURE_MODEL]
+    if not is_llm_strategy(strategy):
+        return []
+    return [
+        m for m in list(get_ollama_models()) + list(get_api_models())
+        if m != "None" and m not in NON_LLM_MODELS
+    ]
 
 
 def get_decision_sources():
-    """Local decision sources: the rule comparator plus installed Ollama tags.
+    """Local decision sources: the non-LLM comparators plus installed Ollama
+    tags.
 
-    The rule is not a model, but it is selected like one so that a rule run
-    and a model run differ in nothing except who decides.
+    None of them is a model, but they are selected like one so that a
+    comparator run and a model run differ in nothing except who decides.
     """
     models = list(get_ollama_models())
-    if RULE_BASED_MODEL in models:
-        return models
     insert_at = 1 if models and models[0] == "None" else 0
-    models.insert(insert_at, RULE_BASED_MODEL)
+    for name in reversed(NON_LLM_MODELS):
+        if name not in models:
+            models.insert(insert_at, name)
     return models
 
 
-def set_active_ai_model(model, other_selector=None, persist=True):
-    """Select exactly one local/API model and persist the shared model ID."""
-    selected_model = str(model or "None")
+def set_active_ai_model(model, other_selector=None, persist=True, control_mode=None):
+    """Select exactly one local/API model and persist the shared model ID.
+
+    ``control_mode`` (or a "[configured]" label suffix) selects AI Configured;
+    only an AI/LLM-Based decider can run it, everything else is assisted.
+    """
+    selected_model, label_mode = split_arm_label(model)
     if other_selector is not None:
         other_selector.set("None")
     runtime = global_config["ai_runtime"]
     runtime["model"] = selected_model
+    mode = control_mode or label_mode
+    if not is_llm_strategy(strategy_for(selected_model)):
+        mode = CONTROL_MODE_ASSISTED
+    runtime["control_mode"] = mode
     if runtime.get("armed", False):
         runtime["last_status"] = (
             BASELINE_NO_MODEL
@@ -1150,7 +1453,12 @@ def get_batch_model_choices():
     environment (get_api_models() already gates on that)."""
     local_choices = [model for model in get_decision_sources() if model != "None"]
     api_choices = [model for model in get_api_models() if model != "None"]
-    return [BATCH_BASELINE_LABEL] + local_choices + api_choices
+    choices = [BATCH_BASELINE_LABEL] + local_choices + api_choices
+    # Every LLM once more as an AI/LLM Decided arm, so one queue can mix them.
+    return choices + [
+        model + CONFIGURED_ARM_SUFFIX for model in choices
+        if is_llm_strategy(strategy_of(model))
+    ]
 
 
 def request_start_batch(models, seeds):
@@ -1184,8 +1492,19 @@ def request_start_batch(models, seeds):
 
 
 def request_stop_batch():
-    """STOP BATCH: finish the run in flight, then halt -- never mid-run."""
+    """STOP BATCH: pause the sweep in place -- the run in flight freezes and
+    no further run starts until RESUME; END discards the sweep."""
     global_config["batch_stop_requested"] = True
+
+
+def request_resume_batch():
+    global_config["batch_resume_requested"] = True
+
+
+def request_end_batch():
+    """END: abandon the run in flight and the queue, clear the batch state
+    and perform the same full reset as RESET (main.poll_batch_runner)."""
+    global_config["batch_end_requested"] = True
 
 
 def create_dashboard_window(parent=None):
@@ -1221,6 +1540,36 @@ def create_dashboard_window(parent=None):
     write_ai_control()
 
     panel_fit_after_id = None
+    recurring_after_ids = set()
+    panel_destroyed = False
+
+    def schedule_panel_callback(delay_ms, callback):
+        if panel_destroyed:
+            return None
+        holder = {}
+
+        def run_callback():
+            recurring_after_ids.discard(holder["id"])
+            if not panel_destroyed:
+                callback()
+
+        holder["id"] = root.after(delay_ms, run_callback)
+        recurring_after_ids.add(holder["id"])
+        return holder["id"]
+
+    def cancel_panel_callbacks(event=None):
+        nonlocal panel_destroyed, panel_fit_after_id
+        if event is not None and event.widget is not root:
+            return
+        panel_destroyed = True
+        if panel_fit_after_id is not None:
+            root.after_cancel(panel_fit_after_id)
+            panel_fit_after_id = None
+        for after_id in tuple(recurring_after_ids):
+            root.after_cancel(after_id)
+        recurring_after_ids.clear()
+
+    root.bind("<Destroy>", cancel_panel_callbacks, add="+")
 
     def fit_panel_to_visible_content():
         """Resize only the height after a disclosure section changes state.
@@ -1253,6 +1602,7 @@ def create_dashboard_window(parent=None):
 
     def on_close():
         global_config["is_running"] = False
+        cancel_panel_callbacks()
         try:
             root.destroy()
         except Exception:
@@ -1263,7 +1613,8 @@ def create_dashboard_window(parent=None):
         root.protocol("WM_DELETE_WINDOW", on_close)
 
     style = ttk.Style()
-    style.theme_use('clam')
+    if style.theme_use() != 'clam':
+        style.theme_use('clam')
 
     style.configure(
         "Modern.TCombobox",
@@ -1285,6 +1636,19 @@ def create_dashboard_window(parent=None):
         darkcolor=[("focus", COLOR_ACCENT)],
     )
     root.option_add("*TCombobox*Listbox.font", FONT_BODY)
+
+    # clam's default scrollbar is grey on the dark card: give the model
+    # picker one with a visible trough and thumb.
+    style.configure(
+        "Modern.Vertical.TScrollbar",
+        troughcolor=COLOR_CARD_ALT, background=COLOR_CARD_BORDER,
+        bordercolor=COLOR_CARD_ALT, arrowcolor=COLOR_TEXT_SECONDARY,
+        lightcolor=COLOR_CARD_BORDER, darkcolor=COLOR_CARD_BORDER, width=12,
+    )
+    style.map(
+        "Modern.Vertical.TScrollbar",
+        background=[("active", COLOR_TEXT_SECONDARY), ("pressed", COLOR_ACCENT)],
+    )
 
     # One slider look for the whole panel; a focused slider swaps its bevel
     # to amber so the operator can see which control the arrow keys drive.
@@ -1339,9 +1703,9 @@ def create_dashboard_window(parent=None):
         )
         if window_shape_btn.cget("text") != label:
             window_shape_btn.config(text=label)
-        root.after(250, refresh_window_shape_button)
+        schedule_panel_callback(250, refresh_window_shape_button)
 
-    root.after(250, refresh_window_shape_button)
+    schedule_panel_callback(250, refresh_window_shape_button)
 
     # Status sits under the title: beside it, the title alone fills a
     # portrait-width pane and the status text gets clipped.
@@ -1369,8 +1733,8 @@ def create_dashboard_window(parent=None):
     approaches_body = approaches_section["body"]
 
     # One item card per approach. Row 1 = name + ON/OFF chip, row 2 = the
-    # generation model + inflow stepper, row 3 = straight % and trucks % as
-    # two thin sliders side by side. Same approach_configs keys as before.
+    # generation model + inflow stepper, row 3 = the turning-movement split
+    # bar, row 4 = trucks %.
     for key, name in APPROACH_NAMES.items():
         inner = make_item_card(approaches_body)
 
@@ -1439,30 +1803,27 @@ def create_dashboard_window(parent=None):
 
         bind_spinbox_changes(rate_box, make_rate_change(key, rate_box))
 
-        # Row 3: the two percentage controls side by side, each a caption
-        # (label + live value) over a thin slider.
-        pct_row = tk.Frame(inner, bg=COLOR_CARD_ALT)
-        pct_row.pack(fill="x")
-        pct_row.grid_columnconfigure(0, weight=1, uniform="approach_pct")
-        pct_row.grid_columnconfigure(1, weight=1, uniform="approach_pct")
-        split_col = tk.Frame(pct_row, bg=COLOR_CARD_ALT)
-        split_col.grid(row=0, column=0, sticky="ew", padx=(0, SPACE_XS))
-        heavy_col = tk.Frame(pct_row, bg=COLOR_CARD_ALT)
-        heavy_col.grid(row=0, column=1, sticky="ew", padx=(SPACE_XS, 0))
+        # Row 3: turning movements as one 100 % bar -- Straight | first left
+        # option | second left option (where the approach has one) -- with a
+        # thumb at each boundary. Row 4: trucks %.
+        options = APPROACH_TURN_OPTIONS[key]
+        cfg = approach_configs[key]
+        straight = int(round(cfg["turn_split"] * 100))
+        far = int(round(cfg.get("left_far_share", 0.0) * 100)) if len(options) > 1 else 0
+        segments = [straight, 100 - straight - far] + ([far] if len(options) > 1 else [])
 
-        def make_split_slider(k, lbl):
-            def update(val):
-                v_f = float(val) / 100.0
-                approach_configs[k]["turn_split"] = v_f
-                lbl.config(text=f"{int(v_f*100)}%")
+        def make_split_change(k):
+            def update(parts):
+                approach_configs[k]["turn_split"] = parts[0] / 100.0
+                approach_configs[k]["left_far_share"] = (
+                    parts[2] / 100.0 if len(parts) > 2 else 0.0
+                )
             return update
 
-        split_val, split_slider = add_slider_row(
-            split_col, "Straight", f"{int(approach_configs[key]['turn_split']*100)}%",
-            0, 100, int(approach_configs[key]["turn_split"] * 100), None, step=1,
-            style="Thin.Horizontal.TScale", pady=0,
+        add_split_bar_row(
+            inner, ["Straight", *(label for label, _nodes in options)], segments,
+            make_split_change(key),
         )
-        split_slider.config(command=make_split_slider(key, split_val))
 
         def make_heavy_slider(k, lbl):
             def update(val):
@@ -1472,7 +1833,7 @@ def create_dashboard_window(parent=None):
             return update
 
         heavy_val, heavy_slider = add_slider_row(
-            heavy_col, "Trucks", f"{int(approach_configs[key]['heavy_ratio']*100)}%",
+            inner, "Trucks", f"{int(approach_configs[key]['heavy_ratio']*100)}%",
             0, 50, int(approach_configs[key]["heavy_ratio"] * 100), None, step=1,
             style="Thin.Horizontal.TScale", pady=0,
         )
@@ -1545,7 +1906,7 @@ def create_dashboard_window(parent=None):
             return update
 
         hw_val_lbl, hw_slider = add_slider_row(
-            inner, "Headway", f"{r_cfg['headway_sec']}s", 0, 90,
+            inner, "Headway", f"{r_cfg['headway_sec']}s", 0, MAX_HEADWAY_SEC,
             r_cfg["headway_sec"], None, step=1, style="Modern.Horizontal.TScale",
         )
         hw_slider.config(command=make_hw_slider(r_id, hw_val_lbl))
@@ -1595,56 +1956,78 @@ def create_dashboard_window(parent=None):
         on_toggle=schedule_panel_fit,
     )
     ai_body = single_run_section["body"]
-    make_subsection_heading(ai_body, "AI / LLM", first=True)
+    make_subsection_heading(ai_body, "Control Strategy", first=True)
 
-    available_models = get_decision_sources()
-    available_api_models = get_api_models()
     selected_model = str(global_config["ai_runtime"].get("model", "None"))
-    if selected_model in available_api_models and selected_model != "None":
-        selected_local_model = "None"
-        selected_api_model = selected_model
-    elif selected_model in available_models:
-        selected_local_model = selected_model
-        selected_api_model = "None"
-    else:
+    selected_strategy = strategy_for(
+        selected_model, global_config["ai_runtime"].get("control_mode", CONTROL_MODE_ASSISTED)
+    )
+    if selected_model not in strategy_models(selected_strategy):
         selected_model = "None"
-        selected_local_model = "None"
-        selected_api_model = "None"
+        selected_strategy = STRATEGY_BASELINE
         global_config["ai_runtime"]["model"] = selected_model
 
-    local_row = add_labeled_row(ai_body, "Local model")
-    llm_engine_box = ttk.Combobox(
-        local_row, values=available_models, state="readonly",
+    # Level 1: the strategy family. Level 2: the decider within it, greyed
+    # out when the family has only one (Baseline, ML) so the row still
+    # tells the operator what will run.
+    strategy_row = add_labeled_row(ai_body, "Strategy", pady=(0, SPACE_XS))
+    strategy_box = ttk.Combobox(
+        strategy_row, values=list(CONTROL_STRATEGIES), state="readonly",
         style="Modern.TCombobox", font=FONT_BODY,
+        # width=1: fill="x" sizes it; the 20-char default overruns the pane.
+        width=1,
     )
-    llm_engine_box.set(selected_local_model)
-    llm_engine_box.pack(side="left", fill="x", expand=True)
+    strategy_box.set(selected_strategy)
+    strategy_box.pack(side="left", fill="x", expand=True)
 
-    def on_llm_engine_selected(event):
-        selected_model_name = set_active_ai_model(
-            llm_engine_box.get(), api_engine_box, persist=False
+    strategy_hint_lbl = make_label(
+        ai_body, STRATEGY_HINTS[selected_strategy], color=COLOR_TEXT_SECONDARY,
+        wraplength=PORTRAIT_WRAP_LENGTH, justify="left", anchor="w",
+    )
+    strategy_hint_lbl.pack(fill="x", pady=(0, ROW_GAP))
+
+    decider_row = add_labeled_row(ai_body, "Decider")
+    decider_box = ttk.Combobox(
+        decider_row, state="readonly", style="Modern.TCombobox", font=FONT_BODY,
+        width=1,
+    )
+    decider_box.pack(side="left", fill="x", expand=True)
+
+    def show_decider_choices(strategy, model):
+        choices = strategy_models(strategy)
+        decider_box.config(
+            values=choices or ["(none installed)"],
+            state="readonly" if len(choices) > 1 else "disabled",
         )
-        selected_val_lbl.config(text=selected_model_name)
+        decider_box.set(
+            model if model in choices else (choices[0] if choices else "(none installed)")
+        )
+        strategy_hint_lbl.config(text=STRATEGY_HINTS[strategy])
+
+    show_decider_choices(selected_strategy, selected_model)
+
+    def on_strategy_selected(event):
+        strategy = strategy_box.get()
+        choices = strategy_models(strategy)
+        model = choices[0] if choices else "None"
+        show_decider_choices(strategy, model)
+        mode = STRATEGY_CONTROL_MODE.get(strategy, CONTROL_MODE_ASSISTED)
+        selected_val_lbl.config(text=set_active_ai_model(model, persist=False, control_mode=mode))
+        runtime = global_config["ai_runtime"]
+        if mode == CONTROL_MODE_CONFIGURED and int(runtime.get("tick_seconds", DEFAULT_TICK_SECONDS)) < CONFIGURED_TICK_SECONDS:
+            tick_slider.set(CONFIGURED_TICK_SECONDS)
         write_ai_control()
 
-    llm_engine_box.bind("<<ComboboxSelected>>", on_llm_engine_selected)
+    strategy_box.bind("<<ComboboxSelected>>", on_strategy_selected)
 
-    api_row = add_labeled_row(ai_body, "API model")
-    api_engine_box = ttk.Combobox(
-        api_row, values=available_api_models, state="readonly",
-        style="Modern.TCombobox", font=FONT_BODY,
-    )
-    api_engine_box.set(selected_api_model)
-    api_engine_box.pack(side="left", fill="x", expand=True)
-
-    def on_api_engine_selected(event):
-        selected_model_name = set_active_ai_model(
-            api_engine_box.get(), llm_engine_box, persist=False
-        )
-        selected_val_lbl.config(text=selected_model_name)
+    def on_decider_selected(event):
+        selected_val_lbl.config(text=set_active_ai_model(
+            decider_box.get(), persist=False,
+            control_mode=STRATEGY_CONTROL_MODE.get(strategy_box.get(), CONTROL_MODE_ASSISTED),
+        ))
         write_ai_control()
 
-    api_engine_box.bind("<<ComboboxSelected>>", on_api_engine_selected)
+    decider_box.bind("<<ComboboxSelected>>", on_decider_selected)
 
     def on_run_llm():
         runtime = global_config["ai_runtime"]
@@ -1664,7 +2047,7 @@ def create_dashboard_window(parent=None):
     tick_runtime = global_config["ai_runtime"]
 
     def on_tick_seconds_changed(value):
-        tick_seconds = min(15, max(2, int(float(value))))
+        tick_seconds = min(TICK_SECONDS_MAX, max(TICK_SECONDS_MIN, int(float(value))))
         global_config["ai_runtime"]["tick_seconds"] = tick_seconds
         tick_value_lbl.config(text=f"{tick_seconds}s")
         write_ai_control()
@@ -1672,13 +2055,14 @@ def create_dashboard_window(parent=None):
     tick_value_lbl, tick_slider = add_slider_row(
         ai_body, "Decision interval",
         f"{int(tick_runtime.get('tick_seconds', 5))}s",
-        2, 15, tick_runtime.get("tick_seconds", 5), on_tick_seconds_changed,
+        TICK_SECONDS_MIN, TICK_SECONDS_MAX, tick_runtime.get("tick_seconds", DEFAULT_TICK_SECONDS),
+        on_tick_seconds_changed,
         step=1, style="Global.Horizontal.TScale",
     )
 
     # Arm button, then the live status on its own line under it: a status
     # such as "LLM WAITING_FOR_DECISION | TURN 3" needs the full column.
-    run_llm_btn = make_button(ai_body, f"{SYM_PLAY}  Run LLM", "warning", on_run_llm)
+    run_llm_btn = make_button(ai_body, f"{SYM_PLAY}  Arm strategy", "warning", on_run_llm)
     run_llm_btn.pack(fill="x", pady=(SPACE_XS, ROW_GAP))
 
     ai_row_status = tk.Frame(ai_body, bg=COLOR_CARD)
@@ -1686,7 +2070,7 @@ def create_dashboard_window(parent=None):
     llm_dot = make_label(ai_row_status, SYM_DOT, color=COLOR_TEXT_SECONDARY)
     llm_dot.pack(side="left", padx=(0, SPACE_XS))
     llm_status_text = make_label(
-        ai_row_status, "LLM INACTIVE", bold=True, color=COLOR_TEXT_SECONDARY,
+        ai_row_status, "STRATEGY INACTIVE", bold=True, color=COLOR_TEXT_SECONDARY,
         wraplength=PORTRAIT_WRAP_LENGTH - SPACE_LG,
     )
     llm_status_text.pack(side="left", fill="x", expand=True)
@@ -1713,12 +2097,12 @@ def create_dashboard_window(parent=None):
         turn = int(runtime.get("last_turn", 0))
         if not armed:
             color = COLOR_TEXT_SECONDARY
-            status_text_value = "LLM INACTIVE"
-            button_text = f"{SYM_PLAY}  Run LLM"
+            status_text_value = "STRATEGY INACTIVE"
+            button_text = f"{SYM_PLAY}  Arm strategy"
         elif status == BASELINE_NO_MODEL:
             color = COLOR_ACCENT
-            status_text_value = "No LLM active - running on baseline"
-            button_text = f"{SYM_STOP}  Disarm LLM"
+            status_text_value = "Baseline - no decisions"
+            button_text = f"{SYM_STOP}  Disarm strategy"
         else:
             color = {
                 "OK": COLOR_SUCCESS,
@@ -1726,22 +2110,25 @@ def create_dashboard_window(parent=None):
                 "INVALID_DECISION": COLOR_DANGER,
                 "CONTROL_WRITE_ERROR": COLOR_DANGER,
             }.get(status, COLOR_WARNING)
-            status_text_value = f"LLM {status}"
+            family = strategy_for(
+                runtime.get("model"), runtime.get("control_mode", CONTROL_MODE_ASSISTED)
+            ).upper()
+            status_text_value = f"{family} {status}"
             if turn:
                 status_text_value += f" | TURN {turn}"
-            button_text = f"{SYM_STOP}  Disarm LLM"
+            button_text = f"{SYM_STOP}  Disarm strategy"
         llm_dot.config(fg=color)
         llm_status_text.config(text=status_text_value, fg=color)
         run_llm_btn.config(text=button_text)
-        root.after(250, refresh_llm_status)
+        schedule_panel_callback(250, refresh_llm_status)
 
-    root.after(250, refresh_llm_status)
+    schedule_panel_callback(250, refresh_llm_status)
 
     def refresh_route_buttons():
         repaint_route_flag_buttons()
-        root.after(250, refresh_route_buttons)
+        schedule_panel_callback(250, refresh_route_buttons)
 
-    root.after(250, refresh_route_buttons)
+    schedule_panel_callback(250, refresh_route_buttons)
 
     # Run lifecycle, speed, seed, and Webster output belong to this same
     # single-run workflow. Keep their existing callbacks and state owners.
@@ -1911,7 +2298,7 @@ def create_dashboard_window(parent=None):
     )
 
     def on_batch_tick_seconds_changed(value):
-        tick_seconds = min(15, max(2, int(float(value))))
+        tick_seconds = min(TICK_SECONDS_MAX, max(TICK_SECONDS_MIN, int(float(value))))
         global_config.setdefault(
             "batch_runtime", dict(DEFAULT_BATCH_RUNTIME)
         )["tick_seconds"] = tick_seconds
@@ -1920,7 +2307,7 @@ def create_dashboard_window(parent=None):
     batch_tick_value_lbl, batch_tick_slider = add_slider_row(
         test_body, "Decision interval",
         f"{int(batch_runtime_config.get('tick_seconds', 5))}s",
-        2, 15, batch_runtime_config.get("tick_seconds", 5),
+        TICK_SECONDS_MIN, TICK_SECONDS_MAX, batch_runtime_config.get("tick_seconds", DEFAULT_TICK_SECONDS),
         on_batch_tick_seconds_changed,
         step=1, style="Global.Horizontal.TScale",
     )
@@ -1943,9 +2330,9 @@ def create_dashboard_window(parent=None):
             countdown_lbl.config(text="00:00", fg=COLOR_ACCENT)
         else:
             countdown_lbl.config(text="--:--", fg=COLOR_TEXT_SECONDARY)
-        root.after(200, refresh_test_countdown)
+        schedule_panel_callback(200, refresh_test_countdown)
 
-    root.after(200, refresh_test_countdown)
+    schedule_panel_callback(200, refresh_test_countdown)
 
     def on_test_duration_selected(_event=None):
         global_config["test_duration_sim_seconds"] = TEST_DURATIONS.get(
@@ -1955,16 +2342,10 @@ def create_dashboard_window(parent=None):
 
     test_duration_box.bind("<<ComboboxSelected>>", on_test_duration_selected)
 
-    def start_test():
-        if request_start_test() is None:
-            status_text.config(text="Select duration first", fg=COLOR_WARNING)
-            return
-        # A test starts through the same START path, so it calibrates too.
-        paint_calibrating()
-        write_ai_control()
-
-    start_test_btn = make_button(test_body, "Start test", "warning", start_test)
-    start_test_btn.pack(fill="x", pady=(SPACE_XS, 0))
+    # No separate "Start test" button: a single timed run is a batch of one
+    # model x one seed, and going through the batch means it gets the same
+    # export, summary row and pairing as every other arm. The batch still
+    # chains request_start_test() for each run.
 
     # --- Batch Benchmark Runner -------------------------------------------
     # Chains request_start_test() across every (model x seed) combination at
@@ -2009,7 +2390,7 @@ def create_dashboard_window(parent=None):
         # providers; the operator must never need to resize this dialog just
         # to reach the last model or the Done button.
         picker_width = 340
-        list_height = min(320, max(140, len(choices) * 30))
+        list_height = min(320, max(140, len(choices) * 30 + 24 * len(CONTROL_STRATEGIES)))
         picker.geometry(f"{picker_width}x{list_height + 72}")
 
         list_frame = tk.Frame(picker, bg=COLOR_CARD)
@@ -2018,7 +2399,8 @@ def create_dashboard_window(parent=None):
             list_frame, bg=COLOR_CARD, highlightthickness=0, bd=0,
         )
         model_scrollbar = ttk.Scrollbar(
-            list_frame, orient="vertical", command=model_canvas.yview
+            list_frame, orient="vertical", command=model_canvas.yview,
+            style="Modern.Vertical.TScrollbar",
         )
         model_canvas.configure(yscrollcommand=model_scrollbar.set)
         model_canvas.pack(side="left", fill="both", expand=True)
@@ -2045,17 +2427,33 @@ def create_dashboard_window(parent=None):
         choices_frame.bind("<MouseWheel>", scroll_models)
 
         vars_by_model = {}
-        for choice in choices:
+
+        def add_choice(choice):
             var = tk.BooleanVar(value=choice in batch_selected_models)
             vars_by_model[choice] = var
+            # The strategy heading above already says "AI/LLM DECIDED" --
+            # repeating "[decided]" on every row under it is just noise.
+            display_text = split_arm_label(choice)[0]
             checkbox = tk.Checkbutton(
-                choices_frame, text=choice, variable=var, anchor="w",
+                choices_frame, text=display_text, variable=var, anchor="w",
                 bg=COLOR_CARD, fg=COLOR_TEXT_PRIMARY, selectcolor=COLOR_CARD_ALT,
                 activebackground=COLOR_CARD, activeforeground=COLOR_TEXT_PRIMARY,
                 font=FONT_BODY, highlightthickness=0,
             )
-            checkbox.pack(fill="x", anchor="w", pady=2)
+            checkbox.pack(fill="x", anchor="w", padx=(SPACE_SM, 0), pady=2)
             checkbox.bind("<MouseWheel>", scroll_models)
+
+        # Same hierarchy as the Single Run card: one heading per strategy.
+        for strategy in CONTROL_STRATEGIES:
+            group = [c for c in choices if strategy_of(c) == strategy]
+            if not group:
+                continue
+            make_label(
+                choices_frame, strategy.upper(), bold=True,
+                color=COLOR_TEXT_SECONDARY, anchor="w",
+            ).pack(fill="x", pady=(SPACE_SM, 2))
+            for choice in group:
+                add_choice(choice)
 
         def apply_and_close():
             batch_selected_models[:] = [
@@ -2136,18 +2534,32 @@ def create_dashboard_window(parent=None):
         request_start_batch(list(batch_selected_models), seeds)
         refresh_batch_preview()
 
-    def on_stop_batch():
-        request_stop_batch()
-
     run_batch_btn = make_button(
         batch_buttons_row, "Run batch", "warning", on_run_batch
     )
     run_batch_btn.pack(side="left", fill="x", expand=True, padx=(0, SPACE_XS))
 
-    stop_batch_btn = make_button(
-        batch_buttons_row, "Stop batch", "danger", on_stop_batch
-    )
-    stop_batch_btn.pack(side="left", fill="x", expand=True)
+    # The stop slot: one "Stop batch" button while the sweep runs; once
+    # stopped it splits down the middle into Resume | End.
+    stop_slot = tk.Frame(batch_buttons_row, bg=COLOR_CARD)
+    stop_slot.pack(side="left", fill="x", expand=True)
+    stop_batch_btn = make_button(stop_slot, "Stop batch", "danger", request_stop_batch)
+    stop_batch_btn.pack(fill="x")
+    split_row = tk.Frame(stop_slot, bg=COLOR_CARD)
+    split_row.grid_columnconfigure(0, weight=1, uniform="stop_split")
+    split_row.grid_columnconfigure(1, weight=1, uniform="stop_split")
+    resume_batch_btn = make_button(split_row, "Resume", "success", request_resume_batch)
+    resume_batch_btn.grid(row=0, column=0, sticky="ew", padx=(0, 1))
+    end_batch_btn = make_button(split_row, "End", "danger", request_end_batch)
+    end_batch_btn.grid(row=0, column=1, sticky="ew", padx=(1, 0))
+
+    def show_stop_slot(paused):
+        if paused and not split_row.winfo_manager():
+            stop_batch_btn.pack_forget()
+            split_row.pack(fill="x")
+        elif not paused and split_row.winfo_manager():
+            split_row.pack_forget()
+            stop_batch_btn.pack(fill="x")
 
     # tk.Button's own "disabled" state leaves the filled warning/danger
     # background in place and only swaps the text colour, which reads as
@@ -2188,10 +2600,12 @@ def create_dashboard_window(parent=None):
     def refresh_batch_status():
         runtime = global_config.get("batch_runtime", DEFAULT_BATCH_RUNTIME)
         active = bool(runtime.get("active", False))
+        paused = active and bool(runtime.get("paused", False))
         current = runtime.get("current")
         total = int(runtime.get("total", 0))
         results = runtime.get("results", [])
 
+        show_stop_slot(paused)
         set_batch_button_enabled(stop_batch_btn, active, COLOR_DANGER, COLOR_TEXT_PRIMARY)
         set_batch_button_enabled(
             run_batch_btn, (not active) and batch_can_run(), COLOR_WARNING, COLOR_BG
@@ -2201,7 +2615,7 @@ def create_dashboard_window(parent=None):
             batch_progress_lbl.config(
                 text=(
                     f"Run {len(results) + 1}/{total}: {current.get('model')} "
-                    f"seed {current.get('seed')} — running…"
+                    f"seed {current.get('seed')} — {'stopped' if paused else 'running…'}"
                 ),
                 fg=COLOR_WARNING,
             )
@@ -2232,9 +2646,9 @@ def create_dashboard_window(parent=None):
             batch_log_text.insert("end", line + "\n")
         batch_log_text.config(state="disabled")
 
-        root.after(300, refresh_batch_status)
+        schedule_panel_callback(300, refresh_batch_status)
 
-    root.after(300, refresh_batch_status)
+    schedule_panel_callback(300, refresh_batch_status)
     refresh_batch_preview()
 
     def refresh_simulation_status():
@@ -2319,9 +2733,9 @@ def create_dashboard_window(parent=None):
                     text="Idle — press START", fg=COLOR_TEXT_SECONDARY
                 )
         refresh_seed_state_label()
-        root.after(100, refresh_simulation_status)
+        schedule_panel_callback(100, refresh_simulation_status)
 
-    root.after(100, refresh_simulation_status)
+    schedule_panel_callback(100, refresh_simulation_status)
 
     # 5. MOTION / PRIORITY TUNING -----------------------------------------
     tuning_section = make_section(
@@ -2330,27 +2744,65 @@ def create_dashboard_window(parent=None):
     )
     tuning_body = tuning_section["body"]
 
+    # Both knobs are stored in sim units (px, a speed multiplier) but an
+    # operator reasons in metres and km/h, so each shows the physical value
+    # as its readout and keeps the sim unit in a caption underneath. The
+    # conversion is real_world_units' single anchor, not a second constant.
     def update_priority_eligibility(value):
         pixels = set_priority_eligibility_px(value)
-        eligibility_value.config(text=f"{pixels} px")
+        eligibility_value.config(text=f"{units.px_to_m(pixels):.0f} m")
+        eligibility_note.config(
+            text=f"{pixels} px  ({units.meters_per_pixel():.2f} m/px)"
+        )
 
     eligibility_value, eligibility_slider = add_slider_row(
         tuning_body, "Eligibility zone",
-        f"{global_config['priority_eligibility_px']} px",
+        f"{units.px_to_m(global_config['priority_eligibility_px']):.0f} m",
         250, 400, global_config["priority_eligibility_px"],
         update_priority_eligibility, step=10, style="Global.Horizontal.TScale",
+        pady=(0, 0),
     )
+    eligibility_note = make_label(
+        tuning_body,
+        f"{global_config['priority_eligibility_px']} px  "
+        f"({units.meters_per_pixel():.2f} m/px)",
+        color=COLOR_TEXT_SECONDARY,
+    )
+    eligibility_note.pack(fill="x", pady=(0, ROW_GAP))
+
+    def speed_readout(scale):
+        """Mean car free-flow speed at this scale, and the px/frame it is.
+
+        A car's desired speed is drawn uniform(1.0, 1.4) px/frame and
+        multiplied by the scale (see main._draw_arrival), so the mean is
+        1.2x -- the figure the calibration pins (0.5 -> ~32 km/h).
+        """
+        px_per_frame = MEAN_CAR_BASE_SPEED_PX_PER_FRAME * scale
+        return (
+            f"{units.px_per_frame_to_kmh(px_per_frame):.0f} km/h",
+            f"{scale:.2f}x = {px_per_frame:.2f} px/frame "
+            f"= {units.px_per_frame_to_kmh(px_per_frame) / 3.6:.1f} m/s",
+        )
 
     def update_vehicle_scale(value):
         scale = set_vehicle_speed_scale(value)
-        vehicle_scale_value.config(text=f"{scale:.2f}x")
+        readout, note = speed_readout(scale)
+        vehicle_scale_value.config(text=readout)
+        vehicle_scale_note.config(text=note)
 
+    _initial_readout, _initial_note = speed_readout(
+        global_config["vehicle_speed_scale"]
+    )
     vehicle_scale_value, vehicle_scale_slider = add_slider_row(
-        tuning_body, "Vehicle speed",
-        f"{global_config['vehicle_speed_scale']:.2f}x",
+        tuning_body, "Vehicle speed", _initial_readout,
         0.25, 1.0, global_config["vehicle_speed_scale"],
         update_vehicle_scale, step=0.05, style="Global.Horizontal.TScale",
+        pady=(0, 0),
     )
+    vehicle_scale_note = make_label(
+        tuning_body, _initial_note, color=COLOR_TEXT_SECONDARY
+    )
+    vehicle_scale_note.pack(fill="x", pady=(0, ROW_GAP))
 
     make_label(
         tuning_body, "Applies on next START / RESET", color=COLOR_TEXT_SECONDARY,
@@ -2467,9 +2919,9 @@ def create_dashboard_window(parent=None):
         discharge_recommendation_lbl.config(
             text=f"Recommended first action: {recommendation}"
         )
-        root.after(250, refresh_discharge_status)
+        schedule_panel_callback(250, refresh_discharge_status)
 
-    root.after(250, refresh_discharge_status)
+    schedule_panel_callback(250, refresh_discharge_status)
 
     # Collapsed sections keep every widget alive with its value and callback;
     # only the body frames are unmapped.

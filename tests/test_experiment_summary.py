@@ -44,7 +44,7 @@ def isolate_experiment_paths(tmp_path, monkeypatch):
 
 
 def read_summary_rows():
-    path = main.EXPERIMENT_SUMMARY_PATH
+    path = main.experiment_summary_path()
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8", newline="") as handle:
@@ -172,6 +172,34 @@ def test_perform_full_reset_schedules_checkpoints_only_for_a_timed_test(monkeypa
     assert main.pending_checkpoints_sec == []
 
 
+def test_perform_full_reset_snapshots_inputs_and_drops_the_old_decision(monkeypatch, tmp_path):
+    """The run's verifiable setup is the start snapshot (the end-of-run inputs
+    table shows the decider's terminal flags), and the previous arm's
+    decision.json must not open the run as FOREIGN_DECISION."""
+    class FakeSignals:
+        def reset_all_state(self):
+            pass
+
+    monkeypatch.setattr(main, "calibrate_and_apply_webster", lambda signals: None)
+    monkeypatch.setattr(main, "reset_traffic_generation", lambda: None)
+    stale = tmp_path / "decision.json"
+    stale.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main, "DECISION_PATH", stale)
+    control_panel.global_config["ai_runtime"]["last_status"] = "OK"
+    control_panel.global_config["test_running"] = True
+    control_panel.global_config["random_seed"] = 4242
+    main.perform_full_reset([], FakeSignals())
+    assert not stale.exists()
+    assert control_panel.global_config["ai_runtime"]["last_status"] is None
+    rows = control_panel.global_config["_initial_input_rows"]
+    assert ["Global", "random_seed", 4242] in rows
+    assert all(
+        row[2] is False for row in rows
+        if row[0].startswith("Route: ") and row[1] in ("tsp_enabled", "dbl_enabled")
+    )
+    control_panel.global_config["test_running"] = False
+
+
 def test_checkpoint_filenames_unique():
     names = {
         mark: main.build_test_export_filename(
@@ -181,16 +209,47 @@ def test_checkpoint_filenames_unique():
         for mark in (300, 600, 900, 1800)
     }
     assert len(set(names.values())) == 4
-    assert names[300] == "nemotron_5min_42seed_13092026_120000.xlsx"
-    assert names[600] == "nemotron_10min_42seed_13092026_120000.xlsx"
-    assert names[900] == "nemotron_15min_42seed_13092026_120000.xlsx"
-    assert names[1800] == "nemotron_30min_42seed_13092026_120000.xlsx"
+    # "nemotron" is an LLM arm, so it carries its control mode.
+    assert names[300] == "nemotron-assisted_5min_42seed_13092026_120000.xlsx"
+    assert names[600] == "nemotron-assisted_10min_42seed_13092026_120000.xlsx"
+    assert names[900] == "nemotron-assisted_15min_42seed_13092026_120000.xlsx"
+    assert names[1800] == "nemotron-assisted_30min_42seed_13092026_120000.xlsx"
 
     # An unqualified call (the final-mark path) uses its own duration.
     default_tagged = main.build_test_export_filename(
         "nemotron", 1800, 42, timestamp="20260913_120000"
     )
     assert default_tagged == names[1800]
+
+
+def test_filename_separates_the_two_llm_control_modes():
+    """The same model in the two modes must not collide.
+
+    Before this, an assisted and a configured run of one model differed in
+    nothing but their timestamp (results/orca-mini-7b_10min_234seed_*.xlsx,
+    2026-09-22). The word matches the run's `control_mode` summary column.
+    """
+    def name(model, mode):
+        return main.build_test_export_filename(
+            model, 900, 42, timestamp="20260913_120000", control_mode=mode,
+        )
+
+    assert name("orca-mini:7b", "assisted") == (
+        "orca-mini-7b-assisted_15min_42seed_13092026_120000.xlsx"
+    )
+    assert name("orca-mini:7b", "configured") == (
+        "orca-mini-7b-configured_15min_42seed_13092026_120000.xlsx"
+    )
+
+    # Baseline and the rule comparators cannot run configured, so they name
+    # themselves and keep exactly the filenames they always had.
+    assert name("None", "assisted") == "baseline_15min_42seed_13092026_120000.xlsx"
+    assert name(control_panel.RULE_BASED_MODEL, "assisted") == (
+        "rule-based_15min_42seed_13092026_120000.xlsx"
+    )
+    assert name(control_panel.MAX_PRESSURE_MODEL, "assisted") == (
+        "passenger-pressure-tsp_15min_42seed_13092026_120000.xlsx"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -234,6 +293,9 @@ def test_delay_split_by_mode():
         "stopped_vehicle_frames": 900,
         "bus_passenger_delay_frames": 45 * 600,   # bus stopped 600 frames = 10s
         "car_passenger_delay_frames": 4 * 300,    # car stopped 300 frames = 5s
+        "completed_stopped_vehicle_frames": 900,
+        "completed_bus_passenger_delay_frames": 45 * 600,
+        "completed_car_passenger_delay_frames": 4 * 300,
     }
 
     payload = exporter.build_payload(controller, [], 60, throughput_state=throughput)
@@ -251,6 +313,75 @@ def test_delay_split_by_mode():
     assert payload["network_throughput"]["mean_stopped_delay_sec_per_vehicle"] == (
         pytest.approx(900 / 60.0 / 2, abs=0.01)
     )
+
+
+def test_means_divide_the_completed_cohort_only():
+    """A vehicle still queued at the checkpoint is in the cumulative totals
+    (network exposure) but not in any per-vehicle or per-passenger mean:
+    the means read the completed_* counters _record_completed_vehicle_delay
+    fills, so the audit's early-checkpoint inflation cannot happen."""
+    done = Vehicle(0, H_Y - 0.5 * LANE, "EB")
+    stuck = Vehicle(100, H_Y - 0.5 * LANE, "EB")
+    done.speed = stuck.speed = 0.0
+    for _ in range(600):
+        main.accumulate_frame_metrics([done, stuck])
+    done.passed_nodes = {NODE_A}
+    main._record_completed_vehicle_delay(done)
+    main.network_throughput["vehicles_served_total"] = 1
+    main.network_throughput["passengers_served_car"] = 4
+    main.network_throughput["passengers_served_total"] = 4
+
+    _seed_regime()
+    row = main.build_experiment_summary_row(60)
+    assert main.network_throughput["stopped_vehicle_frames"] == 1200
+    assert row["car_person_hours_delay"] == pytest.approx(2 * 4 * 10 / 3600, abs=1e-4)
+    assert row["mean_stopped_delay_sec_per_vehicle"] == pytest.approx(10.0)  # not 20
+    assert row["mean_car_passenger_delay_sec"] == pytest.approx(10.0)
+    assert row["mean_control_delay_sec_per_vehicle"] == pytest.approx(10.0)
+    assert row["unfinished_stopped_person_hours"] == pytest.approx(4 * 10 / 3600, abs=1e-4)
+    assert row["passenger_hours_in_network"] == pytest.approx(8 * 10 / 3600, abs=1e-4)
+    assert row["level_of_service"] == "A"
+
+    payload = TelemetryExporter(export_interval_frames=1).build_payload(
+        SignalController({"green_time": 20}), [stuck], 600,
+        throughput_state=main.network_throughput,
+    )
+    assert payload["network_throughput"]["mean_stopped_delay_sec_per_vehicle"] == 10.0
+    assert payload["network_throughput"]["mean_control_delay_sec_per_vehicle"] == 10.0
+    assert payload["delay"]["mean_car_passenger_delay_sec"] == 10.0
+
+
+def test_level_of_service_reads_control_delay_not_stopped_delay():
+    """LOS is arrival-to-departure delay (time below own free-flow speed,
+    which sees crawl); stopped delay is only a proxy and is labelled so."""
+    crawler = Vehicle(0, H_Y - 0.5 * LANE, "EB", max_speed=1.0)
+    crawler.speed = 0.5  # never "stopped", loses half a frame per frame
+    for _ in range(60 * 60):
+        main.accumulate_frame_metrics([crawler])
+    main._record_completed_vehicle_delay(crawler)
+    main.network_throughput.update({
+        "vehicles_served_total": 1, "passengers_served_car": 4, "passengers_served_total": 4,
+    })
+    _seed_regime()
+    row = main.build_experiment_summary_row(60)
+    assert row["mean_stopped_delay_sec_per_vehicle"] == 0.0
+    assert row["mean_control_delay_sec_per_vehicle"] == pytest.approx(30.0)
+    assert row["level_of_service"] == "C"
+
+
+def test_node_mean_delay_credits_only_vehicles_that_crossed():
+    main.reset_run_metrics()
+    crossed = Vehicle(NODE_A - 200, H_Y - 0.5 * LANE, "EB")
+    waiting = Vehicle(NODE_A - 300, H_Y - 0.5 * LANE, "EB")
+    crossed.speed = waiting.speed = 0.0
+    for _ in range(120):
+        main.accumulate_frame_metrics([crossed, waiting])
+    crossed.passed_nodes = {NODE_A}
+    main._record_node_crossings(crossed)
+    _seed_regime()
+    row = main.build_experiment_summary_row(60)
+    assert row["node_A_throughput_veh"] == 1
+    assert row["node_A_mean_delay_sec"] == pytest.approx(2.0)  # not 4.0
 
 
 def test_delay_zero_when_nothing_served():
@@ -333,7 +464,7 @@ def test_summary_not_cleared_on_reset(monkeypatch):
     experiment summary -- only manual deletion does."""
     _seed_regime()
     assert main.append_experiment_summary_row(300) is True
-    assert main.EXPERIMENT_SUMMARY_PATH.exists()
+    assert main.experiment_summary_path().exists()
     rows_before = read_summary_rows()
     assert len(rows_before) == 1
 
@@ -355,7 +486,7 @@ def test_summary_not_cleared_on_reset(monkeypatch):
     assert not main.AGENT_TURN_LOG_PATH.exists()
     assert not main.BUS_EVENTS_LOG_PATH.exists()
     # The master dataset survives, untouched, across the reset.
-    assert main.EXPERIMENT_SUMMARY_PATH.exists()
+    assert main.experiment_summary_path().exists()
     assert read_summary_rows() == rows_before
 
 
@@ -519,13 +650,17 @@ def test_steady_columns_use_only_the_post_warmup_window():
         "passengers_served_total": 100, "passengers_served_bus": 45,
         "passengers_served_car": 55,
         "bus_passenger_delay_frames": 45 * 60, "car_passenger_delay_frames": 55 * 60,
+        "completed_bus_passenger_delay_frames": 45 * 60,
+        "completed_car_passenger_delay_frames": 55 * 60,
     })
     main.snapshot_warmup_baseline(7200)
     main.network_throughput.update({
         "passengers_served_total": 580, "passengers_served_bus": 225,
         "passengers_served_car": 355,
-        "bus_passenger_delay_frames": 45 * 60 + 180 * 60,
-        "car_passenger_delay_frames": 55 * 60 + 300 * 60,
+        "bus_passenger_delay_frames": 45 * 60 + 180 * 60 + 999,  # + still-queued exposure
+        "car_passenger_delay_frames": 55 * 60 + 300 * 60 + 999,
+        "completed_bus_passenger_delay_frames": 45 * 60 + 180 * 60,
+        "completed_car_passenger_delay_frames": 55 * 60 + 300 * 60,
     })
 
     row = main.build_experiment_summary_row(600)  # T = 10 min
@@ -534,9 +669,9 @@ def test_steady_columns_use_only_the_post_warmup_window():
     assert row["warmup_discard_sec"] == 120.0
     assert row["steady_window_sec"] == 480.0
     assert row["pax_per_min_steady"] == pytest.approx(60.0)   # 480 / 8
-    assert row["bus_person_hours_delay_steady"] == pytest.approx(180 / 3600, abs=1e-4)
-    assert row["car_person_hours_delay_steady"] == pytest.approx(300 / 3600, abs=1e-4)
-    assert row["total_person_hours_delay_steady"] == pytest.approx(480 / 3600, abs=1e-4)
+    assert row["bus_person_hours_delay_steady"] == pytest.approx((180 * 60 + 999) / 60 / 3600, abs=1e-4)
+    assert row["car_person_hours_delay_steady"] == pytest.approx((300 * 60 + 999) / 60 / 3600, abs=1e-4)
+    assert row["total_person_hours_delay_steady"] == pytest.approx((480 * 60 + 1998) / 60 / 3600, abs=1e-4)
     assert row["mean_bus_passenger_delay_sec_steady"] == pytest.approx(180 / 180)
     assert row["mean_car_passenger_delay_sec_steady"] == pytest.approx(300 / 300)
     for column in main.EXPERIMENT_SUMMARY_HEADERS:
@@ -570,20 +705,40 @@ def test_converged_flag_compares_cumulative_rate_at_0_8T():
     assert main.build_experiment_summary_row(600)["converged"] is None
 
 
+def test_converged_requires_flat_network_load():
+    """A cumulative rate is stable by construction; a run whose accumulation
+    is still climbing at the horizon (Run 8: 150 -> 230 vehicles between
+    0.8T and T with the rate within 5%) is not converged."""
+    _seed_regime()
+    main.network_throughput["passengers_served_total"] = 600
+    main.network_throughput["passengers_served_car"] = 600
+    _write_telemetry_rows([
+        {"sim_time_s": 480, "pax_per_min_cumulative": 58.0, "vehicles_in_network": 150},
+        {"sim_time_s": 600, "pax_per_min_cumulative": 60.0, "vehicles_in_network": 230},
+    ])
+    assert main.build_experiment_summary_row(600)["converged"] is False
+    _write_telemetry_rows([
+        {"sim_time_s": 480, "pax_per_min_cumulative": 58.0, "vehicles_in_network": 150},
+        {"sim_time_s": 600, "pax_per_min_cumulative": 60.0, "vehicles_in_network": 158},
+    ])
+    assert main.build_experiment_summary_row(600)["converged"] is True
+
+
 def test_old_summary_csv_is_rotated_not_misaligned():
     """A dataset written with an older header is set aside intact and a
     fresh file starts with the current header."""
     _seed_regime()
     old_header = "timestamp,model,seed\n"
-    main.EXPERIMENT_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    main.EXPERIMENT_SUMMARY_PATH.write_text(old_header + "1,rule-based,1\n", encoding="utf-8")
+    live = main.experiment_summary_path()
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text(old_header + "1,rule-based,1\n", encoding="utf-8")
 
     assert main.append_experiment_summary_row(300) is True
 
     rows = read_summary_rows()
     assert len(rows) == 1 and "pax_per_min_steady" in rows[0]
     rotated = [
-        path for path in main.EXPERIMENT_SUMMARY_PATH.parent.glob("experiment_summary_*.csv")
+        path for path in live.parent.glob("experiment_summary_*_schema_*.csv")
     ]
     assert len(rotated) == 1
     assert rotated[0].read_text(encoding="utf-8") == old_header + "1,rule-based,1\n"
@@ -620,8 +775,9 @@ def test_every_checkpoint_workbook_carries_the_runs_summary_rows_so_far(monkeypa
     main.fire_due_checkpoints(300 * 60)
     main.finish_timed_test(600 * 60)
 
-    workbooks = sorted(main.EXCEL_EXPORT_DIR.glob("*.xlsx"))
-    assert len(workbooks) == 2
+    reports = sorted(main.EXCEL_EXPORT_DIR.glob("*_gridlock.xlsx"))
+    workbooks = sorted(set(main.EXCEL_EXPORT_DIR.glob("*.xlsx")) - set(reports))
+    assert len(workbooks) == 2 and len(reports) == 2  # each run workbook gets its gridlock report
     sheets = []
     for path in workbooks:
         rows = list(load_workbook(path, read_only=True)["Experiment Summary"].iter_rows(values_only=True))
@@ -691,9 +847,12 @@ def test_pair_against_baseline_is_baseline_minus_arm_on_the_same_seed():
         row("None", 2, 12.0, 7.0, 5.0, 9.0, converged="False", uuid_="b2"),
         row("rule", 2, 12.5, 7.5, 5.0, 9.5, uuid_="a2"),
         row("rule", 3, 5.0, 3.0, 2.0, 4.0, uuid_="a3"),  # no baseline for seed 3
+        dict(row("None", 4, 1.0, 0.5, 0.5, 1.0, uuid_="b4"), demand_draw_hash="aaaa"),
+        dict(row("rule", 4, 1.0, 0.5, 0.5, 1.0, uuid_="a4"), demand_draw_hash="bbbb"),
     ]
-    pairs, unpaired = main.pair_against_baseline(rows)
+    pairs, unpaired, mismatched = main.pair_against_baseline(rows)
     assert unpaired == ["3"]
+    assert mismatched == ["rule/4: demand_draw_hash"]  # a different demand realisation never pairs
     assert [(p["seed"], p["model"]) for p in pairs] == [("1", "rule"), ("2", "rule")]
     first, second = pairs
     assert first["net_person_hours_saved"] == pytest.approx(1.5)
@@ -708,7 +867,7 @@ def test_pair_against_baseline_is_baseline_minus_arm_on_the_same_seed():
 
 def test_paired_dv_csv_written_with_declared_header(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "EXPERIMENT_SUMMARY_PATH", tmp_path / "experiment_summary.csv")
-    pairs, _ = main.pair_against_baseline([
+    pairs, _, _ = main.pair_against_baseline([
         {"campaign_id": "C", "model": "None", "seed": "1", "run_uuid": "b",
          "total_person_hours_travel_delay_steady": "3", "converged": "True"},
         {"campaign_id": "C", "model": "rule", "seed": "1", "run_uuid": "a",
@@ -721,3 +880,85 @@ def test_paired_dv_csv_written_with_declared_header(tmp_path, monkeypatch):
     assert list(written[0].keys()) == list(main.PAIRED_DV_HEADERS)
     assert float(written[0]["net_person_hours_saved"]) == 1.0
     assert written[0]["bus_person_hours_saved"] == ""  # missing split stays blank, not 0
+
+
+def test_regime_hash_ignores_treatment_and_is_frozen_at_reset(monkeypatch):
+    """Audit item 6: toggling a route's TSP/DBL flag must not move the
+    regime hash (that is what the arm does, not the regime it runs in), and
+    every checkpoint of one run reports the hash frozen at reset even if
+    the live panel changes underneath it."""
+    _seed_regime()
+    route = control_panel.bus_routes_config["R1_EB_A_NB"]
+    before = main._config_regime_hash(control_panel.global_config)
+    monkeypatch.setitem(route, "tsp_enabled", not route["tsp_enabled"])
+    monkeypatch.setitem(route, "dbl_enabled", not route["dbl_enabled"])
+    assert main._config_regime_hash(control_panel.global_config) == before
+    monkeypatch.setitem(route, "headway_sec", route["headway_sec"] + 1)  # regime
+    assert main._config_regime_hash(control_panel.global_config) != before
+
+    monkeypatch.setitem(control_panel.global_config, "_regime_hash", "frozen-at-reset")
+    monkeypatch.setitem(control_panel.global_config, "vehicle_speed_scale", 0.25)
+    row = main.build_experiment_summary_row(300)
+    assert row["config_hash"] == "frozen-at-reset"
+
+
+def test_pairing_requires_every_regime_column_to_match():
+    def row(model, seed, **fields):
+        base = {"campaign_id": "C", "model": model, "seed": str(seed), "run_uuid": model,
+                "total_person_hours_travel_delay_steady": "1", "converged": "True",
+                "config_hash": "h", "git_sha": "s", "demand_draw_hash": "d",
+                "checkpoint_min": "60.0", "test_duration_min": "60.0"}
+        base.update(fields)
+        return base
+    rows = [row("None", 1), row("ok", 1),
+            row("None", 2), row("cfg", 2, config_hash="other"),
+            row("None", 3), row("code", 3, git_sha="other"),
+            row("None", 4), row("window", 4, checkpoint_min="30.0", test_duration_min="30.0"),
+            row("None", 5, campaign_id="X"), row("campaign", 5)]
+    pairs, unpaired, mismatched = main.pair_against_baseline(rows)
+    assert [p["model"] for p in pairs] == ["ok"]
+    assert mismatched == [
+        "cfg/2: config_hash", "code/3: git_sha",
+        "window/4: checkpoint_min, test_duration_min",
+    ]
+    assert unpaired == ["5"]  # a baseline from another campaign is no baseline
+
+
+def test_person_hours_totals_equal_sum_of_rounded_parts():
+    """The export assertion compares the rounded total against rounded
+    parts; rounding the raw sum drifts 1e-4 off for ~13% of inputs."""
+    import random
+    from src.core.main import _run_export_assertions
+
+    rng = random.Random(1)
+    for _ in range(2000):
+        bus_h, car_h = rng.uniform(10, 16), rng.uniform(25, 32)
+        row = {
+            "checkpoint_min": 5, "warmup_discard_sec": 120, "steady_window_sec": 180,
+            "passengers_served_total": 0, "passengers_served_bus": 0,
+            "passengers_served_car": 0, "buses_served": 0, "buses_tsp_treated": 0,
+            "buses_untreated": 0, "actual_decision_interval_sec_median": None,
+            "bus_person_hours_delay": round(bus_h, 4),
+            "car_person_hours_delay": round(car_h, 4),
+            "total_person_hours_delay": round(round(bus_h, 4) + round(car_h, 4), 4),
+            "bus_person_hours_travel_delay": round(bus_h, 4),
+            "car_person_hours_travel_delay": round(car_h, 4),
+            "total_person_hours_travel_delay": round(round(bus_h, 4) + round(car_h, 4), 4),
+        }
+        _run_export_assertions(row, {})
+
+
+def test_summary_csv_is_dated_by_campaign_start(monkeypatch):
+    """Rows go to experiment_summary_<YYYYMMDD>.csv: the campaign's start
+    day for a batch (so one crossing midnight stays in one file), the
+    run's start day otherwise."""
+    monkeypatch.setitem(control_panel.global_config, "_run_started_wall", 0.0)
+    monkeypatch.setitem(control_panel.global_config, "batch_runtime", {})
+    import time
+    day_zero = time.strftime("%Y%m%d", time.localtime(0.0))
+    assert main.experiment_summary_path().name == f"experiment_summary_{day_zero}.csv"
+    monkeypatch.setitem(
+        control_panel.global_config, "batch_runtime",
+        {"campaign_id": "c1", "campaign_stamp": "20260921"},
+    )
+    assert main.experiment_summary_path().name == "experiment_summary_20260921.csv"

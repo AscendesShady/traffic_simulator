@@ -288,3 +288,36 @@ def test_no_hard_coded_dbl_refusal_in_guard():
     assert flags == {
         route_id: {"tsp": False, "dbl": True} for route_id in guard.ROUTE_ORDER
     }
+
+
+def test_a_queued_bus_ahead_is_not_a_dbl_obstruction():
+    """The reserved lane's own occupants must not veto each other.
+
+    EB lane 2 at Node A carries R1, R2 and R3. Counting a stopped bus ahead
+    as an obstruction vetoed the follower's DBL stickily
+    (dbl_merge_abandoned_for_leg), so only the leading bus of a platoon could
+    ever hold the lane. A stopped *car* in the same place still counts.
+    """
+    from src.core.vehicle import dbl_lane_is_obstructed, dbl_lane_queue_ahead
+
+    # Same geometry as the queued-blocker case above: the follower sits back
+    # from the bar and the leader stands between it and the stop line.
+    follower = make_bus_for_leg(ROUTE_ID, NODE_A, "FOLLOWER")
+    follower.lane_index = DBL_LANE_INDEX
+    follower.y = lane_center_y(DBL_LANE_INDEX)
+    follower.x -= 160.0
+
+    leader = make_bus_for_leg(ROUTE_ID, NODE_A, "LEADER")
+    leader.lane_index = DBL_LANE_INDEX
+    leader.y = lane_center_y(DBL_LANE_INDEX)
+    leader.x = follower.x + 60.0        # ahead, still short of the bar
+    leader.speed = 0.0                  # stopped in the queue
+
+    fleet = [follower, leader]
+    assert dbl_lane_queue_ahead(follower, fleet, H_Y, target_node=NODE_A) == []
+    assert not dbl_lane_is_obstructed(follower, fleet, H_Y, LANE, target_node=NODE_A)
+
+    # The same geometry with a car instead of a bus is still an obstruction.
+    car = parked_blocker(follower, x_offset=60.0)
+    with_car = [follower, car]
+    assert dbl_lane_queue_ahead(follower, with_car, H_Y, target_node=NODE_A) == [car]

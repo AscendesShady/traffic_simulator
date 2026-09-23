@@ -185,9 +185,11 @@ def test_merged_run_sections_keep_all_actions_and_scroll_model_picker(monkeypatc
         control_panel.create_dashboard_window(mounted)
         single_body = control_panel.control_panel_sections["Single Run"]["body"]
         batch_body = control_panel.control_panel_sections["Batch Run"]["body"]
-        assert find_buttons(single_body, "Run LLM")
+        assert find_buttons(single_body, "Arm strategy")
         assert find_buttons(single_body, "Start")
-        assert find_buttons(batch_body, "Start test")
+        # A single timed run is a batch of one model x one seed, so the card
+        # offers only "Run batch" -- there is no separate "Start test".
+        assert not find_buttons(batch_body, "Start test")
         assert find_buttons(batch_body, "Run batch")
 
         (picker_button,) = find_buttons(batch_body, "Select models")
@@ -272,9 +274,9 @@ def approach_cards(body):
 
 
 def test_compact_approach_cards_keep_every_control_working():
-    """Inflow is a 0-60 v/m stepper; Straight/Trucks are thin sliders side
-    by side; ON/OFF and the model selector still write approach_configs;
-    and each card is roughly half its old height."""
+    """Inflow is a 0-60 v/m stepper; turning movements are one split bar
+    and Trucks a thin slider; ON/OFF and the model selector still write
+    approach_configs; and each card stays compact."""
     import tkinter as tk
     from tkinter import ttk
 
@@ -288,8 +290,10 @@ def test_compact_approach_cards_keep_every_control_working():
         host.update()
         cards = approach_cards(section["body"])
         assert len(cards) == len(control_panel.APPROACH_NAMES)
+        # 174 px: the split-bar caption stacks value under label so three
+        # cells fit the narrowest (256 px) control pane without clipping.
         for card in cards:
-            assert card.winfo_reqheight() <= 120
+            assert card.winfo_reqheight() <= 180
 
         eb_card = cards[0]
         (rate_box,) = widgets_of_type(eb_card, tk.Spinbox)
@@ -319,16 +323,40 @@ def test_compact_approach_cards_keep_every_control_working():
         host.update_idletasks()
         assert control_panel.approach_configs["EB"]["model"] == "Binomial"
 
-        split_scale, heavy_scale = widgets_of_type(eb_card, ttk.Scale)
-        assert str(split_scale.cget("style")) == "Thin.Horizontal.TScale"
-        # Side by side: both sliders share the same row (same top edge).
-        host.update_idletasks()
-        assert split_scale.winfo_y() == heavy_scale.winfo_y()
-        split_scale.set(55)
+        (heavy_scale,) = widgets_of_type(eb_card, ttk.Scale)
+        assert str(heavy_scale.cget("style")) == "Thin.Horizontal.TScale"
         heavy_scale.set(20)
         host.update_idletasks()
-        assert control_panel.approach_configs["EB"]["turn_split"] == 0.55
         assert control_panel.approach_configs["EB"]["heavy_ratio"] == 0.20
+
+        # Turning movements: one bar, two thumbs (Straight | Left @A | Left @B).
+        (split_bar,) = widgets_of_type(eb_card, control_panel.SplitBar)
+        eb = control_panel.approach_configs["EB"]
+        straight0, far0 = round(eb["turn_split"] * 100), round(eb["left_far_share"] * 100)
+        assert split_bar.segments() == [straight0, 100 - straight0 - far0, far0]
+        split_bar._set(0, 55)
+        assert control_panel.approach_configs["EB"]["turn_split"] == 0.55
+        assert control_panel.approach_configs["EB"]["left_far_share"] == far0 / 100
+        split_bar._set(1, 70)
+        assert split_bar.segments() == [55, 15, 30]
+        assert control_panel.approach_configs["EB"]["left_far_share"] == 0.30
+        # Thumbs never cross.
+        split_bar._set(0, 95)
+        assert split_bar.values == [70, 70]
+        # Keyboard: the focused thumb moves by one percent per arrow.
+        split_bar.focus_force()
+        split_bar.active = 1
+        split_bar.event_generate("<Right>")
+        host.update()
+        assert split_bar.values == [70, 71]
+
+        # A single-node approach has one thumb and no far share.
+        a_nb_card = cards[list(control_panel.APPROACH_NAMES).index("A_NB")]
+        (a_nb_bar,) = widgets_of_type(a_nb_card, control_panel.SplitBar)
+        assert len(a_nb_bar.values) == 1
+        a_nb_bar._set(0, 60)
+        assert control_panel.approach_configs["A_NB"]["turn_split"] == 0.60
+        assert control_panel.approach_configs["A_NB"]["left_far_share"] == 0.0
 
         (on_off,) = [
             button for button in widgets_of_type(eb_card, tk.Button)
@@ -418,14 +446,15 @@ def test_scale_click_focuses_and_arrows_make_exact_clamped_steps():
 def test_every_control_panel_scale_enables_keyboard_adjustment():
     source = inspect.getsource(control_panel.create_dashboard_window)
 
-    # Eight slider rows cover simulation speed, eligibility, vehicle speed,
-    # Single Run LLM interval, Batch Run LLM interval, bus headway,
-    # straight %, and trucks %. Inflow is an exact integer and uses a
-    # stepper (make_spinbox) instead. Signal cycles and green splits are
-    # derived by Webster and have no UI slider.
-    # add_slider_row is the only slider constructor and always wires
-    # enable_scale_keyboard.
-    assert source.count("add_slider_row(") == 8
+    # Seven slider rows cover simulation speed, eligibility, vehicle speed,
+    # Single Run LLM interval, Batch Run LLM interval, bus headway and
+    # trucks %. Turning movements are one SplitBar per approach (keyboard-
+    # adjustable itself); inflow is an exact integer and uses a stepper
+    # (make_spinbox). Signal cycles and green splits are derived by Webster
+    # and have no UI slider. add_slider_row is the only slider constructor
+    # and always wires enable_scale_keyboard.
+    assert source.count("add_slider_row(") == 7
+    assert source.count("add_split_bar_row(") == 1
     assert source.count("make_spinbox(") == 1
     assert "ttk.Scale(" not in source
     assert "enable_scale_keyboard(" in inspect.getsource(control_panel.add_slider_row)
@@ -459,3 +488,80 @@ def test_keyboard_steps_snap_to_the_value_grid():
 def test_zero_keyboard_step_is_rejected():
     with pytest.raises(ValueError):
         control_panel.enable_scale_keyboard(FakeScale(), step=0)
+
+
+def test_control_strategy_selector_is_two_level_and_drives_the_model(monkeypatch):
+    """Single Run: a Strategy dropdown (four families) over a Decider
+    dropdown that lists only that family's deciders; the batch picker shows
+    the same headings; Stop batch splits into Resume | End once stopped."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    monkeypatch.setattr(control_panel, "write_ai_control", lambda *a, **k: None)
+    monkeypatch.setattr(control_panel, "get_ollama_models", lambda: ["None", "llama3.1:8b"])
+    monkeypatch.setattr(control_panel, "get_api_models", lambda: ["None"])
+    monkeypatch.setitem(
+        control_panel.global_config, "ai_runtime",
+        {"armed": False, "model": "None", "tick_seconds": 5, "last_status": "INACTIVE", "last_turn": 0},
+    )
+    host = tk.Tk()
+    mounted = tk.Frame(host)
+    try:
+        control_panel.create_dashboard_window(mounted)
+        single_body = control_panel.control_panel_sections["Single Run"]["body"]
+
+        def combos(widget):
+            out = []
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.Combobox):
+                    out.append(child)
+                out.extend(combos(child))
+            return out
+
+        strategy_box, decider_box = combos(single_body)[:2]
+        assert list(strategy_box.cget("values")) == list(control_panel.CONTROL_STRATEGIES)
+        assert strategy_box.get() == control_panel.STRATEGY_BASELINE
+        assert str(decider_box.cget("state")) == "disabled"
+
+        strategy_box.set(control_panel.STRATEGY_RULE)
+        strategy_box.event_generate("<<ComboboxSelected>>")
+        assert control_panel.global_config["ai_runtime"]["model"] == control_panel.RULE_BASED_MODEL
+        assert list(decider_box.cget("values")) == [
+            control_panel.RULE_BASED_MODEL, control_panel.MAX_PRESSURE_MODEL
+        ]
+        decider_box.set(control_panel.MAX_PRESSURE_MODEL)
+        decider_box.event_generate("<<ComboboxSelected>>")
+        assert control_panel.global_config["ai_runtime"]["model"] == control_panel.MAX_PRESSURE_MODEL
+
+        strategy_box.set(control_panel.STRATEGY_LLM_ASSISTED)
+        strategy_box.event_generate("<<ComboboxSelected>>")
+        assert control_panel.global_config["ai_runtime"]["model"] == "llama3.1:8b"
+        assert control_panel.global_config["ai_runtime"]["control_mode"] == "assisted"
+        assert list(decider_box.cget("values")) == ["llama3.1:8b"]
+        # The fifth strategy is the same LLM family in the other control mode.
+        strategy_box.set(control_panel.STRATEGY_LLM_DECIDED)
+        strategy_box.event_generate("<<ComboboxSelected>>")
+        assert control_panel.global_config["ai_runtime"]["control_mode"] == "configured"
+        assert control_panel.global_config["ai_runtime"]["tick_seconds"] >= control_panel.CONFIGURED_TICK_SECONDS
+        strategy_box.set(control_panel.STRATEGY_RULE)
+        strategy_box.event_generate("<<ComboboxSelected>>")
+        assert control_panel.global_config["ai_runtime"]["control_mode"] == "assisted"
+
+        batch_body = control_panel.control_panel_sections["Batch Run"]["body"]
+        assert find_buttons(batch_body, "Stop batch")
+        (resume,) = find_buttons(batch_body, "Resume")
+        (end,) = find_buttons(batch_body, "End")
+        split_row = resume.outline_frame.master
+        assert end.outline_frame.master is split_row and not split_row.winfo_manager()
+        control_panel.global_config["batch_runtime"] = dict(
+            control_panel.DEFAULT_BATCH_RUNTIME, active=True, paused=True, total=1,
+            current={"model": "rule-based", "seed": 1},
+        )
+        host.update()
+        host.after(400, host.quit)
+        host.mainloop()
+        assert split_row.winfo_manager() == "pack"
+        assert not find_buttons(batch_body, "Stop batch")[0].winfo_manager()
+        control_panel.global_config["batch_runtime"] = dict(control_panel.DEFAULT_BATCH_RUNTIME)
+    finally:
+        host.destroy()

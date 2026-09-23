@@ -259,6 +259,40 @@ def test_extension_holds_green_for_bus():
     assert node.last_tsp_adjust_frames == history[-1]["tsp_adjust_frames"]
 
 
+def test_extension_withheld_when_bus_cannot_reach_the_bar_within_the_cap():
+    """The extension twin of the early-green gate (T6 replay, 2026-09-21):
+    a bus whose ETA at its current speed exceeds the cap would meet the red
+    at the end of the held green anyway, so the cross street would pay the
+    whole cap for nothing. The green ends on time, the reason is recorded
+    and the request stays armed for an early green."""
+    bus = tsp_bus()
+    bus.x -= 3 * CAP_FRAMES  # 65 px out at 0.5 px/frame: ETA 130 > cap 20
+    bus.speed = 0.5
+    controller = make_controller()
+    controller.phase = 0
+    controller.timer = GREEN_FRAMES - 3
+
+    observed = [step(controller, [bus])["priority_state"] for _ in range(4)]
+    assert TSP_EXTENDING not in observed
+    status = controller.get_node_status(NODE_A)
+    assert status["signals"]["EB"] == "YELLOW"  # ended on time
+    assert status["active_request"]["state"] == ARMED
+    assert status["active_request"]["tsp_action"] == TSP_ACTION_NONE
+    assert status["active_request"]["tsp_gate_reason"] == TSP_DENY_ETA_WINDOW
+    # Still armed: once the cross street's green runs, the early-green gate
+    # gets its turn (the bus is then close enough for the cut to pay).
+    later = [step(controller, [bus])["priority_state"] for _ in range(40)]
+    assert TSP_EARLY_TRUNCATE in later and TSP_EXTENDING not in later
+
+    # The same bus close enough to cross inside the cap is extended for.
+    near = tsp_bus(bus_id="NEAR_BUS")
+    near.speed = 0.5  # 5 px out: ETA 10 <= cap 20
+    controller = make_controller()
+    controller.phase = 0
+    controller.timer = GREEN_FRAMES - 3
+    assert TSP_EXTENDING in [step(controller, [near])["priority_state"] for _ in range(10)]
+
+
 def test_extension_capped():
     """A bus that never clears gets exactly 20% of the Webster green extra
     and not one frame more; then the green ends through yellow anyway."""

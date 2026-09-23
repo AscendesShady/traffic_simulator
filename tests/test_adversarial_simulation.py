@@ -1,4 +1,5 @@
 import random
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,30 @@ LANES = {
         for node in INT_X
     },
 }
+
+
+def assert_swept_nonoverlap(vehicles, before, tick):
+    """Sample the shared frame interval, retaining pre-turn orientation."""
+    for index, first in enumerate(vehicles):
+        if first not in before:
+            continue
+        ax, ay, ad = before[first]
+        a = SimpleNamespace(
+            x=(ax + first.x) / 2, y=(ay + first.y) / 2,
+            direction=ad, length=first.length, width=first.width,
+        )
+        for second in vehicles[index + 1:]:
+            if second not in before:
+                continue
+            bx, by, bd = before[second]
+            b = SimpleNamespace(
+                x=(bx + second.x) / 2, y=(by + second.y) / 2,
+                direction=bd, length=second.length, width=second.width,
+            )
+            assert not rectangles_overlap(a, b), (
+                f"swept overlap at tick={tick}: {ad}->{first.direction} "
+                f"and {bd}->{second.direction}"
+            )
 
 
 def make_car():
@@ -59,7 +84,7 @@ def make_bus(route_id, sequence):
 
 
 @pytest.mark.parametrize("seed", [0, 1])
-def test_seeded_congestion_has_no_cross_direction_rectangle_overlap(seed):
+def test_seeded_congestion_has_no_all_pair_rectangle_overlap(seed):
     random.seed(seed)
     for config in control_panel.bus_routes_config.values():
         config["tsp_enabled"] = True
@@ -70,7 +95,9 @@ def test_seeded_congestion_has_no_cross_direction_rectangle_overlap(seed):
     sequence = 0
     for tick in range(3000):
         if tick % 45 == 0:
-            vehicles.append(make_car())
+            candidate = make_car()
+            if all(not rectangles_overlap(candidate, other) for other in vehicles):
+                vehicles.append(candidate)
         for route_id, config in control_panel.bus_routes_config.items():
             if not config["active"]:
                 continue
@@ -80,9 +107,12 @@ def test_seeded_congestion_has_no_cross_direction_rectangle_overlap(seed):
             threshold = max(300, config["headway_sec"] * 12)
             if dispatch_counters[route_id] >= threshold:
                 sequence += 1
-                vehicles.append(make_bus(route_id, sequence))
+                candidate = make_bus(route_id, sequence)
+                if all(not rectangles_overlap(candidate, other) for other in vehicles):
+                    vehicles.append(candidate)
                 dispatch_counters[route_id] = 0
 
+        before = {v: (v.x, v.y, v.direction) for v in vehicles}
         controller.update(vehicles)
         signals = controller.get_all_signals(INT_X)
         for vehicle in list(vehicles):
@@ -92,16 +122,16 @@ def test_seeded_congestion_has_no_cross_direction_rectangle_overlap(seed):
             for vehicle in vehicles
             if -60 <= vehicle.x <= WIDTH + 60 and -60 <= vehicle.y <= HEIGHT + 60
         ]
+        assert_swept_nonoverlap(vehicles, before, tick)
         for index, first in enumerate(vehicles):
             for second in vehicles[index + 1 :]:
-                if first.direction != second.direction:
-                    assert not rectangles_overlap(first, second), (
+                assert not rectangles_overlap(first, second), (
                         f"seed={seed} tick={tick}; "
                         f"first={type(first).__name__}/{getattr(first, 'route_id', '')}/"
                         f"{first.direction}@({first.x:.1f},{first.y:.1f}) turn={first.target_turn}; "
                         f"second={type(second).__name__}/{getattr(second, 'route_id', '')}/"
                         f"{second.direction}@({second.x:.1f},{second.y:.1f}) turn={second.target_turn}"
-                    )
+                )
 
 
 def test_production_congestion_peak_builds_a_queue_without_crashing():
@@ -132,6 +162,7 @@ def test_production_congestion_peak_builds_a_queue_without_crashing():
             main.try_spawn_vehicle(
                 vehicles, "EB", "EB", NODE_A - 320, eb_lanes, config
             )
+            before = {v: (v.x, v.y, v.direction) for v in vehicles}
             controller.update(vehicles)
             signals = controller.get_all_signals(INT_X)
             for vehicle in list(vehicles):
@@ -151,6 +182,7 @@ def test_production_congestion_peak_builds_a_queue_without_crashing():
                 if -60 <= vehicle.x <= WIDTH + 60
                 and -60 <= vehicle.y <= HEIGHT + 60
             ]
+            assert_swept_nonoverlap(vehicles, before, _)
             # Queued = stopped or crawling behind a leader; followers now
             # creep with the car ahead instead of sitting at 0 until a full
             # gap opens, so a queue is not a row of speed-0 vehicles.
@@ -204,6 +236,7 @@ def test_all_sources_congestion_peak_remains_collision_safe_and_bounded():
                     lanes,
                     config,
                 )
+            before = {v: (v.x, v.y, v.direction) for v in vehicles}
             controller.update(vehicles)
             signals = controller.get_all_signals(INT_X)
             for vehicle in list(vehicles):
@@ -224,14 +257,14 @@ def test_all_sources_congestion_peak_remains_collision_safe_and_bounded():
                 and -60 <= vehicle.y <= HEIGHT + 60
             ]
             maximum_live_vehicles = max(maximum_live_vehicles, len(vehicles))
+            assert_swept_nonoverlap(vehicles, before, tick)
             for index, first in enumerate(vehicles):
                 for second in vehicles[index + 1 :]:
-                    if first.direction != second.direction:
-                        assert not rectangles_overlap(first, second), (
+                    assert not rectangles_overlap(first, second), (
                             f"tick={tick}; {first.direction}@({first.x:.1f},"
                             f"{first.y:.1f}) overlaps {second.direction}@"
                             f"({second.x:.1f},{second.y:.1f})"
-                        )
+                    )
     finally:
         pending_counts = [
             state["pending_arrivals"] for state in main.spawner_states.values()

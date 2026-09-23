@@ -1,10 +1,10 @@
 # Traffic Simulator — Consolidated Context
 
-> Generated reference distilled from every `.py` module and every file in `docs/`, current as of the `src/` package layout (post `c6b1d6c` restructure). Treat this as a fast-loading map of the codebase; where it and the actual source disagree, the source wins. For narrative depth beyond this file, see `docs/TRAFFIC_SIMULATOR_ARCHITECTURE_AND_REUSE_GUIDE.md` (deep architecture/reuse guide) and `docs/TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md` (full source walkthrough, ~7000 lines).
+> Generated reference distilled from every `.py` module and every file in `docs/`, current as of the `src/` package layout (post `c6b1d6c` restructure). Treat this as a fast-loading map of the codebase; where it and the actual source disagree, the source wins. For narrative depth beyond this file, see `docs/TRAFFIC_SIMULATOR_METHODOLOGY_AND_ARCHITECTURE.md` (methodology in Part I, architecture in Part II).
 
 ## 1. What this project is
 
-A desktop traffic and transit simulation of two connected signalized intersections — **Node A** at `x=300` and **Node B** at `x=700` — built on Pygame (rendered offscreen into a Tk canvas), Tkinter, and an optional separate-process LLM supervisor (LangGraph over local Ollama, or the Gemini/OpenAI/xAI Grok APIs). It models:
+A desktop traffic and transit simulation of two connected signalized intersections — **Node A** at `x=800` and **Node B** at `x=1600` (`canvas_gemini.INT_X`, on a 2400×600 px surface — never hard-code a node x) — built on Pygame (rendered offscreen into a Tk canvas), Tkinter, and an optional separate-process LLM supervisor (LangGraph over local Ollama, or the Gemini/OpenAI/xAI Grok APIs). It models:
 
 - stochastic demand generation on six approaches (EB, WB, and NB/SB at each node),
 - six fixed bus routes with Transit Signal Priority (TSP) and a Dynamic Bus Lane (DBL),
@@ -198,7 +198,7 @@ Key derived per-approach fields, all display/decision-support only (never fed ba
 | `logs/bus_events.jsonl` | `BusEventTracker._append` | Bus Events export sheet | per-bus lifecycle on completion |
 | `logs/agent_rejects.log` | `guard._record_rejection` | developer | best-effort malformed-output evidence |
 | `results/*.xlsx` | main/dashboard | operator | session/timed-test/EXPORT ALL workbooks |
-| `results/experiment_summary.csv` | `main.append_experiment_summary_row` | cross-run analysis | **never cleared by RESET** — append-forever master dataset |
+| `results/experiment_summary_<YYYYMMDD>.csv` (`main.experiment_summary_path()`, dated by the campaign's start day) | `main.append_experiment_summary_row` | cross-run analysis | **never cleared by RESET** — append-forever master dataset |
 
 All are gitignored and use atomic replace (temp file + `os.fsync` + `os.replace`) so a reader never observes a half-written file.
 
@@ -219,12 +219,12 @@ A `LangGraph` `StateGraph` with nodes `load_save → check_discharge → read_mi
 - **`load_save`**: reads telemetry; `STALE` if missing, `simulation_paused`, or older than `STALE_SECONDS=3.0` → routes straight to `hold` (fresh all-off, no model call).
 - **`check_discharge`**: if `network_discharge.active`, stands down with an all-off `STANDDOWN_DISCHARGE` decision, skipping inference entirely.
 - **`read_minimap`**: builds a structured-text (not image) observation: `DECISION_LAG_SEC` (the previous turn's measured latency, or `DEFAULT_DECISION_LAG_SEC=8.0` on turn 1 — the rule controller instead uses its own `RULE_DECISION_LAG_SEC=0.0`), per-node phase/signals/waiting-passengers/queue-length/downstream-free-space/actionable-bus summary, then per-route (in `ROUTE_ORDER`) active/tsp/dbl/obstruction/nearest-bus-ETA/`eta_at_decision_land_sec` (ETA minus the decision lag — a bus with `eta_at_decision_land_sec<=0` will already be at the node before the flag lands, so granting it is wasted) and `actionable` (`0 < landed_eta < ACTIONABLE_HORIZON_SEC=45s`).
-- **`check_locked`**: routes with a bus currently `priority_granted` or `priority_clearing` are added to `locked_routes` and appended to the minimap as `LOCKED_ROUTES=...` — the model is told not to change them, and `anti_cheat` re-forces those routes' flags to their current live state regardless of model output, so an in-flight grant can never be yanked mid-execution by an oscillating model.
+- **`check_locked`**: routes with a bus the controller holds a request for — `priority_requested` (armed, waiting on the early-green gate), `priority_granted` or `priority_clearing` — are added to `locked_routes` and appended to the minimap as `LOCKED_ROUTES=...`; the model is told to leave them as shown, and `anti_cheat` re-forces those routes' flags to their current live state regardless of what any arm returns. A route flag is a *continuous hold*: `SignalController._request_is_live` re-reads it every frame and cancels the request the frame it drops (`FEATURE_DISABLED`), then suppresses that bus's leg so it never re-requests. Locking only granted/clearing requests let every arm (the deterministic rule included: 9 of its 9 TSP denials) withdraw most of its grants mid-approach as the snapshot changed — cross-street load ticking past 45 pax, or the bus's landed ETA reaching 0 at the bar. Every arm decides *new* requests only.
 - **`ai_turn`**: dispatches by model-name prefix — `is_rule_model` (rule_controller), `gemini-*`, `gpt-*`, `grok-*` (openai SDK against `GROK_BASE_URL`), else Ollama. Each backend call runs in a **daemon thread with a hard timeout** (`GEMINI_TIMEOUT_SECONDS=30`, `OPENAI_TIMEOUT_SECONDS=30`, `GROK_TIMEOUT_SECONDS=30`, `OLLAMA_TIMEOUT_SECONDS=45`) and a non-reentrant lock per provider (a still-running call from a timed-out previous turn can't overlap the next); a timeout/exception becomes `status="INVALID"` and a synthetic error string that `guard.safe_decision` will reject to all-off.
 - **`anti_cheat`**: `guard.safe_decision(...)`, then the locked-route overlay described above, then a DBL safety overlay: any *new* (non-locked) `dbl=True` grant is forced back to `False` server-side when telemetry shows that route's DBL lane has a queue ahead or is otherwise obstructed (`dbl_lane_queue_ahead`/`dbl_lane_obstructed`) — a model cannot grant DBL into a lane that would just strand the bus, even if it ignores `SYSTEM_PROMPT`'s instruction to the same effect.
 - **`write_decision`**: atomic write to `decision.json` + `log_turn` append to `agent_turn_log.jsonl` (includes minimap, raw output, computed `tokens_per_sec`, etc.).
 
-`SYSTEM_PROMPT` is heavily restraint-biased: "Webster is already competent, congestion is failure, default to no grant, at most 1-2 routes per node per turn, compare bus passengers (45) directly against the cross-traffic queue you'd delay, never grant into a blocked downstream, decide fresh each turn from current state only (no carrying flags forward)." `_track_run_boundary` resets the turn counter/decision memory when telemetry's `frame_number` jumps backward (a new run started).
+`SYSTEM_PROMPT` is heavily restraint-biased: "Webster is already competent, congestion is failure, default to no grant, at most 1-2 routes per node per turn, compare bus passengers (45) directly against the cross-traffic queue you'd delay, never grant into a blocked downstream, decide fresh each turn from current state only (no carrying flags forward) — except LOCKED_ROUTES, which the controller already holds." `_track_run_boundary` resets the turn counter/decision memory when telemetry's `frame_number` jumps backward (a new run started).
 
 ## 13. `rule_controller.py` — deterministic comparator
 
@@ -282,6 +282,9 @@ Offline HCM-style calibration diagnostic — reuses production geometry/vehicle/
 12. START/RESET fully clear run state and logs; STOP preserves them for export — distinct, deliberate contracts.
 13. Same seed reproduces traffic generation only; an armed run may still diverge because model output can differ.
 14. Queue *passenger* counts are estimates (flat per-vehicle-type weighting); *served* passenger counts are exact (each vehicle's real `passengers` value).
+15. A route flag is a continuous hold — never narrow `agent.check_locked` back to granted/clearing requests; an armed request whose flag drops is cancelled `FEATURE_DISABLED` and its bus's leg suppressed for good.
+16. A summary row that contradicts its own inputs is refused, never written: `main._run_export_assertions` (steady window, passenger/bus/person-hours identities, decision cadence) and `BaselineContaminationError` mark the run `FAILED` and keep the workbook. Person-hours totals are the sum of the rounded parts so the identity holds exactly.
+17. Tests never touch a live simulator's files: `conftest.isolate_runtime_files` redirects every `data/`/`logs/`/`results/` path per test, and path defaults are resolved at call time, not bound as default arguments. Still, never run the suite while a batch is in flight.
 
 ## 20. Testing
 
@@ -294,7 +297,7 @@ py -m venv .venv
 ```
 If Windows denies pytest's default temp dir: `--basetemp=.\runtime\pytest-temp` (create `runtime/` first).
 
-`tests/conftest.py` provides `base_geometry`, a `signal_system` fixture (a `SignalController` with short 20/3/3-frame timings for fast tests), an autouse `restore_shared_configuration` fixture that deep-copies and restores `control_panel.global_config`/`bus_routes_config`/`approach_configs` around every test — because these are shared mutable module dictionaries, not per-instance state — and an autouse `destroy_leftover_tk_root` fixture that destroys any Tk root a test leaves behind, since a live root keeps its interpreter and pending `after` callbacks alive for every later test.
+`tests/conftest.py` provides `base_geometry`, a `signal_system` fixture (a `SignalController` with short 20/3/3-frame timings for fast tests), an autouse `restore_shared_configuration` fixture that deep-copies and restores `control_panel.global_config`/`bus_routes_config`/`approach_configs` around every test — because these are shared mutable module dictionaries, not per-instance state — an autouse `destroy_leftover_tk_root` fixture that destroys any Tk root a test leaves behind, since a live root keeps its interpreter and pending `after` callbacks alive for every later test, and an autouse `isolate_runtime_files` fixture that points every `data/`, `logs/` and `results/` path constant of every module (`main`, `guard`, `agent`, `control_panel`, `bus_event_log`, `telemetry_exporter`, `telemetry_dashboard`) at a per-test temp directory — without it, a test calling `perform_full_reset` deletes the `logs/*.jsonl` of a simulator running in another process and one writing `ai_control.json` flips its agent to observation-only (three of the seven refused rows in the 2026-09-21 batch). Never run the suite while a batch is in flight regardless.
 
 **`--capture=sys` in `tests/pytest.ini` is load-bearing.** pytest's default `--capture=fd` dup2()s file descriptors 1 and 2 onto temp files and swaps them around each test, while Tcl binds its standard channels once per process at first-interpreter init. Swapping the descriptors underneath it dangles that global state, and a later `tk.Tk()` then fails inside its own startup — `couldn't read file .../init.tcl: No error`, `Can't find a usable tk.tcl`, or `invalid command name tcl_findLibrary` — on a random GUI test. Measured on the Tk-heavy subset: 4/10 runs failed under fd capture, 0/15 under sys capture. Never override it back to `--capture=fd`.
 
@@ -311,8 +314,8 @@ Compile-check (no dedicated lint config):
 
 ## 22. Documentation index
 
-- `docs/TRAFFIC_SIMULATOR_ARCHITECTURE_AND_REUSE_GUIDE.md` — deep architecture/reuse reference with per-module reuse assessments, decoupling plan, and a final reuse-decision checklist. **Read this in full before any non-trivial architectural change.**
-- `docs/TRAFFIC_SIMULATOR_GUIDE_AND_DOCUMENTATION.md` — exhaustive full-source documentation (~7000 lines).
+- `docs/TRAFFIC_SIMULATOR_METHODOLOGY_AND_ARCHITECTURE.md` — the single authoritative description: paper-ready methodology (Part I) and implementation reference (Part II). **Read this in full before any non-trivial architectural change.**
+- `docs/MODEL_VALIDATION_AND_VERIFICATION_NOTE.md` — validity argument for peer review.
 - `docs/SIMULATION_INPUT_PARAMETERS.md` — default config values for demand/approaches/bus routes, with field-by-field definitions.
 - `docs/ui-ux-design-rulebook.md` — evidence-based UI/UX rules (contrast, touch targets, state matrices, spacing grid, dark-pattern avoidance); apply when touching `control_panel.py` or `telemetry_dashboard.py`.
 - `docs/audits/` — historical incident/audit reports (gridlock, callback/placeholder, priority-starvation, DBL/TSP interaction checks), each dated `YYYY-MM-DD` in the filename. New audits go here; `docs/` root stays current-guides-only.

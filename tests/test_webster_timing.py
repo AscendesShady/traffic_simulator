@@ -4,12 +4,14 @@ Cycle and green durations are no longer operator inputs: each node's cycle and
 EW/NS split are derived from the configured flows and a saturation flow S
 calibrated fresh at START.
 """
+import pytest
+
 import src.ui.control_panel as control_panel
 import src.core.main as main
 import src.core.webster as webster
 from src.core.signal_controller import SignalController
 from src.telemetry.telemetry_exporter import TelemetryExporter
-from tests.helpers import NODE_A, NODE_B
+from tests.helpers import NODE_A, NODE_B, reference_flows
 
 
 # ---------------------------------------------------------------- Part A
@@ -87,7 +89,7 @@ def test_oversaturated_node_caps_cycle():
 
 
 def test_per_node_cycles_can_differ():
-    flows = {key: dict(value) for key, value in control_panel.approach_configs.items()}
+    flows = reference_flows()
     flows["A_NB"]["rate"] = flows["A_SB"]["rate"] = 8
     flows["B_NB"]["rate"] = flows["B_SB"]["rate"] = 12
 
@@ -99,33 +101,70 @@ def test_per_node_cycles_can_differ():
     assert splits[NODE_B]["cycle_source"] == "webster_optimal"
 
 
-def test_critical_lane_fraction_matches_spawn_lane_choice():
-    """try_spawn_vehicle sends straight vehicles to lanes 0/1 at random and
-    left-turners to lane 2, so the busiest lane carries
-    max(turn_split / 2, 1 - turn_split) of the approach flow. heavy_ratio
-    never touches lane choice, so it must not enter this fraction."""
-    assert webster.critical_lane_fraction(0.8) == 0.4
-    assert webster.critical_lane_fraction(0.5) == 0.5      # left lane busiest
-    assert webster.critical_lane_fraction(1.0) == 0.5
-    assert webster.critical_lane_fraction(0.0) == 1.0
-    cfg = {"rate": 12, "turn_split": 0.8, "heavy_ratio": 0.5}
-    assert webster.critical_lane_flow_veh_hr(cfg) == 720 * 0.4
-    assert webster.critical_lane_flow_veh_hr({**cfg, "heavy_ratio": 0.0}) == 720 * 0.4
+def test_movement_matrix_walks_every_turn_option_node_by_node():
+    """Each (approach, turn option) lands on the node and lane vehicle.py
+    gives it: straight from the source over lanes 0/1, a left from lane 2
+    at its node, a far-node left through the near node in lanes 0/1, and a
+    side-street left that enters the corridor on lane 2 at the OTHER node.
+    heavy_ratio never touches lane choice."""
+    flows = {
+        "EB": {"active": True, "rate": 10, "turn_split": 0.6, "left_far_share": 0.3, "heavy_ratio": 0.5},
+        "B_NB": {"active": True, "rate": 5, "turn_split": 0.5, "left_far_share": 0.2},
+        "A_SB": {"active": False, "rate": 99, "turn_split": 0.0},
+    }
+    matrix = {
+        node: {d: {l: round(v, 6) for l, v in lanes.items()} for d, lanes in by_dir.items()}
+        for node, by_dir in webster.movement_lane_flows(
+            flows, control_panel.APPROACH_TURN_OPTIONS
+        ).items()
+    }
+    # EB 600 veh/hr: 60 % straight + 30 % far left ride lanes 0/1 through A
+    # (270 each), 10 % near left uses lane 2 at A.
+    assert matrix[NODE_A]["EB"] == {0: 270.0, 1: 270.0, 2: 60.0}
+    # At B only the straight 60 % is left in lanes 0/1; lane 2 has the far left.
+    assert matrix[NODE_B]["EB"] == {0: 180.0, 1: 180.0, 2: 180.0}
+    # B_NB 300 veh/hr: 50 % straight lanes 0/1, 50 % left from lane 2 at B ...
+    assert matrix[NODE_B]["NB"] == {0: 75.0, 1: 75.0, 2: 150.0}
+    # ... and those 150 then enter Node A westbound on lane 2 (a second left
+    # or straight from the landing lane -- lane 2 either way).
+    assert matrix[NODE_A]["WB"] == {0: 0.0, 1: 0.0, 2: 150.0}
+    assert "SB" not in matrix[NODE_A]  # inactive approach offers nothing
+    assert webster.critical_lane_flows(matrix, NODE_A) == {"EW": 270.0, "NS": 0.0}
+    assert webster.critical_lane_flows(matrix, NODE_B) == {"EW": 180.0, "NS": 150.0}
+    assert webster.approach_critical_lane_flow_veh_hr(flows, "EB") == pytest.approx(270.0)
+    assert webster.approach_critical_lane_flow_veh_hr(flows, "B_NB") == pytest.approx(150.0)
+    assert webster.approach_critical_lane_flow_veh_hr(
+        {**flows, "EB": {**flows["EB"], "heavy_ratio": 0.0}}, "EB"
+    ) == pytest.approx(270.0)
+
+
+def test_nodes_differ_when_a_side_street_feeds_the_corridor_at_the_other_node():
+    flows = reference_flows()
+    flows["B_NB"]["rate"] = 30       # 1800 veh/hr, 25 % left -> 450 on WB lane 2 at A
+    flows["B_NB"]["turn_split"] = 0.75
+    flows["B_NB"]["left_far_share"] = 0.0
+    splits = webster.compute_all_nodes(flows, s=1291.0, lost_time_sec=4.0)
+    matrix = webster.movement_lane_flows(flows)
+    assert matrix[NODE_A]["WB"][2] == 72 + 450
+    assert splits[NODE_A]["EW_critical_lane_flow_veh_hr"] == 522.0
+    assert splits[NODE_B]["EW_critical_lane_flow_veh_hr"] == 324.0
+    assert splits[NODE_A]["EW_green_frames"] != splits[NODE_B]["EW_green_frames"]
 
 
 def test_webster_uses_per_lane_flows_against_per_lane_s():
     """Default flows at the measured-S regime: y is the busiest lane / S,
     Y is far from saturation, and the cycle sits on the 40 s floor rather
     than the 155 s the whole-approach mismatch used to produce."""
-    flows = {key: dict(value) for key, value in control_panel.approach_configs.items()}
+    flows = reference_flows()
     splits = webster.compute_all_nodes(flows, s=1291.0, lost_time_sec=4.0)
     node = splits[NODE_A]
-    ew_lane = webster.critical_lane_fraction(flows["EB"]["turn_split"])
-    ns_lane = webster.critical_lane_fraction(flows["A_NB"]["turn_split"])
-    ew_flow = flows["EB"]["rate"] * 60 * ew_lane          # 720 x 0.40 = 288
+    # EB at A: straight + far-node left share lanes 0/1 -> (0.8 + 0.1) / 2.
+    ew_lane = (flows["EB"]["turn_split"] + flows["EB"]["left_far_share"]) / 2
+    ns_lane = flows["A_NB"]["turn_split"] / 2
+    ew_flow = flows["EB"]["rate"] * 60 * ew_lane          # 720 x 0.45 = 324
     ns_flow = flows["A_NB"]["rate"] * 60 * ns_lane        # 480 x 0.375 = 180
 
-    assert (ew_lane, ns_lane) == (0.4, 0.375)
+    assert (ew_lane, ns_lane) == (0.45, 0.375)
     assert node["EW_critical_lane_flow_veh_hr"] == ew_flow
     assert node["NS_critical_lane_flow_veh_hr"] == ns_flow
     assert node["y_ew"] == round(ew_flow / 1291, 3)
@@ -150,7 +189,7 @@ def test_min_cycle_floor_is_adjustable():
 
 
 def test_symmetric_flows_equal_nodes():
-    flows = {key: dict(value) for key, value in control_panel.approach_configs.items()}
+    flows = reference_flows()
 
     splits = webster.compute_all_nodes(flows, s=1800.0, lost_time_sec=4.0)
 

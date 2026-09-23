@@ -84,6 +84,6 @@ def test_write_ai_control_behavior_unchanged_when_mounted(tmp_path, monkeypatch)
         import json
 
         payload = json.loads(fake_path.read_text(encoding="utf-8"))
-        assert set(payload) == {"armed", "model", "tick_seconds", "simulation_running"}
+        assert set(payload) == {"armed", "model", "tick_seconds", "simulation_running", "control_mode"}
     finally:
         root.destroy()

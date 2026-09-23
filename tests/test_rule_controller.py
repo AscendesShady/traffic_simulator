@@ -339,7 +339,9 @@ def test_rule_selectable_in_control_panel(monkeypatch):
             returncode=0, stdout="NAME ID SIZE MODIFIED\nmodel-a:latest abc 1GB now\n"
         ),
     )
-    assert control_panel.get_decision_sources() == ["None", "rule-based", "model-a:latest"]
+    assert control_panel.get_decision_sources() == [
+        "None", "rule-based", control_panel.MAX_PRESSURE_MODEL, "model-a:latest"
+    ]
     assert control_panel.RULE_BASED_MODEL == rc.RULE_MODEL_NAME
     # Persisted to ai_control.json through the ordinary path.
     control_panel.set_active_ai_model("rule-based", persist=False)
@@ -381,6 +383,7 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
     monkeypatch.setattr(main.time, "time", lambda: now)
     runtime = {"armed": True, "model": "rule-based", "tick_seconds": 5, "last_status": "WAITING_FOR_DECISION"}
     monkeypatch.setitem(control_panel.global_config, "ai_runtime", runtime)
+    monkeypatch.setitem(control_panel.global_config, "_run_uuid", "run-rule")
 
     # 1. The agent's turn, exactly as the graph runs it, with the rule deciding.
     snapshot = telemetry([bus("R1_EB_A_NB", NODE_A, "EB", 20)], {str(NODE_A): {"NB": 8, "SB": 4}})
@@ -388,6 +391,7 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
         "telemetry": snapshot, "minimap": "minimap text", "locked_routes": set(),
         "raw_output": "", "call_metrics": {}, "decision": {}, "status": "OK",
         "recent_decisions": [], "turn": 1, "model": "rule-based", "decision_lag_sec": 0.0,
+        "run_uuid": "run-rule",
     }
     state.update(agent.ai_turn(state))
     state.update(agent.anti_cheat(state))
@@ -444,8 +448,8 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
         assert workbook.sheetnames == [
             "Decisions", "Telemetry", "AI Decision Audit",
             "LLM Performance", "LLM Summary",
-            "Control Panel Inputs", "Bus Events", "Unit Conversions",
-            "Experiment Summary",
+            "Control Panel Inputs", "Control Panel Inputs (start)",
+            "Bus Events", "Unit Conversions", "Experiment Summary",
         ]
         decisions = workbook["Decisions"]
         header = [c.value for c in decisions[1]]

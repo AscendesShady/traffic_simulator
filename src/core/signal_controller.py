@@ -12,7 +12,10 @@ from src.core.vehicle import (
     Bus,
     DBL_LANE_INDEX,
     dbl_lane_is_obstructed,
+    dbl_lane_queue_ahead,
+    ENTRY_ZONE_PX,
     eta_frames_to_stop_bar,
+    SAFE_GAP_PX,
 )
 
 log = logging.getLogger(__name__)
@@ -39,6 +42,13 @@ TSP_ACTION_EARLY_GREEN = "early_green"
 # untreated after one of these terminates DENIED carrying the reason.
 TSP_DENY_ETA_WINDOW = "TSP_ETA_OUTSIDE_GREEN_WINDOW"
 TSP_DENY_NET_BENEFIT = "TSP_CUT_BELOW_CLEARANCE"
+# The bus's receiving lane beyond the node cannot take it: a green bought
+# for it would release nothing, so no timing changes until the lane clears.
+TSP_DENY_DOWNSTREAM_BLOCKED = "DOWNSTREAM_BLOCKED"
+# A standing vehicle appeared ahead of the bus in the reserved lane after the
+# request was accepted (a left turner that stopped for a reservation, a
+# spillback hold): the lane can no longer deliver the bus, so DBL is revoked.
+DBL_REVOKED_LANE_BLOCKED = "DBL_REVOKED_LANE_BLOCKED"
 
 # A bus may not request priority at a node it has not yet been released
 # toward: the eligibility zone can never exceed the link between the nodes.
@@ -132,6 +142,7 @@ class PriorityRequest:
     # Instrumentation only: DBL becomes an actual grant when this request is
     # promoted to the node's active request and owns the reserved lane.
     dbl_granted: bool = False
+    dbl_revoke_reason: str = ""
     metrics_finalized: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -156,6 +167,7 @@ class PriorityRequest:
             "tsp_action": self.tsp_action,
             "tsp_adjust_frames": self.tsp_adjust_frames,
             "tsp_gate_reason": self.tsp_gate_reason,
+            "dbl_revoke_reason": self.dbl_revoke_reason,
         }
 
 
@@ -182,6 +194,12 @@ class NodeState:
     # bar by same-approach through traffic in the corner sweep. See
     # LEFT_TURN_STARVATION_FRAMES.
     left_turn_waiting: dict[str, tuple[Any, int]] = field(default_factory=dict)
+    # AI Configured (apply_plan): green length per green phase {0: EW, 3: NS}
+    # in frames while a plan is live (None = Webster), the approaches whose
+    # lane 2 is commanded reserved, and a pending "end this green now".
+    plan_green_frames: dict[int, int] | None = None
+    dbl_commanded: set[str] = field(default_factory=set)
+    cut_pending: bool = False
 
 
 # A same-approach left turn yields to through traffic in the corner sweep
@@ -192,6 +210,17 @@ class NodeState:
 # the bar so the corner drains and the left turn goes; vehicles already in
 # the box are untouched.
 LEFT_TURN_STARVATION_FRAMES = 60
+FRAMES_PER_SECOND = 60
+
+# NOT a mechanism, a finding. Cutting a green short once its receiving lanes
+# have spilled back (so it discharges nobody) was implemented and measured on
+# 2026-09-22, seed 234, 15 min, benchmark regime: it fired 5 times and served
+# 8,350 pax against 8,960 for the untreated run -- 6.8 % WORSE, with more
+# vehicles standing at the end (221 vs 204). Truncating a blocked green
+# removes the green from the movement that discharges first once the
+# downstream link clears, and the cross street it hands the time to feeds the
+# same saturated box. A saturated corridor wants offset/coordination between
+# the nodes, not phase truncation. Do not re-add this without measuring it.
 
 
 class SignalController:
@@ -1134,13 +1163,78 @@ class SignalController:
                 result[approach] = GREEN
         return result
 
+    # --- AI Configured: an externally written timing plan -------------------
+    # The plan owns green lengths and the lane-2 flashers only. Yellow,
+    # all-red, the intersection-clear wait, reservations and every collision
+    # check stay here, and no plan at all means Webster (fail closed).
+
+    def apply_plan(self, plan):
+        """Run ``plan`` (guard.validate_signal_plan output, keyed by the
+        string node x) from this frame: a running green longer than its new
+        length ends now through yellow, a cut waits for the minimum green,
+        and TSP requests in flight are cancelled -- the plan is the priority."""
+        for node_x, node in self.nodes.items():
+            node_plan = plan[str(node_x)]
+            node.plan_green_frames = {
+                0: int(node_plan["ew_green_sec"] * FRAMES_PER_SECOND),
+                3: int(node_plan["ns_green_sec"] * FRAMES_PER_SECOND),
+            }
+            node.dbl_commanded = {
+                approach for approach, on in node_plan["dbl"].items() if on
+            }
+            if node_plan["end_current_green_now"] and node.phase in (0, 3):
+                node.cut_pending = True
+            for request in [node.active_request, *node.request_queue]:
+                if request is not None:
+                    request.denial_or_cancel_reason = "PLAN_CONTROL"
+                    self._finalize_request(node, request, CANCELLED)
+            node.request_queue.clear()
+            node.active_request = None
+            node.priority_state = NORMAL
+
+    def clear_plan(self):
+        """Back to Webster timing and no commanded lanes (stale or invalid
+        plan, disarm, reset)."""
+        for node in self.nodes.values():
+            node.plan_green_frames = None
+            node.dbl_commanded = set()
+            node.cut_pending = False
+
+    @property
+    def plan_active(self):
+        return any(node.plan_green_frames for node in self.nodes.values())
+
+    def get_plan(self):
+        """The live plan per string node x (telemetry), or None."""
+        if not self.plan_active:
+            return None
+        return {
+            str(node_x): {
+                "ew_green_sec": node.plan_green_frames[0] / FRAMES_PER_SECOND,
+                "ns_green_sec": node.plan_green_frames[3] / FRAMES_PER_SECOND,
+                "dbl": sorted(node.dbl_commanded),
+            }
+            for node_x, node in self.nodes.items()
+        }
+
+    def dbl_excludes_left_turns(self, target_node_x, direction):
+        """A bus-requested DBL keeps left-turners out of lane 2 (they hold in
+        a general lane); a commanded lane is shared with them."""
+        node = self.nodes.get(target_node_x)
+        if node and direction in node.dbl_commanded:
+            return False
+        return self.is_dbl_active_for_approach(target_node_x, direction)
+
     def get_green_time(self, node_x=None, phase=0):
         """Green duration in frames for one node's current phase.
 
-        Webster splits are per node and per phase, so EW and NS no longer
-        share a single slider value. Falls back to the legacy green_time
-        when no calibration has run yet.
+        A live plan (apply_plan) wins; else Webster splits are per node and
+        per phase, so EW and NS no longer share a single slider value. Falls
+        back to the legacy green_time when no calibration has run yet.
         """
+        node = self.nodes.get(node_x)
+        if node is not None and node.plan_green_frames:
+            return node.plan_green_frames[3 if phase == 3 else 0]
         splits = self.global_config.get("webster_splits") or {}
         node_split = splits.get(node_x) or splits.get(str(node_x))
         if node_split:
@@ -1464,7 +1558,9 @@ class SignalController:
         if not isinstance(bus, Bus):
             return False
         live_cfg = self._live_route_config(bus)
-        if not live_cfg.get("dbl_enabled", False):
+        node = self.nodes.get(target_node)
+        commanded = bool(node and bus.direction in node.dbl_commanded)
+        if not live_cfg.get("dbl_enabled", False) and not commanded:
             return False
         leg = bus.get_active_route_leg(INT_X)
         return bool(leg and leg["node_x"] == target_node)
@@ -1645,10 +1741,29 @@ class SignalController:
         ):
             request.denial_or_cancel_reason = "FEATURE_DISABLED"
             return False
+        # The gate's lane check, re-run every frame the request lives: a
+        # vehicle that was moving when DBL was accepted and has since stopped
+        # ahead of the bus makes the reserved lane useless, so DBL is revoked
+        # -- the request ends if it was DBL only, else it carries on as TSP.
+        if request.dbl_requested and dbl_lane_queue_ahead(
+            request.bus, vehicles, H_Y, target_node=request.node_x, lane_w=LANE
+        ):
+            request.dbl_revoke_reason = DBL_REVOKED_LANE_BLOCKED
+            if not request.tsp_requested:
+                request.denial_or_cancel_reason = DBL_REVOKED_LANE_BLOCKED
+                return False
+            request.dbl_requested = request.dbl_granted = False
+            request.entry_lane = leg["entry_lane"]
         return True
 
     def _normal_phase_update(self, node, vehicles, node_x):
         node.timer += 1
+        if node.phase not in (0, 3):
+            node.cut_pending = False
+        elif node.cut_pending and node.timer >= self.min_green_frames:
+            node.cut_pending = False
+            self._advance_phase(node)
+            return
         if node.phase in (0, 3):
             maximum = self.get_green_time(node_x, node.phase)
         elif node.phase in (1, 4):
@@ -1693,13 +1808,24 @@ class SignalController:
 
     def _request_can_start_tsp(self, request, node_x, vehicles):
         """Feasibility gate: one bounded action per request, only for a bus
-        that can actually use it and is still upstream of the stop bar."""
-        return (
+        that can actually use it, is still upstream of the stop bar, and has
+        room in the lane its movement enters (re-checked every frame; the
+        request stays armed and a bus that crosses untreated is DENIED with
+        the gate reason)."""
+        if not (
             request.tsp_requested
             and request.tsp_action == TSP_ACTION_NONE
             and self._bus_can_use_grant(request, node_x, vehicles)
             and request.bus.is_front_bumper_upstream(node_x, H_Y, ROAD_W, STOP)
-        )
+        ):
+            return False
+        bus = request.bus
+        if bus.receiving_space_px(node_x, vehicles, H_Y, ROAD_W, LANE) < bus.length + SAFE_GAP_PX:
+            request.tsp_gate_reason = TSP_DENY_DOWNSTREAM_BLOCKED
+            return False
+        if request.tsp_gate_reason == TSP_DENY_DOWNSTREAM_BLOCKED:
+            request.tsp_gate_reason = ""
+        return True
 
     def _terminal_state_for(self, request):
         if request.denial_or_cancel_reason == "REQUEST_TIMEOUT":
@@ -1807,6 +1933,24 @@ class SignalController:
         node.timer += 1
         request.tsp_adjust_frames = node.priority_timer
 
+    def _extension_is_feasible(self, request, node_x, cap):
+        """Arrival-time gate on an extension, the twin of the early-green
+        gate: the bus must be predicted to cross the stop bar within the cap
+        (ETA at its current speed, the shared estimator). Otherwise the green
+        is held for a bus that still meets the red at the end of it -- the
+        cross street pays the whole cap for nothing -- so the green ends on
+        time and the request stays armed for an early green instead. A bus
+        that then crosses untreated finishes DENIED with this reason."""
+        bus = request.bus
+        eta = eta_frames_to_stop_bar(
+            self.distance_to_node_stop_bar(bus, node_x), bus.speed
+        )
+        if eta > cap:
+            request.tsp_gate_reason = TSP_DENY_ETA_WINDOW
+            return False
+        request.tsp_gate_reason = ""
+        return True
+
     def _early_green_is_feasible(self, node, request, node_x, target_end, cut):
         """Arrival-time gate on a truncation, evaluated afresh every frame.
 
@@ -1845,6 +1989,13 @@ class SignalController:
         conflicting = node.phase
         green = self.get_green_time(node_x, conflicting)
         cap = self._tsp_cap_frames(node_x, conflicting)
+        # The cut is cap-sized and the ARRIVAL WINDOW gates it
+        # (_early_green_is_feasible), deliberately: sizing the cut to the ETA
+        # point estimate was tried on 2026-09-22 and regressed T1/T2, because
+        # eta_frames_to_stop_bar reads the bus's INSTANTANEOUS speed and so
+        # runs long for a bus that is still accelerating -- a near bus then
+        # yields cut == 0 and never gets its early green. Fix the estimator
+        # before sizing anything from it.
         shortened = max(self.min_green_frames, green - cap)
         target_end = max(node.timer + 1, shortened)
         cut = green - target_end
@@ -1900,7 +2051,7 @@ class SignalController:
                 # now with the bus still upstream.
                 if node.timer + 1 >= self.get_green_time(node_x, bus_phase):
                     cap = self._tsp_cap_frames(node_x, bus_phase)
-                    if cap > 0:
+                    if cap > 0 and self._extension_is_feasible(request, node_x, cap):
                         self._begin_extension(node, request, cap)
                         return
             elif node.phase == self._conflicting_phase(bus_phase):
@@ -1919,9 +2070,14 @@ class SignalController:
             self._update_discharge(vehicles)
             self._publish_discharge_status()
             return
-        self._collect_priority_requests(vehicles)
-        for node_x, node in self.nodes.items():
-            self._priority_update(node_x, node, vehicles)
+        if self.plan_active:
+            for node_x, node in self.nodes.items():
+                self.experiment_metrics["dbl_total_active_frames"] += len(node.dbl_commanded)
+                self._normal_phase_update(node, vehicles, node_x)
+        else:
+            self._collect_priority_requests(vehicles)
+            for node_x, node in self.nodes.items():
+                self._priority_update(node_x, node, vehicles)
         self._publish_discharge_status()
 
     def get_experiment_metrics(self):
@@ -2003,8 +2159,24 @@ class SignalController:
             if node_x in self.nodes
         }
 
+    def _commanded_dbl_dict(self, node_x, direction):
+        return {
+            "request_id": None, "bus_id": None, "route_id": None,
+            "route_leg_index": None, "node_x": node_x,
+            "originating_approach": direction, "movement": None,
+            "entry_lane": DBL_LANE_INDEX, "exit_direction": None,
+            "conflicting_approaches": [], "requested_at_frame": None,
+            "state": "ACTIVE", "expires_at_frame": None,
+            "denial_or_cancel_reason": "", "tsp_requested": False,
+            "dbl_requested": True, "attempt_number": 0, "tsp_action": TSP_ACTION_NONE,
+            "tsp_adjust_frames": 0, "tsp_gate_reason": "", "dbl_revoke_reason": "",
+            "commanded": True,
+        }
+
     def is_dbl_active_for_approach(self, target_node_x, direction, all_vehicles=None):
         node = self.nodes.get(target_node_x)
+        if node and direction in node.dbl_commanded:
+            return True
         if not node or not node.active_request:
             return False
         request = node.active_request
@@ -2012,6 +2184,12 @@ class SignalController:
 
     def get_active_dbl_request(self, target_node_x, direction=None):
         node = self.nodes.get(target_node_x)
+        if node and node.dbl_commanded:
+            commanded = direction if direction in node.dbl_commanded else (
+                sorted(node.dbl_commanded)[0] if direction is None else None
+            )
+            if commanded is not None:
+                return self._commanded_dbl_dict(target_node_x, commanded)
         if not node or not node.active_request or not node.active_request.dbl_requested:
             return None
         request = node.active_request
@@ -2030,6 +2208,8 @@ class SignalController:
             }
             node = self.nodes.get(node_x)
             if node:
+                for approach in node.dbl_commanded:
+                    result[approach] = "ACTIVE"
                 for queued in node.request_queue:
                     if queued.dbl_requested:
                         result[queued.originating_approach] = "TRANSITIONING"
@@ -2080,6 +2260,21 @@ class SignalController:
             "terminal_history": list(node.terminal_history),
             "reservation_count": len(node.reservations),
         }
+
+    def routes_with_live_requests(self):
+        """Route IDs with a request the controller currently holds (armed,
+        queued or adjusting) at any node. The decision merge keeps these
+        routes' flags as they are: a request is only ever created under an
+        enabled flag, and the flag dropping cancels it (FEATURE_DISABLED) --
+        so a stale or held decision, or a decider working from a snapshot
+        taken before the request existed, must not withdraw a treatment the
+        safety authority already committed to. Flags gate *new* requests."""
+        routes = set()
+        for node in self.nodes.values():
+            for request in (node.active_request, *node.request_queue):
+                if request is not None:
+                    routes.add(request.route_id)
+        return routes
 
     def get_priority_status_for_bus(self, bus, node_x):
         node = self.nodes.get(node_x)

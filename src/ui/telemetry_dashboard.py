@@ -92,14 +92,31 @@ def _runtime_tag(runtime_sim_seconds):
     return f"{text or '0'}sec"
 
 
+def _model_mode_tag(model, control_mode=None):
+    """The filename's first field: the arm, and its mode when that is a choice.
+
+    An LLM is the only decider that can run either assisted or configured, so
+    only an LLM arm carries the mode -- ``llama3-1-8b-assisted`` against
+    ``llama3-1-8b-configured``. Without it the two arms of one model differed
+    in nothing but their timestamp. Baseline and the rule comparators name
+    themselves and are always assisted, so they stay exactly as before and
+    every existing filename keeps its meaning. The word matches the
+    ``control_mode`` summary column, so a workbook joins to its CSV row.
+    """
+    name = "baseline" if str(model or "None") == "None" else model
+    tag = _filename_tag(name, "baseline")
+    mode = str(control_mode or control_panel.CONTROL_MODE_ASSISTED)
+    strategy = control_panel.strategy_for(str(model or "None"), mode)
+    if control_panel.is_llm_strategy(strategy):
+        tag = f"{tag}-{_filename_tag(mode, control_panel.CONTROL_MODE_ASSISTED)}"
+    return tag
+
+
 def build_excel_export_filename(
-    model, runtime_sim_seconds, seed, timestamp=None
+    model, runtime_sim_seconds, seed, timestamp=None, control_mode=None
 ):
-    """Build ``model_runtime_seed_DDMMYYYY_HHMMSS.xlsx`` filenames."""
-    model_tag = _filename_tag(
-        "baseline" if str(model or "None") == "None" else model,
-        "baseline",
-    )
+    """Build ``model[-mode]_runtime_seed_DDMMYYYY_HHMMSS.xlsx`` filenames."""
+    model_tag = _model_mode_tag(model, control_mode)
     seed_tag = (
         f"{_filename_tag(seed, 'no')}seed" if seed is not None else "noseed"
     )
@@ -454,6 +471,23 @@ class TelemetryDashboard:
             self.root.resizable(True, True)
         self.root.configure(bg=COLOR_BG)
         self._resize_after_id = None
+        self._poll_after_ids = set()
+        self._destroyed = False
+        # Debounce timers for redraws bound directly to a canvas/page
+        # <Configure> (node diagrams, trend charts, phase cycle, notebook
+        # height): each fires once per canvas per resize step instead of
+        # once per <Configure> event, the same coalescing
+        # schedule_responsive_layout already does for the responsive pass --
+        # without it, a maximize/restore's flood of Configure events queued
+        # a full redraw of every chart and diagram on each one, which is
+        # what made rescaling between window shapes visibly slow to settle.
+        self._DEBOUNCED_REDRAW_TIMERS = (
+            "_node_diagram_after_id", "_trend_chart_after_id",
+            "_phase_cycle_after_id", "_notebook_height_after_id",
+        )
+        for timer_attr in self._DEBOUNCED_REDRAW_TIMERS:
+            setattr(self, timer_attr, None)
+        self.root.bind("<Destroy>", self._on_destroy, add="+")
         self.initialize_history_state()
         self.initialize_llm_monitor_state()
         self.latest_telemetry = None
@@ -472,10 +506,63 @@ class TelemetryDashboard:
         self.root.bind("<Configure>", self.schedule_responsive_layout, add="+")
         if self.viewport is not self.root:
             self.viewport.bind("<Configure>", self.schedule_responsive_layout, add="+")
-        self.root.after_idle(self.apply_responsive_layout)
+        self._schedule_poll("idle", self.apply_responsive_layout)
         start_gpu_poll_thread()
         self.poll_telemetry()
         self.poll_llm_performance()
+
+    def _schedule_poll(self, delay, callback):
+        if getattr(self, "_destroyed", False):
+            return None
+        if not hasattr(self, "_poll_after_ids"):
+            # Lightweight test doubles construct only the poll method's inputs.
+            return self.root.after(delay, callback)
+        holder = {}
+
+        def run_callback():
+            self._poll_after_ids.discard(holder["id"])
+            if not self._destroyed:
+                callback()
+
+        holder["id"] = (
+            self.root.after_idle(run_callback)
+            if delay == "idle" else self.root.after(delay, run_callback)
+        )
+        self._poll_after_ids.add(holder["id"])
+        return holder["id"]
+
+    def _on_destroy(self, event):
+        if event.widget is not self.root:
+            return
+        self._destroyed = True
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+            self._resize_after_id = None
+        for timer_attr in self._DEBOUNCED_REDRAW_TIMERS:
+            pending = getattr(self, timer_attr, None)
+            if pending is not None:
+                self.root.after_cancel(pending)
+                setattr(self, timer_attr, None)
+        for after_id in tuple(self._poll_after_ids):
+            self.root.after_cancel(after_id)
+        self._poll_after_ids.clear()
+
+    def _debounce_redraw(self, timer_attr, callback, delay_ms=35):
+        """Coalesce a burst of <Configure> events on one canvas/page into a
+        single ``callback()`` call, the way schedule_responsive_layout
+        already debounces the responsive-layout pass."""
+        if self._destroyed:
+            return
+        pending = getattr(self, timer_attr, None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+
+        def fire():
+            setattr(self, timer_attr, None)
+            if not self._destroyed:
+                callback()
+
+        setattr(self, timer_attr, self.root.after(delay_ms, fire))
 
     @staticmethod
     def initial_window_size(screen_width, screen_height):
@@ -791,10 +878,16 @@ class TelemetryDashboard:
             row=0, column=1, sticky="nsew", padx=(5, 0)
         )
         self.node_a_canvas.bind(
-            "<Configure>", lambda _event: self.draw_node_intersections()
+            "<Configure>",
+            lambda _event: self._debounce_redraw(
+                "_node_diagram_after_id", self.draw_node_intersections
+            ),
         )
         self.node_b_canvas.bind(
-            "<Configure>", lambda _event: self.draw_node_intersections()
+            "<Configure>",
+            lambda _event: self._debounce_redraw(
+                "_node_diagram_after_id", self.draw_node_intersections
+            ),
         )
         self.build_trends_ui()
         self.build_llm_performance_ui()
@@ -864,7 +957,13 @@ class TelemetryDashboard:
         # A page's own content changing height (a longer Units section, the
         # recovery panel expanding, a font change from responsive layout)
         # must re-pin the notebook the same way switching tabs does.
-        page.bind("<Configure>", self.sync_notebook_height, add="+")
+        page.bind(
+            "<Configure>",
+            lambda _event: self._debounce_redraw(
+                "_notebook_height_after_id", self.sync_notebook_height
+            ),
+            add="+",
+        )
         self.refresh_tab_strip()
 
     def refresh_tab_strip(self, _event=None):
@@ -1343,7 +1442,10 @@ class TelemetryDashboard:
         self.phase_cycle_canvas.pack(fill="x", padx=6, pady=(0, 5))
         self.phase_cycle_canvas.bind(
             "<Configure>",
-            lambda _event: self.draw_phase_cycle(self.latest_telemetry),
+            lambda _event: self._debounce_redraw(
+                "_phase_cycle_after_id",
+                lambda: self.draw_phase_cycle(self.latest_telemetry),
+            ),
         )
 
     def build_webster_timing_ui(self):
@@ -1847,7 +1949,12 @@ class TelemetryDashboard:
             "title_label": title_label,
         }
         self.trend_charts.append(chart)
-        canvas.bind("<Configure>", lambda _event: self.draw_trend_charts())
+        canvas.bind(
+            "<Configure>",
+            lambda _event: self._debounce_redraw(
+                "_trend_chart_after_id", self.draw_trend_charts
+            ),
+        )
         return canvas
 
     def create_node_canvas(self, parent, title):
@@ -2615,7 +2722,7 @@ class TelemetryDashboard:
             # stop either the LLM monitor or the main telemetry dashboard.
             pass
         finally:
-            self.root.after(LLM_POLL_MILLISECONDS, self.poll_llm_performance)
+            self._schedule_poll(LLM_POLL_MILLISECONDS, self.poll_llm_performance)
 
     @staticmethod
     def _write_decision_rows(sheet, decisions):
@@ -2741,6 +2848,7 @@ class TelemetryDashboard:
             ai_runtime.get("model", "None"),
             self._session_runtime_seconds(),
             config.get("random_seed"),
+            control_mode=ai_runtime.get("control_mode"),
         )
 
     def _add_ai_decision_audit_sheet(
@@ -3434,7 +3542,7 @@ class TelemetryDashboard:
             self.last_read_error = str(exc)
             self.status_lbl.config(text="TELEMETRY ERROR", fg=COLOR_DANGER)
         finally:
-            self.root.after(250, self.poll_telemetry)
+            self._schedule_poll(250, self.poll_telemetry)
 
     def clear_history(self):
         """Clear this dashboard process's samples without touching telemetry."""

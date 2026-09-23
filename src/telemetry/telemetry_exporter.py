@@ -14,6 +14,8 @@ from src.core.vehicle import (
     dbl_lane_is_obstructed,
     dbl_lane_queue_ahead,
     eta_frames_to_stop_bar,
+    receiving_space_px,
+    SAFE_GAP_PX,
 )
 from src.telemetry import real_world_units as units
 
@@ -29,13 +31,13 @@ APPROACHES = ("EB", "WB", "NB", "SB")
 # shorter than about two queued vehicles (car length plus standing gap each),
 # i.e. a vehicle released into it has essentially nowhere to go.
 DOWNSTREAM_BLOCKED_PX = 2 * units.SIM_QUEUE_SPACING_PX
-# Standing gap a stopped vehicle keeps to the one ahead (vehicle.py SAFE_GAP).
-VEHICLE_QUEUE_GAP_PX = units.SIM_QUEUE_GAP_PX
 
 
 class TelemetryExporter:
-    def __init__(self, filename=DEFAULT_TELEMETRY_PATH, export_interval_frames=10):
-        self.filename = Path(filename).resolve()
+    def __init__(self, filename=None, export_interval_frames=10):
+        # Default read at call time so a test that redirects it never writes
+        # the live file under a running simulator.
+        self.filename = Path(DEFAULT_TELEMETRY_PATH if filename is None else filename).resolve()
         self.export_interval = max(1, int(export_interval_frames))
         self.frame_counter = 0
         self._throughput_samples = []
@@ -77,6 +79,15 @@ class TelemetryExporter:
             if vehicle.direction not in ("EB", "WB", "NB", "SB"):
                 continue
             yield node_key, vehicle.direction, vehicle
+
+    def compute_left_turners_lane2_by_node(self, vehicles):
+        """Queued left-turners sitting in lane 2, by node and approach: under
+        a commanded bus lane they share it with the bus (AI Configured)."""
+        counts = self._empty_queue_table()
+        for node_key, approach, vehicle in self._iter_queued_vehicles(vehicles):
+            if getattr(vehicle, "target_turn", None) == "LEFT" and getattr(vehicle, "lane_index", None) == 2:
+                counts[node_key][approach] += 1
+        return counts
 
     def compute_queue_counts_by_node(self, vehicles):
         """Count stopped upstream vehicles by node and physical approach."""
@@ -156,70 +167,61 @@ class TelemetryExporter:
         }
 
     @staticmethod
-    def _downstream_stretch(node_x, approach):
-        """Return (axis, low, high) for the road a movement enters after node_x.
-
-        The stretch runs from the far edge of the node's conflict box, in the
-        approach's direction of travel, to the next node's conflict box or the
-        canvas edge, whichever comes first. Straight-through travel only.
-        """
-        half_w = canvas.ROAD_W / 2.0
-        sorted_nodes = sorted(canvas.INT_X)
+    def _lane_centres(node_x, approach):
+        """Cross coordinate of lanes 0..2 for an approach at ``node_x``."""
+        offsets = [(index + 0.5) * canvas.LANE for index in range(canvas.LANES)]
         if approach == "EB":
-            nexts = [nx for nx in sorted_nodes if nx > node_x]
-            end = (nexts[0] - half_w) if nexts else float(canvas.WIDTH)
-            return "x", node_x + half_w, end
+            return [canvas.H_Y - o for o in offsets]
         if approach == "WB":
-            prevs = [nx for nx in sorted_nodes if nx < node_x]
-            start = (prevs[-1] + half_w) if prevs else 0.0
-            return "x", start, node_x - half_w
+            return [canvas.H_Y + o for o in offsets]
         if approach == "NB":
-            return "y", 0.0, canvas.H_Y - half_w
-        return "y", canvas.H_Y + half_w, float(canvas.HEIGHT)
+            return [node_x - o for o in offsets]
+        return [node_x + o for o in offsets]
+
+    def compute_downstream_space_by_lane(self, vehicles):
+        """Free road beyond each node per approach and receiving lane, in px:
+        node key -> approach -> [lane 0, lane 1, lane 2], each the distance
+        from the conflict box to the tail of the nearest standing vehicle in
+        that lane (vehicle.receiving_space_px, the same measure the spillback
+        hold and the TSP gate use)."""
+        return {
+            str(node_x): {
+                approach: [
+                    receiving_space_px(
+                        node_x, approach, "STRAIGHT", cross, vehicles,
+                        canvas.H_Y, canvas.ROAD_W, canvas.LANE,
+                    )
+                    for cross in self._lane_centres(node_x, approach)
+                ]
+                for approach in APPROACHES
+            }
+            for node_x in canvas.INT_X
+        }
+
+    @staticmethod
+    def _downstream_from_lanes(by_lane_px):
+        """(space_m, blocked) per node and approach from the per-lane figures:
+        the space is the best receiving lane's, and an approach is blocked
+        only when every lane is (a bus's own lane is judged per bus)."""
+        space_m = {
+            node_key: {
+                approach: round(units.px_to_m(max(lanes)), 1)
+                for approach, lanes in row.items()
+            }
+            for node_key, row in by_lane_px.items()
+        }
+        blocked = {
+            node_key: {
+                approach: all(px < DOWNSTREAM_BLOCKED_PX for px in lanes)
+                for approach, lanes in row.items()
+            }
+            for node_key, row in by_lane_px.items()
+        }
+        return space_m, blocked
 
     def compute_downstream_space_by_node(self, vehicles):
-        """Estimate the free road on the far side of each node, per approach.
-
-        Returns (space_m, blocked): both are node key -> approach dicts. The
-        free space is the downstream stretch length minus the room taken by
-        vehicles already travelling on it (each vehicle's length plus one
-        standing gap), spread across the approach's lanes so the figure reads
-        as metres of free road per lane. ``blocked`` is True when that free
-        space is under ``DOWNSTREAM_BLOCKED_PX``: a green would only release
-        vehicles into a road that cannot absorb them.
-        """
-        half_w = canvas.ROAD_W / 2.0
-        space_m = self._empty_queue_table()
-        blocked = {
-            node_key: {approach: False for approach in APPROACHES}
-            for node_key in space_m
-        }
-        for node_x in canvas.INT_X:
-            node_key = str(node_x)
-            for approach in APPROACHES:
-                axis, low, high = self._downstream_stretch(node_x, approach)
-                length_px = max(0.0, high - low)
-                occupied_px = 0.0
-                for vehicle in vehicles:
-                    if vehicle.direction != approach:
-                        continue
-                    if axis == "x":
-                        along, across = vehicle.x, vehicle.y
-                        # Same horizontal road; the direction filter already
-                        # picks the EB or WB carriageway.
-                        on_road = abs(across - canvas.H_Y) <= half_w
-                    else:
-                        along, across = vehicle.y, vehicle.x
-                        # Vertical roads are node-specific.
-                        on_road = abs(across - node_x) <= half_w
-                    if on_road and low <= along <= high:
-                        occupied_px += float(vehicle.length) + VEHICLE_QUEUE_GAP_PX
-                free_px = max(
-                    0.0, length_px - occupied_px / max(1, canvas.LANES)
-                )
-                space_m[node_key][approach] = round(units.px_to_m(free_px), 1)
-                blocked[node_key][approach] = free_px < DOWNSTREAM_BLOCKED_PX
-        return space_m, blocked
+        """(space_m, blocked) per node and approach; see _downstream_from_lanes."""
+        return self._downstream_from_lanes(self.compute_downstream_space_by_lane(vehicles))
 
     @staticmethod
     def _flatten_queue_counts(queues_by_node):
@@ -310,9 +312,14 @@ class TelemetryExporter:
             5: "ALL_RED",
         }.get(node_status["phase_index"], "UNKNOWN")
 
-    def _bus_state(self, bus, signal_controller):
+    def _bus_state(self, bus, signal_controller, vehicles=()):
         leg = bus.get_active_route_leg(canvas.INT_X)
         target_node = leg["node_x"] if leg else bus.get_next_target_node(canvas.INT_X)
+        # The bus's own movement and lane, not the approach's straight
+        # average: the same measure the controller's TSP gate reads.
+        receiving_px = bus.receiving_space_px(
+            target_node, vehicles, canvas.H_Y, canvas.ROAD_W, canvas.LANE
+        )
         distance = bus.distance_to_node_stop_bar(
             target_node, canvas.H_Y, canvas.ROAD_W, canvas.STOP
         )
@@ -351,6 +358,8 @@ class TelemetryExporter:
             "target_turn": bus.target_turn,
             "route_leg": leg,
             "leg_state": bus.leg_state,
+            "receiving_space_m": round(units.px_to_m(receiving_px), 1),
+            "receiving_blocked": receiving_px < bus.length + SAFE_GAP_PX,
             "tsp_enabled": bool(live_cfg.get("tsp_enabled", False)),
             "dbl_enabled": bool(live_cfg.get("dbl_enabled", False)),
             "priority_requested": priority is not None,
@@ -383,9 +392,19 @@ class TelemetryExporter:
         queues_passengers_by_node = self.compute_queue_passengers_by_node(vehicles)
         queues_passengers = self._flatten_queue_counts(queues_passengers_by_node)
         queue_length_m_by_node = self.compute_queue_length_by_node(vehicles)
+        left_turners_lane2_by_node = self.compute_left_turners_lane2_by_node(vehicles)
+        signal_plan = signal_controller.get_plan() if hasattr(signal_controller, "get_plan") else None
+        downstream_by_lane_px = self.compute_downstream_space_by_lane(vehicles)
         downstream_space_m_by_node, downstream_blocked_by_node = (
-            self.compute_downstream_space_by_node(vehicles)
+            self._downstream_from_lanes(downstream_by_lane_px)
         )
+        downstream_space_m_by_lane = {
+            node_key: {
+                approach: [round(units.px_to_m(px), 1) for px in lanes]
+                for approach, lanes in row.items()
+            }
+            for node_key, row in downstream_by_lane_px.items()
+        }
         demand_state = demand_state or {}
         throughput_state = throughput_state or {}
         pending_demand = sum(
@@ -401,13 +420,18 @@ class TelemetryExporter:
         car_delay_frames = int(
             throughput_state.get("car_passenger_delay_frames", 0) or 0
         )
+        # Means divide the completed cohort only (main.network_throughput's
+        # completed_* counters); the totals above include unfinished vehicles.
+        def _completed_mean(key, denominator, scale=60.0):
+            value = float(throughput_state.get(key, 0) or 0) / scale
+            return round(value / denominator, 2) if denominator else None
         bus_pax_served = int(throughput_state.get("passengers_served_bus", 0) or 0)
         car_pax_served = int(throughput_state.get("passengers_served_car", 0) or 0)
         bus_passenger_delay_sec = round(bus_delay_frames / 60.0, 1)
         car_passenger_delay_sec = round(car_delay_frames / 60.0, 1)
         vehicle_positions = self.build_vehicle_position_snapshot(vehicles)
         buses = [
-            self._bus_state(vehicle, signal_controller)
+            self._bus_state(vehicle, signal_controller, vehicles)
             for vehicle in vehicles
             if isinstance(vehicle, Bus)
         ]
@@ -520,7 +544,10 @@ class TelemetryExporter:
                 ),
                 "queue_length_m": queue_length_m_by_node[node_key],
                 "downstream_space_m": downstream_space_m_by_node[node_key],
+                "downstream_space_m_by_lane": downstream_space_m_by_lane[node_key],
                 "downstream_blocked": downstream_blocked_by_node[node_key],
+                "left_turners_lane2": left_turners_lane2_by_node[node_key],
+                "dbl_commanded": (signal_plan or {}).get(node_key, {}).get("dbl", []),
             }
 
         # Per-bus arrival test, the one fact that decides whether TSP can help
@@ -577,6 +604,9 @@ class TelemetryExporter:
             "schema_version": 3,
             "timestamp": round(time.time(), 3),
             "frame_number": frame_number,
+            # The run this snapshot belongs to: a decision is only merged
+            # back into the run it was made for (main.merge_ai_decision).
+            "run_uuid": str(control_panel.global_config.get("_run_uuid", "") or ""),
             "simulation_time_seconds": round(simulation_seconds, 3),
             "simulation_running": bool(
                 control_panel.global_config.get("is_running", False)
@@ -617,6 +647,11 @@ class TelemetryExporter:
                     * (green_frames + yellow_frames + all_red_frames),
                 },
                 "nodes": node_states,
+                # AI Configured: the plan in force (None = Webster) and the mode.
+                "plan": signal_plan,
+                "control_mode": str(
+                    control_panel.global_config.get("ai_runtime", {}).get("control_mode", "assisted")
+                ),
             },
             "network_discharge": discharge_status,
             "network_summary": {
@@ -664,9 +699,17 @@ class TelemetryExporter:
                 # threshold, and its mean per served vehicle (HCM control
                 # delay proxy for the Units tab's level of service).
                 "stopped_vehicle_seconds": round(stopped_frames / 60.0, 1),
-                "mean_stopped_delay_sec_per_vehicle": (
-                    round(stopped_frames / 60.0 / vehicles_served, 2)
-                    if vehicles_served else None
+                "mean_stopped_delay_sec_per_vehicle": _completed_mean(
+                    "completed_stopped_vehicle_frames", vehicles_served
+                ),
+                # Arrival-to-departure (HCM control) delay per completed
+                # vehicle, over the whole route: the LOS input.
+                "mean_control_delay_sec_per_vehicle": _completed_mean(
+                    "completed_control_delay_frames", vehicles_served
+                ),
+                "passenger_hours_in_network": round(
+                    int(throughput_state.get("passenger_frames_in_network", 0) or 0)
+                    / 60.0 / 3600.0, 4
                 ),
             },
             # Passenger-weighted delay, split bus vs car/truck: the standard
@@ -675,13 +718,11 @@ class TelemetryExporter:
             "delay": {
                 "bus_passenger_delay_sec": bus_passenger_delay_sec,
                 "car_passenger_delay_sec": car_passenger_delay_sec,
-                "mean_bus_passenger_delay_sec": (
-                    round(bus_passenger_delay_sec / bus_pax_served, 2)
-                    if bus_pax_served else None
+                "mean_bus_passenger_delay_sec": _completed_mean(
+                    "completed_bus_passenger_delay_frames", bus_pax_served
                 ),
-                "mean_car_passenger_delay_sec": (
-                    round(car_passenger_delay_sec / car_pax_served, 2)
-                    if car_pax_served else None
+                "mean_car_passenger_delay_sec": _completed_mean(
+                    "completed_car_passenger_delay_frames", car_pax_served
                 ),
                 "total_person_hours_delay": round(
                     (bus_passenger_delay_sec + car_passenger_delay_sec) / 3600.0, 4

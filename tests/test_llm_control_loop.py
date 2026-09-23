@@ -20,6 +20,14 @@ def isolate_agent_turn_log(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "TURN_LOG_PATH", tmp_path / "agent_turn_log.jsonl")
 
 
+RUN_ID = "run-under-test"
+
+
+@pytest.fixture(autouse=True)
+def _decisions_belong_to_this_run(monkeypatch):
+    monkeypatch.setitem(control_panel.global_config, "_run_uuid", RUN_ID)
+
+
 def valid_flags(tsp_route=None, dbl_route=None):
     flags = guard.all_off_flags()
     if tsp_route:
@@ -107,7 +115,7 @@ def test_position_one_tsp_reaches_merge_and_signal_controller(
     assert decision["flags"][route_id] == {"tsp": True, "dbl": False}
 
     decision_path = tmp_path / "decision.json"
-    decision_path.write_text(json.dumps(decision), encoding="utf-8")
+    decision_path.write_text(json.dumps(dict(decision, run_uuid=RUN_ID)), encoding="utf-8")
     runtime = {"tick_seconds": 5, "last_status": "INACTIVE"}
     monkeypatch.setitem(control_panel.global_config, "ai_runtime", runtime)
 
@@ -260,6 +268,7 @@ def test_control_panel_writes_atomic_agent_control_and_discovers_models(
         "model": "local-model:latest",
         "tick_seconds": 9,
         "simulation_running": False,
+        "control_mode": "assisted",
     }
     assert list(tmp_path.iterdir()) == [destination]
 
@@ -451,9 +460,10 @@ def test_main_merge_applies_valid_flags_and_rejects_invalid_flags(
     decision_path = tmp_path / "decision.json"
     decision_path.write_text(
         json.dumps(
-            {
+            {"run_uuid": RUN_ID, 
                 "schema_version": 1,
                 "turn": 42,
+                "model": "test-model",
                 "timestamp": main.time.time(),
                 "status": "OK",
                 "flags": valid_flags(
@@ -471,7 +481,8 @@ def test_main_merge_applies_valid_flags_and_rejects_invalid_flags(
     assert runtime["last_status"] == "OK"
     assert runtime["last_turn"] == 42
 
-    invalid = {"timestamp": main.time.time(), "flags": valid_flags()}
+    invalid = {"run_uuid": RUN_ID, "model": "test-model", "turn": 43,
+               "timestamp": main.time.time(), "flags": valid_flags()}
     del invalid["flags"]["R6_WB_ONLY"]
     decision_path.write_text(json.dumps(invalid), encoding="utf-8")
     assert not main.merge_ai_decision(decision_path)
@@ -502,7 +513,7 @@ def test_fresh_decision_applies(tmp_path, monkeypatch):
     decision_path = tmp_path / "decision.json"
     flags = valid_flags(tsp_route="R1_EB_A_NB")
     decision_path.write_text(
-        json.dumps({"timestamp": now, "status": "OK", "flags": flags}),
+        json.dumps({"run_uuid": RUN_ID, "timestamp": now, "status": "OK", "flags": flags}),
         encoding="utf-8",
     )
 
@@ -519,7 +530,7 @@ def test_stale_decision_held_all_off(tmp_path, monkeypatch):
     decision_path = tmp_path / "decision.json"
     decision_path.write_text(
         json.dumps(
-            {
+            {"run_uuid": RUN_ID, 
                 "timestamp": now - 3600,
                 "status": "OK",
                 "flags": valid_flags(dbl_route="R4_WB_A_SB"),
@@ -542,7 +553,7 @@ def test_missing_timestamp_treated_stale(tmp_path, monkeypatch):
     monkeypatch.setitem(control_panel.global_config, "ai_runtime", runtime)
     decision_path = tmp_path / "decision.json"
     decision_path.write_text(
-        json.dumps({"status": "OK", "flags": valid_flags(tsp_route="R2_EB_B_NB")}),
+        json.dumps({"run_uuid": RUN_ID, "status": "OK", "flags": valid_flags(tsp_route="R2_EB_B_NB")}),
         encoding="utf-8",
     )
 
@@ -563,7 +574,7 @@ def test_invalid_timestamp_treated_stale(tmp_path, monkeypatch):
     for invalid_timestamp in ("not-a-time", float("nan"), float("inf")):
         decision_path.write_text(
             json.dumps(
-                {
+                {"run_uuid": RUN_ID, 
                     "timestamp": invalid_timestamp,
                     "status": "OK",
                     "flags": valid_flags(tsp_route="R6_WB_ONLY"),
@@ -589,14 +600,14 @@ def test_stale_threshold_scales_with_tick(tmp_path, monkeypatch):
     flags = valid_flags(tsp_route="R3_EB_ONLY")
 
     decision_path.write_text(
-        json.dumps({"timestamp": now - 20, "status": "OK", "flags": flags}),
+        json.dumps({"run_uuid": RUN_ID, "timestamp": now - 20, "status": "OK", "flags": flags}),
         encoding="utf-8",
     )
     assert main.merge_ai_decision(decision_path)
     assert control_panel.bus_routes_config["R3_EB_ONLY"]["tsp_enabled"] is True
 
     decision_path.write_text(
-        json.dumps({"timestamp": now - 50, "status": "OK", "flags": flags}),
+        json.dumps({"run_uuid": RUN_ID, "timestamp": now - 50, "status": "OK", "flags": flags}),
         encoding="utf-8",
     )
     assert not main.merge_ai_decision(decision_path)
@@ -611,7 +622,7 @@ def test_agent_death_self_heals(tmp_path, monkeypatch):
     decision_path = tmp_path / "decision.json"
     decision_path.write_text(
         json.dumps(
-            {
+            {"run_uuid": RUN_ID, 
                 "timestamp": clock["now"],
                 "status": "OK",
                 "flags": valid_flags(dbl_route="R5_WB_B_SB"),
@@ -1717,9 +1728,16 @@ def test_langgraph_runs_one_complete_network_turn(tmp_path, monkeypatch):
         ),
     )
 
-    result = agent.build_graph().invoke(agent_state(turn=11))
+    result = agent.build_graph().invoke(
+        agent_state(turn=11, run_uuid="RUN-7", telemetry_frame=4242)
+    )
 
     assert result["decision"]["status"] == "OK"
+    # Through the compiled graph, not a plain dict: a state key LangGraph
+    # does not declare is dropped, and the published decision would carry
+    # run_uuid "" -- refused by main.merge_ai_decision as FOREIGN_DECISION.
+    published = json.loads(agent.DECISION_PATH.read_text(encoding="utf-8"))
+    assert published["run_uuid"] == "RUN-7" and published["telemetry_frame"] == 4242
     assert result["decision"]["flags"] == flags
     assert result["decision"]["reason"] == reason
     assert result["recent_decisions"][-1]["turn"] == 11
@@ -1795,15 +1813,25 @@ def test_read_ai_control_is_fail_closed_and_clamps_tick(tmp_path):
 
     control_path = tmp_path / "ai_control.json"
     control_path.write_text(
-        json.dumps({"armed": True, "model": "m", "tick_seconds": 99}),
+        json.dumps({"armed": True, "model": "m", "tick_seconds": 999}),
         encoding="utf-8",
     )
     assert agent.read_ai_control(control_path) == {
         "armed": True,
         "model": "m",
-        "tick_seconds": 15,
+        "tick_seconds": control_panel.TICK_SECONDS_MAX,
         "simulation_running": False,
+        "control_mode": "assisted",
     }
+    # One decision per ~50 s signal cycle must be representable: a tick
+    # below the slowest arm's latency measures a disconnected loop.
+    assert control_panel.TICK_SECONDS_MAX >= 60
+    control_path.write_text(
+        json.dumps({"armed": True, "model": "m", "tick_seconds": 60}),
+        encoding="utf-8",
+    )
+    assert agent.read_ai_control(control_path)["tick_seconds"] == 60
+    assert control_panel._effective_tick_seconds() <= control_panel.TICK_SECONDS_MAX
 
 
 def test_agent_turn_resets_on_frame_drop():
@@ -2026,6 +2054,7 @@ def test_excel_export_builds_decisions_and_telemetry_sheets(
             "Telemetry",
             "AI Decision Audit",
             "Control Panel Inputs",
+            "Control Panel Inputs (start)",
         ]
         inputs = workbook["Control Panel Inputs"]
         assert [cell.value for cell in inputs[1]] == [
@@ -2097,9 +2126,161 @@ def test_default_excel_export_uses_dedicated_folder(tmp_path, monkeypatch):
 
     assert destination is not None
     assert destination.parent == export_folder
+    # An LLM arm carries its control mode; ai_runtime has none set, so the
+    # session workbook falls back to assisted.
     assert re.fullmatch(
-        r"gemini2\.5_5min_42seed_\d{8}_\d{6}\.xlsx",
+        r"gemini2\.5-assisted_5min_42seed_\d{8}_\d{6}\.xlsx",
         destination.name,
     )
     assert destination.suffix == ".xlsx"
     assert destination.exists()
+
+
+def _decision_file(tmp_path, **fields):
+    body = {"run_uuid": RUN_ID, "model": "new-model", "turn": 1,
+            "timestamp": main.time.time(), "status": "OK",
+            "flags": valid_flags(tsp_route="R1_EB_A_NB")}
+    body.update(fields)
+    path = tmp_path / "decision.json"
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def _all_off():
+    return all(
+        route[flag] is False
+        for route in control_panel.bus_routes_config.values()
+        for flag in ("tsp_enabled", "dbl_enabled")
+    )
+
+
+def test_decision_from_another_model_run_or_older_turn_is_refused(tmp_path, monkeypatch):
+    runtime = {"model": "new-model", "tick_seconds": 5, "last_status": "INACTIVE", "last_turn": 0}
+    monkeypatch.setitem(control_panel.global_config, "ai_runtime", runtime)
+    tsp = control_panel.bus_routes_config["R1_EB_A_NB"]
+
+    # The audit's probe: a fresh decision tagged with the previous model.
+    assert not main.merge_ai_decision(_decision_file(tmp_path, model="old-model"))
+    assert runtime["last_status"] == "FOREIGN_DECISION" and _all_off()
+    # ...or made for the previous run.
+    assert not main.merge_ai_decision(_decision_file(tmp_path, run_uuid="previous-run"))
+    assert runtime["last_status"] == "FOREIGN_DECISION" and _all_off()
+
+    assert main.merge_ai_decision(_decision_file(tmp_path, turn=5))
+    assert tsp["tsp_enabled"] is True and runtime["last_turn"] == 5
+    # Re-reading the same turn keeps it; a replayed older turn is refused.
+    assert main.merge_ai_decision(_decision_file(tmp_path, turn=5))
+    assert not main.merge_ai_decision(_decision_file(tmp_path, turn=4))
+    assert runtime["last_status"] == "STALE_DECISION" and _all_off()
+
+
+def test_full_reset_clears_flags_for_every_arm_and_restarts_turns(monkeypatch):
+    monkeypatch.setitem(control_panel.global_config, "test_running", True)
+    monkeypatch.setitem(control_panel.global_config, "test_model", "new-model")
+    runtime = {"model": "new-model", "armed": True, "last_turn": 9}
+    monkeypatch.setitem(control_panel.global_config, "ai_runtime", runtime)
+    route = control_panel.bus_routes_config["R4_WB_A_SB"]
+    monkeypatch.setitem(route, "tsp_enabled", True)
+    monkeypatch.setitem(route, "dbl_enabled", True)
+
+    main.perform_full_reset([], main.SignalController({"green_time": 240}))
+
+    assert _all_off() and runtime["last_turn"] == 0
+    assert control_panel.global_config["_run_uuid"] != RUN_ID  # a new identity
+
+
+def test_second_simulator_instance_is_refused(tmp_path):
+    lock = tmp_path / "simulator.lock"
+    first = main.acquire_instance_lock(lock)
+    with pytest.raises(SystemExit):
+        main.acquire_instance_lock(lock)
+    first.close()
+    main.acquire_instance_lock(lock).close()
+
+
+def test_armed_request_locks_the_route_before_any_grant():
+    """A route is locked as soon as the controller holds a request for its
+    bus, not only once green is adjusting: dropping the flag mid-request
+    cancels it (FEATURE_DISABLED) and suppresses that bus's leg."""
+    armed = {
+        "bus_id": "ARMED",
+        "route_id": "R1_EB_A_NB",
+        "route_leg": {"node_x": 780, "movement": "STRAIGHT"},
+        "leg_state": "APPROACHING",
+        "distance_to_stop_bar_px": 120.0,
+        "eta_to_stop_bar_sec_freeflow": 4.0,
+        "priority_requested": True,
+        "priority_granted": False,
+        "priority_clearing": False,
+    }
+    state = agent_state(telemetry={"active_buses": [armed]})
+
+    assert agent.check_locked(state)["locked_routes"] == {"R1_EB_A_NB"}
+
+
+def test_live_request_keeps_its_route_flag_through_stale_and_held_all_off(
+    tmp_path, monkeypatch
+):
+    """The lock is enforced at the merge boundary from the live controller:
+    a route whose bus the controller already holds a request for keeps its
+    flags whatever the decision says (stale, guard-held, or a decider whose
+    snapshot predates the request), so a committed treatment is never
+    cancelled as FEATURE_DISABLED by the decision path. Routes without a
+    live request still follow the decision."""
+    now = 1_900_000_000.0
+    monkeypatch.setattr(main.time, "time", lambda: now)
+    runtime = {"tick_seconds": 5, "last_status": "INACTIVE", "last_turn": 0}
+    monkeypatch.setitem(control_panel.global_config, "ai_runtime", runtime)
+    monkeypatch.setitem(control_panel.global_config, "_run_uuid", RUN_ID)
+    for route in control_panel.bus_routes_config.values():
+        route["tsp_enabled"] = route["dbl_enabled"] = False
+    control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] = True
+    control_panel.bus_routes_config["R2_EB_B_NB"]["tsp_enabled"] = True
+    signals = SignalController({"green_time": 300}, yellow_time=2, red_clearance_time=2)
+    bus = make_bus_for_leg("R1_EB_A_NB", NODE_A, "LOCKED_BUS")
+    signals.update([bus])
+    assert signals.routes_with_live_requests() == {"R1_EB_A_NB"}
+
+    decision_path = tmp_path / "decision.json"
+    stale = {"run_uuid": RUN_ID, "timestamp": now - 3600, "status": "OK",
+             "flags": valid_flags()}
+    decision_path.write_text(json.dumps(stale), encoding="utf-8")
+    assert not main.merge_ai_decision(decision_path, signals=signals)
+    assert runtime["last_status"] == "STALE_DECISION"
+    assert control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] is True
+    assert control_panel.bus_routes_config["R2_EB_B_NB"]["tsp_enabled"] is False
+
+    # A fresh, valid all-off decision (what a guard HELD_ALL_OFF or a
+    # snapshot-lagged decider writes) cannot withdraw it either.
+    fresh = {"run_uuid": RUN_ID, "timestamp": now, "turn": 1,
+             "status": "HELD_ALL_OFF", "flags": valid_flags()}
+    decision_path.write_text(json.dumps(fresh), encoding="utf-8")
+    assert main.merge_ai_decision(decision_path, signals=signals)
+    assert control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] is True
+
+    # Once the request is gone the same decision is applied in full.
+    signals.update([])
+    assert signals.routes_with_live_requests() == set()
+    fresh["turn"] = 2
+    decision_path.write_text(json.dumps(fresh), encoding="utf-8")
+    assert main.merge_ai_decision(decision_path, signals=signals)
+    assert control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] is False
+
+
+def test_the_tick_floor_matches_the_agent_call_timeouts():
+    """control_panel.MIN_UNSKIPPED_TICK_SECONDS exists so that no arm ever
+    skips a decision grid point: the agent skips-and-counts any point that
+    comes due while a call is still running, so the tick has to outlast the
+    longest a call can possibly take. If a provider timeout is raised, this
+    fails until the floor -- and the default tick above it -- follow.
+    """
+    longest_call = max(
+        agent.OLLAMA_TIMEOUT_SECONDS, agent.GEMINI_TIMEOUT_SECONDS,
+        agent.OPENAI_TIMEOUT_SECONDS, agent.GROK_TIMEOUT_SECONDS,
+    )
+    assert control_panel.AGENT_CALL_TIMEOUT_CEILING_SEC == longest_call
+    assert control_panel.MIN_UNSKIPPED_TICK_SECONDS > longest_call
+    assert control_panel.DEFAULT_TICK_SECONDS >= control_panel.MIN_UNSKIPPED_TICK_SECONDS
+    assert control_panel.DEFAULT_TICK_SECONDS <= control_panel.TICK_SECONDS_MAX
+    # Both decision paths ship at the floor, not just the Single Run card.
+    assert control_panel.DEFAULT_BATCH_RUNTIME["tick_seconds"] == control_panel.DEFAULT_TICK_SECONDS

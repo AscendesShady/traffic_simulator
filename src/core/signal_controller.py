@@ -1672,9 +1672,9 @@ class SignalController:
         # still short of the box: the next request must be judged on what it
         # does now (a missed turn goes straight), not on the old booking. In
         # the box the stored movement is what identifies a turn mid-pivot.
-        if hasattr(vehicle, "is_front_bumper_upstream") and vehicle.is_front_bumper_upstream(
-            node_x, H_Y, ROAD_W, STOP
-        ):
+        if node_x in getattr(vehicle, "intersection_entry_movements", {}) and hasattr(
+            vehicle, "is_front_bumper_upstream"
+        ) and vehicle.is_front_bumper_upstream(node_x, H_Y, ROAD_W, STOP):
             getattr(vehicle, "intersection_entry_movements", {}).pop(node_x, None)
             getattr(vehicle, "intersection_entry_approaches", {}).pop(node_x, None)
 

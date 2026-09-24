@@ -1537,19 +1537,25 @@ def _remember_decision(state: AgentState, decision: dict) -> list:
     return recent[-RECENT_DECISION_LIMIT:]
 
 
-def publish_decision(decision: dict, run_uuid, telemetry_frame=None) -> dict:
+def publish_decision(decision: dict, run_uuid, telemetry_frame=None, latency_ms=None) -> dict:
     """The only writer of decision.json. Every decision names the run (and
     telemetry frame) it was made for, so main.merge_ai_decision can refuse
-    one left over from an earlier run, arm or model."""
+    one left over from an earlier run, arm or model, and carries the wall
+    time the call took, so main releases it that long after its snapshot on
+    the simulation clock whatever the pace (_decision_release_frame)."""
     decision["run_uuid"] = str(run_uuid or "")
     decision["telemetry_frame"] = telemetry_frame
+    decision["latency_ms"] = latency_ms
     atomic_write_json(DECISION_PATH, decision)
     return decision
 
 
 def write_decision(state: AgentState) -> dict:
     decision = guard_baseline(state["decision"], state)
-    publish_decision(decision, state.get("run_uuid"), state.get("telemetry_frame"))
+    publish_decision(
+        decision, state.get("run_uuid"), state.get("telemetry_frame"),
+        (state.get("call_metrics") or {}).get("latency_ms"),
+    )
     log_turn(state, decision)
     return {"decision": decision, "recent_decisions": _remember_decision(state, decision)}
 
@@ -1634,6 +1640,31 @@ def _dependency_hold(turn: int, model: str, message: str, run_uuid=None) -> dict
 TICK_POLL_SEC = 0.2
 
 
+def turn_busy_until(decided_at, latency_s, sim_time_after):
+    """When a turn stops occupying the decision schedule, on the sim clock:
+    the later of the sim time reached when the call returned and the sim
+    time it was decided at plus the call's real latency. Below real-time
+    pace the simulation has not advanced a whole latency during the call,
+    but main releases the decision only that far after its snapshot
+    (main._decision_release_frame), so the turn occupies that much sim time
+    -- and a slow model skips the grid points it would skip in real time."""
+    candidates = [sim_time_after]
+    if isinstance(decided_at, (int, float)) and isinstance(latency_s, (int, float)):
+        candidates.append(decided_at + latency_s)
+    numeric = [t for t in candidates if isinstance(t, (int, float))]
+    return max(numeric) if numeric else None
+
+
+def grid_points_skipped(scheduled_time, interval, busy_until):
+    """The grid points after ``scheduled_time`` that fall due while the turn
+    is busy (at or before ``busy_until``), and the next point to wait for."""
+    skipped, probe = [], scheduled_time + interval
+    while isinstance(busy_until, (int, float)) and probe <= busy_until:
+        skipped.append(probe)
+        probe += interval
+    return skipped, probe
+
+
 def run_forever() -> None:
     try:
         graph = build_graph()
@@ -1693,6 +1724,7 @@ def run_forever() -> None:
         scheduled_time = next_scheduled_sim_time
         tick_index += 1
         turn += 1
+        turn_latency_s = None
         model = control["model"]
         run_uuid = telemetry.get("run_uuid") if isinstance(telemetry, dict) else None
         try:
@@ -1732,6 +1764,10 @@ def run_forever() -> None:
                 # A rule turn is not a measurement of any model, so it leaves
                 # the model carry-forward untouched.
                 measured = result.get("call_metrics", {})
+                if isinstance(measured, dict) and isinstance(
+                    measured.get("latency_ms"), (int, float)
+                ):
+                    turn_latency_s = measured["latency_ms"] / 1000.0
                 if isinstance(measured, dict) and not rule_controller.is_rule_model(
                     model
                 ):
@@ -1754,20 +1790,22 @@ def run_forever() -> None:
             )
             recent_decisions = (recent_decisions + [decision])[-RECENT_DECISION_LIMIT:]
 
-        # The call above blocked in sim-time too: any further grid point that
-        # came due while it ran is a skipped-and-counted opportunity, not a
+        # The call above occupied the schedule: any further grid point that
+        # came due while it ran -- in sim time, counting its real latency
+        # (turn_busy_until) -- is a skipped-and-counted opportunity, not a
         # backlog to catch up on.
         telemetry_after = _read_telemetry()
         sim_time_after = (
             telemetry_after.get("simulation_time_seconds")
             if isinstance(telemetry_after, dict) else None
         )
-        probe = scheduled_time + interval
-        while isinstance(sim_time_after, (int, float)) and probe <= sim_time_after:
+        skipped, next_scheduled_sim_time = grid_points_skipped(
+            scheduled_time, interval,
+            turn_busy_until(sim_time, turn_latency_s, sim_time_after),
+        )
+        for probe in skipped:
             tick_index += 1
             log_skipped_tick(tick_index, probe, model, interval)
-            probe += interval
-        next_scheduled_sim_time = probe
 
 
 def exit_when_parent_dies() -> None:

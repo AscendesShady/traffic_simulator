@@ -1,7 +1,7 @@
 import pytest
 
 import src.ui.control_panel as control_panel
-from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
+from src.ui.canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP
 from src.core.signal_controller import SignalController
 from src.core.vehicle import (
     Bus,
@@ -18,7 +18,7 @@ from src.core.vehicle import (
 # each test runs until the vehicle is standing and asserts the mechanism --
 # no reservation, no crossing, no entry -- over the whole approach.
 SETTLE_FRAMES = 180
-from tests.helpers import make_bus_for_leg, rectangles_overlap, NODE_A, NODE_B
+from tests.helpers import NETWORK_CROSSING_FRAMES, NODE_A, NODE_B, make_bus_for_leg, rectangles_overlap
 
 
 def signals_for(direction, state):
@@ -42,8 +42,8 @@ def test_invalid_signal_values_fail_closed(invalid):
     [
         ("EB", (NODE_A - 60, H_Y - 2.5 * LANE), "NB"),
         ("WB", (NODE_A + 60, H_Y + 2.5 * LANE), "SB"),
-        ("NB", (NODE_A - 2.5 * LANE, 360), "WB"),
-        ("SB", (NODE_A + 2.5 * LANE, 240), "EB"),
+        ("NB", (NODE_A - 2.5 * LANE, H_Y + 60), "WB"),
+        ("SB", (NODE_A + 2.5 * LANE, H_Y - 60), "EB"),
     ],
 )
 def test_left_turn_displacement_is_continuous(direction, start, expected):
@@ -547,7 +547,7 @@ def test_r4_completes_with_dbl_and_tsp_off_when_unobstructed():
         {"green_time": 30}, yellow_time=3, red_clearance_time=3
     )
 
-    for _ in range(3000):
+    for _ in range(NETWORK_CROSSING_FRAMES):
         controller.update([bus])
         bus.update(
             controller.get_all_signals(INT_X),
@@ -559,12 +559,12 @@ def test_r4_completes_with_dbl_and_tsp_off_when_unobstructed():
             [bus],
             controller,
         )
-        if bus.y > 660:
+        if bus.y > HEIGHT + 60:
             break
 
     assert bus.passed_nodes == {NODE_B, NODE_A}
     assert bus.direction == "SB"
-    assert bus.y > 660
+    assert bus.y > HEIGHT + 60
 
 
 @pytest.mark.parametrize(

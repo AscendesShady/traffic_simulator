@@ -81,8 +81,10 @@ valid engine for results.
 
 **Physical dimensions** at the model scale (0.25 m per pixel, anchored to
 7.5 m queue spacing): cars 4.5 × 2.5 m, trucks 7 × 3 m; desired speeds
-32–45 km/h for cars at the campaign speed setting; a 200 m link; 181 m
-arterial approaches and **56 m side-street approaches** (to the stop line); lanes **5.5 m** wide,
+32–45 km/h for cars at the campaign speed setting; a **500 m link** and
+**350 m on every approach** (edge to node centre; 331 m to the stop line,
+room for about 44 queued cars per lane), on a 1,200 m × 700 m surface;
+lanes **5.5 m** wide,
 so the conflict box is 33 m across. The box width is what the all-red must
 clear, which gives 3.5 s against ≈ 2.5 s for a standard-width six-lane
 crossing: about 2 s more lost time per cycle, identical for every arm.
@@ -144,7 +146,8 @@ crossing: about 2 s more lost time per cycle, identical for every arm.
 - **The primary DV counts all the delay.** `total_person_hours_delay_incl_entry_steady`
   is passenger-weighted time below each vehicle's own free-flow speed
   **plus** the time offered demand waited at the network boundary to enter,
-  after a 120 s warm-up. FHWA TAT Vol. III asks that demand unable to enter
+  after a 300 s warm-up (about 2.5 crossings of the 1.2 km arterial).
+  FHWA TAT Vol. III asks that demand unable to enter
   be accounted for; without it an arm that holds traffic outside the model
   is credited for the delay it exported (§4.2 item 1).
 - **Pairing contract.** Pairs form only within a campaign and only when
@@ -154,15 +157,18 @@ crossing: about 2 s more lost time per cycle, identical for every arm.
 - **Replications.** The end-of-batch summary states, per arm, the runs
   needed for the mean paired DV to lie within ±10 % of itself at 95 %
   confidence, and flags an under-replicated arm.
-- **Real-time pace and control delay.** The model runs in real time
-  against a simulation paced to one simulated second per wall second
-  (fixed 60 Hz step driven by a wall-clock accumulator). The achieved pace
-  is recorded per row and flagged beyond ±2 %. Independently of pace, the
-  control delay each decision actually suffered is measured on the
-  simulation clock — from the frame of the snapshot the decider saw to the
-  frame its decision took effect — and reported per decision and as a
-  median and 95th percentile per run, so the latency a result depends on
-  is a measurement, not an assumption.
+- **Decision latency, independent of pace.** The model runs in real time,
+  but the simulation cannot always keep real time: on the 500 m network a
+  frame costs more than its 16.67 ms budget once several hundred vehicles
+  are present. A decision is therefore released on the simulation clock at
+  the frame of the snapshot it was made on plus the model call's measured
+  wall latency; if it arrives earlier (the simulation running slower than
+  real time), it waits, and the decision in force stays in force. The
+  sim-time control delay then equals the model's real latency at any pace,
+  and a slow pace only lengthens the run in wall time. The control delay
+  each decision suffered is measured on the simulation clock and reported
+  per decision and as a median and 95th percentile per run; a run faster
+  than real time, which would land decisions late, is flagged.
 - **Baseline integrity.** A baseline row that shows any decision or TSP
   treatment is refused (`BaselineContaminationError`).
 
@@ -210,8 +216,9 @@ each is now covered by a test.
    zero effective decisions). *Corrected:* such turns are skipped and
    counted, and an arm that skips more than 5 % of its decision points is
    named in the campaign summary. The decision interval (default 10 s, one
-   value for every arm) is set by the bus — two decision points on its
-   ~20 s approach to the first node — and clears the kept models' measured
+   value for every arm) is set by the bus — about four decision points on
+   its ~39 s approach to the first node and at least one inside the 100 m
+   eligibility zone — and clears the kept models' measured
    latency (≤ 2.0 s) by a wide margin; in campaign 2026-09-22 a 3–5 s tick
    sat below the slow models' 15–17 s latency.
 8. **Unphysical braking was absorbed silently**, including at insertion
@@ -325,11 +332,11 @@ features this model has. No numerical parity is claimed.
   standard traffic behaviour, not predictions for a real corridor.
 - Lanes are 5.5 m wide at the kinematic scale (§2), lengthening the all-red
   and each lane change; the effect is common to every arm.
-- North–south approaches are 56 m, so under heavy demand queues reach the
-  boundary. Latent demand is measured and charged in the DV, but a
-  boundary that truncates queues is itself a limitation; FHWA TAT Vol. III
-  advises extending the network until latent demand is negligible. Report
-  `latent_demand_share_at_end` with any result.
+- Every approach is 350 m (lengthened from 75 m side streets and 200 m
+  arterial approaches on 2026-09-24, following FHWA TAT Vol. III's advice
+  to extend the network until latent demand is small). Under oversaturated
+  demand queues can still reach the boundary; that wait is measured and
+  charged in the DV. Report `latent_demand_share_at_end` with any result.
 - Saturation flow is calibrated on one straight lane in isolation; the
   in-network value is measured and reported beside it, not fed back.
 - Box reservations are first-come in update order; the residual order
@@ -375,16 +382,22 @@ yes: golden-output regression pins two scenarios' complete end state (§3).
 Changing only the update order still moves results, by an amount compared
 with ordinary behavioural noise in §8.
 
-**Why is some demand held at the boundary?** The side streets store
-about seven cars per lane (56 m), so queues can reach the edge of the
-model; that wait is charged to the DV (§4.1), not dropped. At 0.6× the
-campaign demand (Webster Y = 0.70) 8–9 % of offered demand is still waiting
-at the end of a run; at the full campaign demand (Y = 1.17, oversaturated)
-27–32 % is (§8.3). Results are reported at the lower demand, or with the
-latent share beside them. Before the right-of-way corrections of §4.2
-item 11 the same 0.6× demand left 44–50 % outside.
+**Why is some demand held at the boundary?** Only when queues outgrow
+the approaches, and that wait is charged to the DV (§4.1), not dropped.
+On the original network the side streets stored about seven cars per lane
+(56 m) and 8–9 % of 0.6× campaign demand was still outside at the end of a
+run (§8.3; 44–50 % before the right-of-way corrections of §4.2 item 11).
+The approaches are now 350 m, about 44 cars per lane: in a first 15-minute
+run at 0.6× demand 3 % was outside. Results are reported at a demand below
+capacity, or with the latent share beside them.
 
 ## 8. Measured evidence (validation runs, 2026-09-23/24)
+
+> **These figures were measured on the original 200 m network** (75 m
+> side streets, commit `3ae7751`). The network was lengthened to a 500 m
+> link with 350 m approaches on 2026-09-24; regenerate this section on it
+> before citing any figure below. The method and the checks carry over
+> unchanged.
 
 Headless runs of the code at commit `3ae7751`: seeds 234 and 764; the
 2026-09-22 campaign demand (EB 38, WB 35, A_NB 26, A_SB 29, B_NB 27,

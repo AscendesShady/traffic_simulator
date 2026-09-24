@@ -25,9 +25,10 @@ def test_fit_canvas_size_keeps_surface_aspect_with_integer_pixels():
     width, height = main.fit_canvas_size(1146, 3000)
     assert 1146 - step < width <= 1146
     width, height = main.fit_canvas_size(9000, 450)
-    assert height <= 450 and height + canvas.HEIGHT // canvas.WIDTH * step + 1 >= 450
+    # Within one width step's worth of height of the limit.
+    assert height <= 450 and height + step * canvas.HEIGHT // canvas.WIDTH + 1 >= 450
     # A transiently tiny pane never yields a degenerate image.
-    floor = canvas.WIDTH // 4 - (canvas.WIDTH // 4) % step
+    floor = main.CANVAS_MIN_DISPLAY_WIDTH - main.CANVAS_MIN_DISPLAY_WIDTH % step
     assert main.fit_canvas_size(0, 0) == (floor, floor * canvas.HEIGHT // canvas.WIDTH)
 
 
@@ -219,24 +220,32 @@ def test_view_zoom_crops_the_surface_and_is_display_only(monkeypatch):
     host = tk.Tk()
     sources = []
     real = pygame.transform.smoothscale
+    real_nearest = pygame.transform.scale
 
+    # The crop reaches the first scaling stage: smoothscale directly, or the
+    # nearest-neighbour pre-pass when it is over twice the target (_downscale).
     def recording(surface, size, dest=None):
         sources.append(surface.get_size())
         return real(surface, size, dest)
 
+    def recording_nearest(surface, size, dest=None):
+        sources.append(surface.get_size())
+        return real_nearest(surface, size, dest)
+
     monkeypatch.setattr(main.pygame.transform, "smoothscale", recording)
+    monkeypatch.setattr(main.pygame.transform, "scale", recording_nearest)
     try:
         simulation_canvas, push_frame = build_canvas(host)
         surface = pygame.Surface((canvas.WIDTH, canvas.HEIGHT))
         surface.fill((1, 2, 3))
         simulation_canvas.set_view_zoom(2.0)
         push_frame(surface)
-        assert sources == [(canvas.WIDTH // 2, canvas.HEIGHT // 2)]
+        assert sources[0] == (canvas.WIDTH // 2, canvas.HEIGHT // 2)
         assert simulation_canvas.view_rect().center == (canvas.WIDTH // 2, canvas.HEIGHT // 2)
         # Zooming keeps the world point under the cursor fixed: from zoom 2
-        # the top-left corner shows world (600, 150), and it still does at 4.
+        # the top-left corner shows world (WIDTH/4, HEIGHT/4), and it still does at 4.
         simulation_canvas.set_view_zoom(4.0, at=(0, 0))
-        assert simulation_canvas.view_rect().topleft == (600, 150)
+        assert simulation_canvas.view_rect().topleft == (canvas.WIDTH // 4, canvas.HEIGHT // 4)
         simulation_canvas.set_view_zoom(1.0)
         simulation_canvas.set_view_zoom(4.0, at=(0, 0))
         assert simulation_canvas.view_rect().topleft == (0, 0)
@@ -298,8 +307,15 @@ def test_a_batch_sweep_drops_the_render_rate(monkeypatch):
         simulation_canvas.set_target_size(1300, 325)   # full rate otherwise
         runtime = main.control_panel.global_config.setdefault("batch_runtime", {})
         monkeypatch.setitem(runtime, "active", True)
-        ticks = main.BATCH_RENDER_EVERY * 3
-        assert sum(simulation_canvas.frame_is_due() for _ in range(ticks)) == 3
+        # One painted frame per BATCH_RENDER_INTERVAL_SEC of wall clock,
+        # however many ticks fit in it: 30 ticks over 3 s paint 3 frames.
+        clock = {"t": 0.0}
+        monkeypatch.setattr(main.time, "monotonic", lambda: clock["t"])
+        painted = 0
+        for tenth in range(30):
+            clock["t"] = tenth / 10.0 * main.BATCH_RENDER_INTERVAL_SEC
+            painted += simulation_canvas.frame_is_due()
+        assert painted == 3
         monkeypatch.setitem(runtime, "active", False)
         assert sum(simulation_canvas.frame_is_due() for _ in range(4)) == 4
     finally:

@@ -47,11 +47,11 @@ def test_deadlocked_queue_head_is_diagnosed_and_a_follower_is_not():
     # The live snapshot: left turners holding 35 px short of Node A's bar,
     # a truck frozen straddling lanes 1/2, and the queue behind them.
     vehicles = [
-        vehicle("car-1", 919.8, wb_y(0), target_turn="LEFT", lane_vacate_target=2, must_hold_for_lane=True),
-        vehicle("truck-10", 924.6, wb_y(1) + 12.5, vtype="truck", lane_index=1, target_turn="LEFT",
+        vehicle("car-1", NODE_A + 119.8, wb_y(0), target_turn="LEFT", lane_vacate_target=2, must_hold_for_lane=True),
+        vehicle("truck-10", NODE_A + 124.6, wb_y(1) + 12.5, vtype="truck", lane_index=1, target_turn="LEFT",
                 lane_vacate_target=2, must_hold_for_lane=True),
-        vehicle("truck-2", 954.7, wb_y(0), vtype="truck"),
-        vehicle("car-4", 989.7, wb_y(0)),
+        vehicle("truck-2", NODE_A + 154.7, wb_y(0), vtype="truck"),
+        vehicle("car-4", NODE_A + 189.7, wb_y(0)),
     ]
     heads = diagnose_stalled_heads(payload(100.0, vehicles))
     by_id = {h["vehicle"]: h for h in heads}

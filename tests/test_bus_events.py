@@ -15,7 +15,7 @@ import src.core.main as main
 from src.telemetry.bus_event_log import BUS_EVENT_HEADERS, BusEventTracker, flatten_bus_event
 from src.ui.canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
 from src.core.signal_controller import TSP_ACTION_EXTENDING, TSP_ACTION_NONE, SignalController
-from tests.helpers import make_bus_for_leg, NODE_A, NODE_B
+from tests.helpers import NETWORK_CROSSING_FRAMES, NODE_A, NODE_B, make_bus_for_leg
 
 
 GREEN_FRAMES = 100
@@ -40,7 +40,7 @@ def read_rows(path):
     ]
 
 
-def run_bus_to_completion(bus, controller, tracker, max_frames=3000):
+def run_bus_to_completion(bus, controller, tracker, max_frames=NETWORK_CROSSING_FRAMES):
     """Drive one bus through the controller until it exits the network.
 
     Mirrors the main loop's order: controller update, vehicle update, exit

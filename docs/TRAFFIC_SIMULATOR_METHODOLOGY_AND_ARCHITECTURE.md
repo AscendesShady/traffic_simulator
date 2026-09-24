@@ -49,13 +49,14 @@ fingerprinting a whole run).
 
 ### 3. Network
 
-A 600 m × 150 m surface (2400 × 600 px) carrying one east–west arterial and
-two north–south cross streets.
+A 1,200 m × 700 m surface (4800 × 2800 px) carrying one east–west arterial
+and two north–south cross streets. `canvas_gemini` derives every position
+from three lengths (`LINK_M` = 500, `APPROACH_M` = 350, `PX_PER_M` = 4).
 
 | Element | Value |
 |---|---|
-| Signalised nodes | A at x = 200 m (800 px), B at x = 400 m (1600 px); link A–B = 200 m |
-| Approach lengths | 200 m of arterial upstream of A and downstream of B; 75 m of cross street each side of the arterial |
+| Signalised nodes | A at x = 350 m (1400 px), B at x = 850 m (3400 px); link A–B = 500 m |
+| Approach lengths | 350 m on every approach, edge to node centre (331 m to the stop line): arterial upstream of A and downstream of B, and each cross street either side of the arterial |
 | Lanes | 3 per direction on every approach, 5.5 m (22 px) wide; carriageway 33 m (132 px) |
 | Conflict area | 33 m × 33 m square per node |
 | Stop line | 2.5 m (10 px) upstream of the conflict area |
@@ -462,10 +463,12 @@ returns for it, and the merge itself (`_set_ai_flags`, including the
 all-off of every refusal) skips any route with a live controller request.
 The tick is 2–120 s (`control_panel.TICK_SECONDS_MIN/MAX`, a slider on
 both run cards), default **10 s**, one value for every arm. It follows from
-the bus: an entering bus reaches Node A's stop line in about 20 s (200 m at
-9 m/s) and is inside the priority zone throughout, so a 10 s tick gives
-every bus two decision points before Node A, where a 60 s tick left two in
-three reaching it before any decision had seen them. (Route flags are a
+the bus: an entering bus reaches Node A's stop line about 39 s after
+entering (350 m at 9 m/s) and is inside the TSP eligibility zone for its
+last 100 m (the default; configurable up to 350 m), about 11 s, so a 10 s
+tick gives every bus about four decision points on its approach and at
+least one inside the zone, where a 60 s tick left many reaching Node A
+before any decision had seen them. (Route flags are a
 continuous hold, so a long tick does not stop buses being treated; it
 reduces the decider to a once-a-minute route switch.) The tick must also
 clear the slowest arm's p95 latency: the agent skips-and-counts a grid
@@ -485,9 +488,12 @@ running alongside to measure the frame-time cost. Every model gets the same
 8,192-token context (`agent.OLLAMA_NUM_CTX`; left to Ollama, the window
 follows the model's maximum and small models spilled onto the CPU), 6
 inference threads, and the simulator runs at above-normal priority. The
-latency bars follow from the bus: at 9 m/s a bus crosses the 200 m priority
-zone in about 22 s, so a decision must land within that (worst turn ≤ 22 s)
-and, for the median bus in the zone, within half of it (median ≤ 11 s).
+latency bars were set on the 200 m network of the time: a bus took about
+22 s from entering to the first stop line, so a decision had to land within
+that (worst turn ≤ 22 s) and, for the median bus, within half of it
+(median ≤ 11 s). (On the 500 m network the approach is 350 m, about 39 s,
+and the default eligibility zone 100 m, about 11 s; the kept models answer
+in under 2 s either way.)
 
 | Model | Placement | Median | Worst | Valid | Arm |
 |---|---|---|---|---|---|

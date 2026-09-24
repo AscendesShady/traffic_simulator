@@ -17,7 +17,7 @@ from src.core import vehicle as vm
 from src.core.vehicle import Vehicle
 from src.experiments import headless_run
 from src.ui import canvas_gemini as canvas
-from tests.helpers import NODE_A, apply_reference_demand
+from tests.helpers import NETWORK_CROSSING_FRAMES, NODE_A, apply_reference_demand
 from tests.test_dbl_lane_clearing import rectangles_overlap
 
 H_Y, LANE = canvas.H_Y, canvas.LANE
@@ -190,9 +190,19 @@ def test_idm_engine_drives_the_whole_network_without_overlaps(monkeypatch):
             )
     monkeypatch.setattr(main, "step_simulation", checked)
     try:
-        headless_run.run(7, 3000, tsp=True, dbl=True)
+        headless_run.run(7, NETWORK_CROSSING_FRAMES * 2 // 3, tsp=True, dbl=True)
         assert vm.movement_model() == "idm"
         assert main.network_throughput["vehicles_served_total"] > 0
         assert overlaps == []
     finally:
         vm.set_movement_model(vm.MOVEMENT_MODEL_LEGACY)
+
+
+def test_the_canvas_scale_is_the_engine_scale():
+    """canvas_gemini builds the network from lengths in metres at PX_PER_M;
+    it must be the same scale the engine and the unit conversions use."""
+    from src.ui import canvas_gemini as canvas
+    assert canvas.PX_PER_M * vm.METERS_PER_PX == 1.0
+    assert (canvas.INT_X[1] - canvas.INT_X[0]) * vm.METERS_PER_PX == canvas.LINK_M
+    assert canvas.INT_X[0] * vm.METERS_PER_PX == canvas.APPROACH_M
+    assert canvas.H_Y * vm.METERS_PER_PX == canvas.APPROACH_M

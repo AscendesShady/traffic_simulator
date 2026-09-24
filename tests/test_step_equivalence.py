@@ -1,6 +1,7 @@
 """One authoritative frame: the Tk loop and headless_run both run
 main.step_simulation, so a headless experiment is production's engine
 without the window (audit 2026-09-21, item 7)."""
+from tests.helpers import NETWORK_CROSSING_FRAMES
 import copy
 import inspect
 import json
@@ -63,7 +64,7 @@ def test_headless_run_is_deterministic_and_keeps_production_bookkeeping(monkeypa
 
     for _ in range(2):
         headless_run.run(
-            seed=11, frames=3000, tsp=True, decide=decide, decide_every_frames=300,
+            seed=11, frames=NETWORK_CROSSING_FRAMES // 2, tsp=True, decide=decide, decide_every_frames=300,
             on_finish=lambda vehicles, signals: states.append(copy.deepcopy(_fingerprint(vehicles, signals))),
         )
     first, second = states

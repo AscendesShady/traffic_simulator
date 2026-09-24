@@ -7,20 +7,29 @@ import pygame
 # ==========================================================
 # AUTHORITATIVE NETWORK GEOMETRY
 # ==========================================================
-# Physics-surface size. The Tk pane smoothscales it to fit, so a wider world
-# only displays smaller; vehicle/lane/threshold pixels are unchanged. At
-# 0.25 m/px (real_world_units) the 800 px link is 200 m and each approach
-# from the spawn edge is ~190 m -- about 25 s of decision lead time at the
-# default speed scale, up from ~11 s on the old 1000 px surface. Nodes sit
-# symmetrically: 800 px from either edge, 800 px apart.
-WIDTH, HEIGHT = 2400, 600
+# The network is set by three lengths; every position downstream (INT_X,
+# H_Y, WIDTH, HEIGHT) derives from them, so rescaling it means editing these
+# and nothing else. The scale is fixed -- 4 px per metre, i.e.
+# vehicle.METERS_PER_PX = 0.25, anchored to the 7.5 m queue spacing and
+# pinned equal by a test -- so a longer network is a larger surface, not
+# smaller vehicles. The Tk pane smoothscales the surface to fit.
+# 2026-09-24: link 500 m and every approach 350 m (were 200 m, and 200 m
+# arterial / 75 m side street).
+PX_PER_M = 4
+LINK_M = 500        # Node A to Node B, centre to centre
+APPROACH_M = 350    # network edge to the nearest node centre, on every approach
+LINK_PX = LINK_M * PX_PER_M
+APPROACH_PX = APPROACH_M * PX_PER_M
+
+WIDTH = 2 * APPROACH_PX + LINK_PX
+HEIGHT = 2 * APPROACH_PX
 CANVAS_HEIGHT = HEIGHT
 
 LANE = 22
 LANES = 3
 ROAD_W = 2 * LANE * LANES  # 132 px
-H_Y = 300
-INT_X = [800, 1600]  # Node A and Node B
+H_Y = HEIGHT // 2
+INT_X = [APPROACH_PX, APPROACH_PX + LINK_PX]  # Node A and Node B
 STOP = 10
 
 

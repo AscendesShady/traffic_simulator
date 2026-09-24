@@ -24,6 +24,8 @@ Source: `control_panel.py` (as of the current working tree). These are the defau
 | `coordination_direction` | `"EB"` | Direction the Node A to Node B offset progresses |
 | `bus_dwell` | door 4.0 s, board 3.0 s/pax, alight 2.0 s/pax, mean 4 on / 4 off, 2 doors | TCQSM 3rd ed. Ch. 6 dwell model at each route stop |
 | `fcd_period_s` | `0` | Floating-car-data sampling period (sim s); `0` = off |
+| `priority_eligibility_px` | `400` (100 m) | TSP eligibility zone before a node; panel slider 250–1400 px (62.5–350 m), clamped to the 500 m link |
+| `warmup_discard_frames` | `18000` (300 s) | Discarded before steady-state DVs; about 2.5 crossings of the 1.2 km arterial |
 
 ### `discharge_runtime` (nested)
 
@@ -80,12 +82,12 @@ Field definitions:
 <!-- BEGIN GENERATED ROUTES -->
 | Route ID | Name | Origin to destination | Waypoints | Lanes | Stops | Active | Headway | TSP | DBL | Manual dispatch |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `R1_EB_A_NB` | EB → Node A (NB) | EB to NODE_A_NB | 800: LEFT | 800: 2 | 800: far-side | Yes | 30s | No | No | No |
-| `R2_EB_B_NB` | EB → Node B (NB) | EB to NODE_B_NB | 800: STRAIGHT, 1600: LEFT | 800: 1, 1600: 2 | 800: far-side | Yes | 45s | No | No | No |
-| `R3_EB_ONLY` | EB Corridor (Straight) | EB to EB_CORRIDOR | 800: STRAIGHT, 1600: STRAIGHT | 800: 1, 1600: 1 | 800: far-side | Yes | 90s | No | No | No |
-| `R4_WB_A_SB` | WB → Node A (SB) | WB to NODE_A_SB | 1600: STRAIGHT, 800: LEFT | 1600: 1, 800: 2 | 1600: far-side | Yes | 30s | No | No | No |
-| `R5_WB_B_SB` | WB → Node B (SB) | WB to NODE_B_SB | 1600: LEFT | 1600: 2 | 1600: far-side | Yes | 45s | No | No | No |
-| `R6_WB_ONLY` | WB Corridor (Straight) | WB to WB_CORRIDOR | 1600: STRAIGHT, 800: STRAIGHT | 1600: 1, 800: 1 | 1600: far-side | No | 90s | No | No | No |
+| `R1_EB_A_NB` | EB → Node A (NB) | EB to NODE_A_NB | 1400: LEFT | 1400: 2 | 1400: far-side | Yes | 30s | No | No | No |
+| `R2_EB_B_NB` | EB → Node B (NB) | EB to NODE_B_NB | 1400: STRAIGHT, 3400: LEFT | 1400: 1, 3400: 2 | 1400: far-side | Yes | 45s | No | No | No |
+| `R3_EB_ONLY` | EB Corridor (Straight) | EB to EB_CORRIDOR | 1400: STRAIGHT, 3400: STRAIGHT | 1400: 1, 3400: 1 | 1400: far-side | Yes | 90s | No | No | No |
+| `R4_WB_A_SB` | WB → Node A (SB) | WB to NODE_A_SB | 3400: STRAIGHT, 1400: LEFT | 3400: 1, 1400: 2 | 3400: far-side | Yes | 30s | No | No | No |
+| `R5_WB_B_SB` | WB → Node B (SB) | WB to NODE_B_SB | 3400: LEFT | 3400: 2 | 3400: far-side | Yes | 45s | No | No | No |
+| `R6_WB_ONLY` | WB Corridor (Straight) | WB to WB_CORRIDOR | 3400: STRAIGHT, 1400: STRAIGHT | 3400: 1, 1400: 1 | 3400: far-side | No | 90s | No | No | No |
 <!-- END GENERATED ROUTES -->
 
 Field definitions:

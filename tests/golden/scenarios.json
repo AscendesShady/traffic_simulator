@@ -1,34 +1,34 @@
 {
   "baseline_seed234": {
-    "fingerprint": "74a7f413e2d7ff24eebf3cef90fc8f4d610379200824c84850df8991f1c2ed59",
+    "fingerprint": "cc6def183688effeaf199540869a1e3abd22ad0bd5757e33e6133a80a56ada88",
     "headline": {
-      "demand_hash": "3869c0c2250443fd",
-      "passengers_served": 29,
-      "person_hours_entry_wait": 0.1621,
-      "person_hours_travel_delay": 1.6061,
-      "vehicles_in_network": 128,
-      "vehicles_served": 8
+      "demand_hash": "855167cca6dccc01",
+      "passengers_served": 76,
+      "person_hours_entry_wait": 0.158,
+      "person_hours_travel_delay": 10.9839,
+      "vehicles_in_network": 364,
+      "vehicles_served": 19
     },
     "scenario": [
       234,
-      3000,
+      7600,
       false,
       false
     ]
   },
   "tsp_dbl_seed234": {
-    "fingerprint": "eafc85af7d1daaddb9ef5b594f15b58abcbbb9aba1cb7b35aeebd9a21f1f85dc",
+    "fingerprint": "f1014f138989a0a85e906ac6b64196421d1b4f9e79473f8cf8e0728f63874f93",
     "headline": {
-      "demand_hash": "3869c0c2250443fd",
-      "passengers_served": 29,
-      "person_hours_entry_wait": 0.1621,
-      "person_hours_travel_delay": 1.603,
-      "vehicles_in_network": 128,
-      "vehicles_served": 8
+      "demand_hash": "855167cca6dccc01",
+      "passengers_served": 76,
+      "person_hours_entry_wait": 0.3056,
+      "person_hours_travel_delay": 10.8057,
+      "vehicles_in_network": 364,
+      "vehicles_served": 19
     },
     "scenario": [
       234,
-      3000,
+      7600,
       true,
       true
     ]

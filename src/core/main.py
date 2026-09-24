@@ -166,7 +166,9 @@ network_throughput = {
 network_throughput_at_warmup = {}
 # 120 s at 60 fps: the network takes ~90 s to fill from empty, so a
 # cumulative DV over a short run is mostly fill. Operator-configurable.
-WARMUP_DISCARD_FRAMES = 7200
+# Discarded before the steady-state DVs: 300 s, about 2.5 crossings of the
+# 1.2 km arterial at mean car speed (was 120 s on the 600 m network).
+WARMUP_DISCARD_FRAMES = 18000
 
 
 def _empty_approach_metric():
@@ -772,7 +774,7 @@ def calculate_startup_window_layout(screen_width, screen_height):
     control_height = min(1030, usable_height)
     right_x = margin + control_width + gap
     right_width = screen_width - right_x - margin
-    telemetry_y = canvas_top + canvas.HEIGHT + gap
+    telemetry_y = canvas_top + CANVAS_DISPLAY_HEIGHT + gap
     telemetry_height = usable_bottom - telemetry_y
 
     if right_width >= CANVAS_DISPLAY_WIDTH and telemetry_height >= 400:
@@ -3402,9 +3404,12 @@ def print_campaign_summary(campaign_id):
         if str(r.get("sim_seconds_per_wall_second") or "").strip()
         not in ("", "None")
     ]
+    # Decisions are released on the simulation clock (_decision_release_frame),
+    # so a pace below 1.0 only costs wall time; above 1.0 a decision lands
+    # later than its latency and that is the run to name.
     off_pace = [
         f"{name} {pace:.3f}" for name, pace in paces
-        if abs(pace - 1.0) > PACE_TOLERANCE
+        if pace > 1.0 + PACE_TOLERANCE
     ]
     skipping = _arms_skipping_decisions(rows)
     lines = [
@@ -3413,13 +3418,13 @@ def print_campaign_summary(campaign_id):
         f"not converged: {len(not_converged)} {not_converged if not_converged else ''}",
         f"no-op arms (decisions_effective == 0): {len(noop)} {noop if noop else ''}",
         f"git_dirty rows: {sum(1 for r in rows if r.get('git_dirty') == 'True')}",
-        # A run that could not hold 1.0 did not measure the control delay
-        # its latency columns claim: the agent times a model call on the
-        # wall clock and spends it against the simulation clock.
         (
-            f"achieved pace off 1.0 by >{PACE_TOLERANCE:.0%}: {len(off_pace)} {off_pace}"
+            f"ran faster than real time (> {1 + PACE_TOLERANCE:.2f}; decisions landed later "
+            f"than their latency): {len(off_pace)} {off_pace}"
             if off_pace else
-            f"achieved pace: all {len(paces)} run(s) within {PACE_TOLERANCE:.0%} of 1.0"
+            f"achieved pace: {min((p for _, p in paces), default=1.0):.2f}-"
+            f"{max((p for _, p in paces), default=1.0):.2f} sim-s per wall-s "
+            "(decisions are released on the sim clock; a slow pace only costs wall time)"
         ),
         (
             f"skipped > {SKIP_RATE_TOLERANCE:.0%} of decision points (tick below the arm's "
@@ -3782,6 +3787,30 @@ def _control_delay_columns():
     }
 
 
+def _decision_release_frame(decision):
+    """The frame a decision takes effect: the frame of the snapshot it was
+    made on plus the wall time its call took, in frames.
+
+    The model runs in real time; the simulation keeps real time only while a
+    frame fits its budget, and on the 500 m network it does not (37-42 ms a
+    frame at campaign demand, 2026-09-24). Released on arrival, a decision
+    would then land fewer sim seconds after its snapshot than its latency --
+    a slow pace would make every model look faster than it is. Held until
+    this frame, the sim-time control delay equals the measured latency at
+    any pace; a slow pace costs only wall time. None (no gating) when the
+    decision does not carry both fields."""
+    if not isinstance(decision, dict):
+        return None
+    try:
+        snapshot = int(decision.get("telemetry_frame"))
+        latency_ms = float(decision.get("latency_ms"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(latency_ms) or latency_ms < 0:
+        return None
+    return snapshot + int(math.ceil(latency_ms * 60.0 / 1000.0))
+
+
 def merge_ai_decision(path=None, signals=None):
     """Validate and merge one file-based AI decision: route flags (AI
     Assisted) into live route config, or a timing plan (AI Configured) into
@@ -3815,11 +3844,22 @@ def merge_ai_decision(path=None, signals=None):
         tick_seconds * DECISION_STALE_MULTIPLIER,
         DECISION_STALE_FLOOR_SEC,
     )
-    timestamp = decision.get("timestamp") if isinstance(decision, dict) else None
+    # Age on the simulation clock when the decision names its snapshot frame
+    # (the agent's grid is sim time, and a slow pace would otherwise age a
+    # healthy decision on the wall clock); the wall clock for a decision that
+    # does not.
     try:
-        age = time.time() - float(timestamp)
-    except (TypeError, ValueError, OverflowError):
-        age = None
+        snapshot_frame = int(decision.get("telemetry_frame"))
+    except (AttributeError, TypeError, ValueError):
+        snapshot_frame = None
+    if snapshot_frame is not None and _current_frame["n"] >= snapshot_frame:
+        age = (_current_frame["n"] - snapshot_frame) / 60.0
+    else:
+        timestamp = decision.get("timestamp") if isinstance(decision, dict) else None
+        try:
+            age = time.time() - float(timestamp)
+        except (TypeError, ValueError, OverflowError):
+            age = None
     if age is None or not math.isfinite(age) or age > stale_after:
         _hold_all_off(signals)
         runtime["last_status"] = "STALE_DECISION"
@@ -3848,6 +3888,13 @@ def merge_ai_decision(path=None, signals=None):
         # regression (an out-of-order or replayed file), never a new decision.
         _hold_all_off(signals)
         runtime["last_status"] = "STALE_DECISION"
+        return False
+
+    # A new turn waits for its release frame; the decision already in force
+    # stays in force until then (flags are a continuous hold).
+    release = _decision_release_frame(decision)
+    if turn > last_turn and release is not None and _current_frame["n"] < release:
+        runtime["last_status"] = "PENDING_RELEASE"
         return False
 
     if configured:
@@ -4008,10 +4055,17 @@ def calibrate_saturation_flow(
     upstream = {}
 
     def queued():
+        # Standing in the queue behind the bar -- the HCM Ch. 31 sample is the
+        # vehicles queued at green onset. Counting every vehicle upstream let
+        # the build end with part of the "queue" still driving in, whose
+        # arrivals were then timed as saturation headways; on the 350 m
+        # approach that read S 10 % low and lost the start-up measurement.
+        standing = vehicle_module.slow_vehicle_speed()
         return [
             vehicle
             for vehicle in vehicles
-            if vehicle.is_front_bumper_upstream(
+            if vehicle.speed < standing
+            and vehicle.is_front_bumper_upstream(
                 canvas.INT_X[0], canvas.H_Y, canvas.ROAD_W, canvas.STOP
             )
         ]
@@ -4022,7 +4076,7 @@ def calibrate_saturation_flow(
                 vehicles, CALIBRATION_APPROACH, CALIBRATION_APPROACH,
                 CALIBRATION_SPAWN_X, lane_coords, approach_cfg, min_gap=40,
             )
-        crossings = 0
+        crossings = []
         for vehicle in list(vehicles):
             key = id(vehicle)
             if key not in upstream:
@@ -4039,7 +4093,7 @@ def calibrate_saturation_flow(
                 canvas.INT_X[0], canvas.H_Y, canvas.ROAD_W, canvas.STOP
             )
             if upstream[key] and not after:
-                crossings += 1
+                crossings.append(vehicle)
             upstream[key] = after
         controller.update(vehicles)
         vehicles[:] = [v for v in vehicles if v.x <= canvas.WIDTH + 150]
@@ -4054,10 +4108,14 @@ def calibrate_saturation_flow(
             if len(queued()) >= target_queue:
                 break
 
+        # Only the vehicles standing at green onset are timed; later arrivals
+        # are not part of a saturated discharge.
+        sample = {id(vehicle) for vehicle in queued()}
         for frame in range(int(CALIBRATION_DISCHARGE_LIMIT_SEC * 60)):
-            for _ in range(step(green, spawning=False)):
-                crossing_frames.append(frame)
-            if not queued():
+            for vehicle in step(green, spawning=False):
+                if id(vehicle) in sample:
+                    crossing_frames.append(frame)
+            if len(crossing_frames) >= len(sample):
                 break
 
     control_panel.global_config["_active_vehicle_speed_scale"] = previous_scale
@@ -4340,8 +4398,11 @@ def merge_live_decision(frame_number):
     """Production's decision source: the guarded decision.json, every 30
     frames while the panel has the agent armed; disarmed, any AI Configured
     plan is withdrawn so the signals fall back to Webster."""
-    if frame_number % 30 == 0:
-        if control_panel.global_config.get("ai_runtime", {}).get("armed", False):
+    runtime = control_panel.global_config.get("ai_runtime", {})
+    # Every frame while a decision waits for its release frame, so it lands
+    # on that frame rather than up to 30 frames late.
+    if frame_number % 30 == 0 or runtime.get("last_status") == "PENDING_RELEASE":
+        if runtime.get("armed", False):
             merge_ai_decision(signals=_live_signals)
         elif _live_signals is not None and _live_signals.plan_active:
             _live_signals.clear_plan()
@@ -4848,6 +4909,13 @@ SIMULATION_PANE_GUTTER = control_panel.SPACE_MD
 # wider surface is smoothscaled down into it (see build_simulation_canvas)
 # rather than forcing a wider window.
 CANVAS_DISPLAY_WIDTH = min(canvas.WIDTH, 1000)
+# The sim pane's height at that width, never below the 600 px the window
+# layout was designed around (the old surface's native height). Layout reads
+# this, not canvas.HEIGHT: a 2,800 px world must not ask for a 2.8k window.
+CANVAS_DISPLAY_HEIGHT = max(600, CANVAS_DISPLAY_WIDTH * canvas.HEIGHT // canvas.WIDTH)
+# Smallest canvas a mid-resize pane may request (was a quarter of native,
+# 600 px on the 2,400 px surface; an absolute floor stays sane at any size).
+CANVAS_MIN_DISPLAY_WIDTH = 600
 
 
 def control_pane_width_for(screen_width):
@@ -4887,7 +4955,7 @@ def main_window_height_for(screen_height):
     and the telemetry dashboard lays itself out to the viewport it gets, so
     nothing else needs the window taller than the network plus its gutter.
     """
-    return min(screen_height - 100, canvas.HEIGHT + 2 * SIMULATION_PANE_GUTTER)
+    return min(screen_height - 100, CANVAS_DISPLAY_HEIGHT + 2 * SIMULATION_PANE_GUTTER)
 
 
 # --- Window shapes -----------------------------------------------------------
@@ -4911,10 +4979,13 @@ LARGE_WINDOW_SCREEN_MARGIN_Y = 80
 # large shapes (0.25-0.45 MP) stay at the full rate, maximized on a 1080p
 # screen (~0.9 MP) halves. See build_simulation_canvas.
 FULL_RATE_PUSH_MAX_PIXELS = 600_000
-# Ticks per painted frame while an unattended batch sweep is running: at
-# TICK_MS this is ~4 fps, enough to watch progress, and it hands the render
-# side's share of the wall clock back to the fixed-step loop.
-BATCH_RENDER_EVERY = 15
+# Wall-clock seconds between painted frames while an unattended batch sweep
+# runs: enough to see progress, and it hands the render side's share of the
+# wall clock back to the physics. By time, not by ticks, because a tick's
+# length follows the load: on the 500 m network a painted frame costs
+# ~25 ms and physics ~86 % of the wall clock, so 1 fps keeps rendering near
+# 2.5 % where every 15th tick was 6-9 % (2026-09-24).
+BATCH_RENDER_INTERVAL_SEC = 1.0
 # Simulation tick period (physics catch-up, draw, push), measured from the
 # tick's start so the work inside it does not lengthen the period.
 TICK_MS = 16
@@ -4950,7 +5021,7 @@ def large_window_geometry_for(screen_width, screen_height):
         usable_height,
         max(
             round(screen_height * LARGE_WINDOW_SCREEN_FRACTION),
-            canvas.HEIGHT + 2 * SIMULATION_PANE_GUTTER,
+            CANVAS_DISPLAY_HEIGHT + 2 * SIMULATION_PANE_GUTTER,
         ),
     )
     x = max(0, (screen_width - width) // 2)
@@ -4959,7 +5030,7 @@ def large_window_geometry_for(screen_width, screen_height):
 
 
 # Width step that keeps the scaled height an exact integer at the surface's
-# aspect ratio (5 for 1000x600, 4 for 2400x600).
+# aspect ratio (4 for 2400x600, 12 for 4800x2800).
 CANVAS_ASPECT_STEP = canvas.WIDTH // math.gcd(canvas.WIDTH, canvas.HEIGHT)
 
 
@@ -4968,11 +5039,11 @@ def fit_canvas_size(available_width, available_height):
     the available area.
 
     The width is a multiple of CANVAS_ASPECT_STEP so the height is an exact
-    integer, and never below a quarter of native so a transiently tiny pane
-    (mid-resize) cannot request a degenerate image.
+    integer, and never below CANVAS_MIN_DISPLAY_WIDTH so a transiently tiny
+    pane (mid-resize) cannot request a degenerate image.
     """
     step = CANVAS_ASPECT_STEP
-    floor_width = canvas.WIDTH // 4 - (canvas.WIDTH // 4) % step
+    floor_width = CANVAS_MIN_DISPLAY_WIDTH - CANVAS_MIN_DISPLAY_WIDTH % step
     scale = min(
         max(0.0, float(available_width)) / canvas.WIDTH,
         max(0.0, float(available_height)) / canvas.HEIGHT,
@@ -5296,6 +5367,22 @@ def build_main_window():
     return root, control_pane, simulation_pane, telemetry_pane
 
 
+def _downscale(source, target, dest, cache):
+    """Smooth downscale, in two stages when the source is more than twice the
+    target: nearest-neighbour to twice the target, then smoothscale. Straight
+    smoothscale of the 4800 x 2800 surface to an 1100 px pane took 15 ms of a
+    16.7 ms tick; two stages take 6.8 ms and differ from it by 2/255 per
+    pixel on average (2026-09-24). Display only, like the zoom."""
+    width, height = target
+    if source.get_width() <= 2 * width:
+        return pygame.transform.smoothscale(source, target, dest)
+    mid = cache.get("mid")
+    if mid is None or mid.get_size() != (2 * width, 2 * height):
+        mid = cache["mid"] = pygame.Surface((2 * width, 2 * height))
+    pygame.transform.scale(source, (2 * width, 2 * height), mid)
+    return pygame.transform.smoothscale(mid, target, dest)
+
+
 def build_simulation_canvas(parent):
     """A Tk Canvas fed by one PhotoImage, mutated every push.
 
@@ -5439,7 +5526,7 @@ def build_simulation_canvas(parent):
         if scaled is not None:
             if state["zoom"] != 1.0:
                 surface = surface.subsurface(view)
-            surface = pygame.transform.smoothscale(surface, state["target"], scaled)
+            surface = _downscale(surface, state["target"], scaled, state)
         if draw_vehicles is not None and scale > 1.0:
             draw_vehicles(surface, view, scale)
         photo.configure(
@@ -5461,14 +5548,17 @@ def build_simulation_canvas(parent):
         just the push: both are render-only work that cost as much as the
         paint they feed.
 
-        An unattended batch drops to BATCH_RENDER_EVERY because nobody is
+        An unattended batch drops to one frame per BATCH_RENDER_INTERVAL_SEC because nobody is
         watching 60 fps of it, and at the campaign's demand the render side
         was a fifth of every run's wall clock (2026-09-23 audit)."""
         state["pushes"] += 1
-        every = state["push_every"]
         if (control_panel.global_config.get("batch_runtime") or {}).get("active", False):
-            every = max(every, BATCH_RENDER_EVERY)
-        return state["pushes"] % every == 0
+            now = time.monotonic()
+            if now - state.get("last_batch_paint", float("-inf")) >= BATCH_RENDER_INTERVAL_SEC:
+                state["last_batch_paint"] = now
+                return True
+            return False
+        return state["pushes"] % state["push_every"] == 0
 
     simulation_canvas.frame_is_due = frame_is_due
     simulation_canvas.set_target_size = set_target_size
@@ -5758,7 +5848,7 @@ def main():
         # Render only on a due tick (build_simulation_canvas.frame_is_due):
         # the network draw, the DBL-state scan and the push all hang off the
         # one gate, which halves the rate past FULL_RATE_PUSH_MAX_PIXELS and
-        # drops to BATCH_RENDER_EVERY while a batch sweep is running.
+        # drops to one per BATCH_RENDER_INTERVAL_SEC while a batch sweep runs.
         if _simulation_canvas.frame_is_due():
             # Vehicles are drawn by the push: at the position interpolated
             # between the last two physics steps, so the 60 Hz sim and the

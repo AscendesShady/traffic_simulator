@@ -33,8 +33,8 @@ from tests.test_step_equivalence import _fingerprint
 GOLDEN_PATH = Path(__file__).parent / "golden" / "scenarios.json"
 SCENARIOS = {
     # name: (seed, frames, tsp, dbl) on the default configuration
-    "baseline_seed234": (234, 3000, False, False),
-    "tsp_dbl_seed234": (234, 3000, True, True),
+    "baseline_seed234": (234, 7600, False, False),
+    "tsp_dbl_seed234": (234, 7600, True, True),
 }
 
 

@@ -10,7 +10,7 @@ import src.ui.control_panel as control_panel
 from src.core.signal_controller import SignalController, NORMAL
 from src.core.vehicle import Vehicle, DBL_LANE_INDEX
 from src.ui import canvas_gemini as canvas
-from tests.helpers import NODE_A, NODE_B, make_bus_for_leg
+from tests.helpers import NETWORK_CROSSING_FRAMES, NODE_A, NODE_B, make_bus_for_leg
 
 H_Y, LANE = canvas.H_Y, canvas.LANE
 A, B = str(NODE_A), str(NODE_B)
@@ -402,7 +402,7 @@ def test_scripted_plan_drives_the_whole_network_without_overlaps(monkeypatch):
         seen_plan["n"] = int(signals.plan_active)
         cuts["n"] = signals.experiment_metrics["dbl_total_active_frames"]
 
-    headless_run.run(7, 3000, tsp=False, dbl=False, decide=scripted_planner,
+    headless_run.run(7, NETWORK_CROSSING_FRAMES * 2 // 3, tsp=False, dbl=False, decide=scripted_planner,
                      decide_every_frames=600, on_finish=finish)
     assert seen_plan["n"] == 1
     assert main.network_throughput["vehicles_served_total"] > 0

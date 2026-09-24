@@ -5,7 +5,7 @@ shared east and west legs. Legs with nothing queued are skipped so the
 rotation never spends a green on an empty approach.
 """
 import src.ui.control_panel as control_panel
-from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP, WIDTH
+from src.ui.canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
 from src.core.signal_controller import (
     DISCHARGE_ACTIVE,
     DISCHARGE_CLOCKWISE_ORDER,
@@ -75,7 +75,7 @@ def served_order(vehicles, frames=4000):
                 signal_controller=controller,
             )
         vehicles[:] = [
-            v for v in vehicles if -300 < v.x < WIDTH + 300 and -300 < v.y < 1000
+            v for v in vehicles if -300 < v.x < WIDTH + 300 and -300 < v.y < HEIGHT + 300
         ]
         controller.update(vehicles)
         if (

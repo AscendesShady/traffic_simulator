@@ -79,7 +79,7 @@ def test_window_width_fits_side_panes_and_canvas_without_slack():
     assert main.main_window_width_for(1024) == 964
     # Height frames the canvas with the same gutter top and bottom.
     assert main.main_window_height_for(1440) == (
-        canvas.HEIGHT + 2 * main.SIMULATION_PANE_GUTTER
+        main.CANVAS_DISPLAY_HEIGHT + 2 * main.SIMULATION_PANE_GUTTER
     )
     assert main.main_window_height_for(700) == 600
 

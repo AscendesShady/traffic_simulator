@@ -815,16 +815,28 @@ def test_t3_cut_below_clearance_is_denied_with_reason():
 
 
 def test_t4_eligibility_is_clamped_to_link_length(caplog):
-    assert PRIORITY_ELIGIBILITY_MAX_PX == INT_X[1] - INT_X[0] == 800
+    link = INT_X[1] - INT_X[0]
+    assert PRIORITY_ELIGIBILITY_MAX_PX == link
     with caplog.at_level("WARNING", logger="src.core.signal_controller"):
         controller = SignalController(
-            {"green_time": GREEN_FRAMES, "priority_eligibility_px": 1200}
+            {"green_time": GREEN_FRAMES, "priority_eligibility_px": link + 400}
         )
-    assert controller.get_priority_eligibility_px() == 800
+    assert controller.get_priority_eligibility_px() == link
     assert "clamped" in caplog.text
 
     bus = tsp_bus()
-    place_bus(bus, distance_px=850, speed=0.5)
+    place_bus(bus, distance_px=link + 50, speed=0.5)
     assert not controller.is_bus_tsp_eligible(bus, NODE_A)
-    place_bus(bus, distance_px=790, speed=0.5)
+    place_bus(bus, distance_px=link - 10, speed=0.5)
     assert controller.is_bus_tsp_eligible(bus, NODE_A)
+
+
+def test_the_eligibility_slider_reaches_350_m():
+    """The panel lets an operator widen the zone to 350 m (the whole approach
+    to the first node); the default stays 100 m."""
+    import src.ui.control_panel as control_panel
+    from src.core.vehicle import METERS_PER_PX
+    assert control_panel.PRIORITY_ELIGIBILITY_UI_MAX_PX * METERS_PER_PX == 350.0
+    assert control_panel.set_priority_eligibility_px(99999) == control_panel.PRIORITY_ELIGIBILITY_UI_MAX_PX
+    assert control_panel.PRIORITY_ELIGIBILITY_UI_MAX_PX <= PRIORITY_ELIGIBILITY_MAX_PX
+    assert control_panel.set_priority_eligibility_px(400) == 400     # the 100 m default

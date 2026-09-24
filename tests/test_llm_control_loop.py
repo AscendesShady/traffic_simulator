@@ -2357,3 +2357,95 @@ def test_the_truncation_guard_uses_the_models_own_smaller_window(monkeypatch):
     state = agent_state(minimap="whole network", turn=10, model="small-ctx")
     guarded = agent.anti_cheat({**state, **agent.ai_turn(state)})
     assert guarded["decision"]["status"] == "HELD_ALL_OFF"
+
+
+def test_a_decision_is_released_its_measured_latency_after_its_snapshot(tmp_path, monkeypatch):
+    """Latency-faithful release: at a pace below 1.0 the decision file
+    arrives in fewer sim seconds than the call took; it is held until
+    snapshot frame + latency, and the decision in force stays in force."""
+    now = 1_900_000_000.0
+    monkeypatch.setattr(main.time, "time", lambda: now)
+    runtime = {"tick_seconds": 10, "armed": True}
+    monkeypatch.setitem(control_panel.global_config, "ai_runtime", runtime)
+    monkeypatch.setitem(main.run_metrics, "decision_applied", {})
+    decision_path = tmp_path / "decision.json"
+    monkeypatch.setattr(main, "DECISION_PATH", decision_path)
+    decision_path.write_text(json.dumps({
+        "run_uuid": RUN_ID, "timestamp": now, "status": "OK", "turn": 5,
+        "telemetry_frame": 1000, "latency_ms": 2000.0,
+        "flags": valid_flags(tsp_route="R1_EB_A_NB"),
+    }), encoding="utf-8")
+    control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] = False
+
+    monkeypatch.setitem(main._current_frame, "n", 1050)       # arrived 0.83 s in
+    assert not main.merge_ai_decision(decision_path)
+    assert runtime["last_status"] == "PENDING_RELEASE"
+    assert control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] is False
+
+    # Pending: the live merge looks every frame, not every 30th.
+    calls = []
+    monkeypatch.setattr(main, "merge_ai_decision", lambda **kw: calls.append(1))
+    main.merge_live_decision(1051)
+    assert calls == [1]
+    monkeypatch.undo()
+
+
+def test_the_released_decision_lands_on_its_release_frame(tmp_path, monkeypatch):
+    now = 1_900_000_000.0
+    monkeypatch.setattr(main.time, "time", lambda: now)
+    runtime = {"tick_seconds": 10}
+    monkeypatch.setitem(control_panel.global_config, "ai_runtime", runtime)
+    monkeypatch.setitem(main.run_metrics, "decision_applied", {})
+    decision_path = tmp_path / "decision.json"
+    decision_path.write_text(json.dumps({
+        "run_uuid": RUN_ID, "timestamp": now, "status": "OK", "turn": 5,
+        "telemetry_frame": 1000, "latency_ms": 2000.0,
+        "flags": valid_flags(tsp_route="R1_EB_A_NB"),
+    }), encoding="utf-8")
+    monkeypatch.setitem(main._current_frame, "n", 1120)       # 1000 + 2 s * 60
+    assert main.merge_ai_decision(decision_path)
+    assert control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] is True
+    assert main._control_delay_columns()["control_delay_sim_sec_median"] == 2.0
+    assert main._decision_release_frame({"telemetry_frame": 10, "latency_ms": 1}) == 11
+    assert main._decision_release_frame({"telemetry_frame": 10}) is None
+
+
+def test_staleness_is_judged_on_the_simulation_clock(tmp_path, monkeypatch):
+    """A slow pace must not age a healthy decision on the wall clock."""
+    now = 1_900_000_000.0
+    monkeypatch.setattr(main.time, "time", lambda: now)
+    monkeypatch.setitem(control_panel.global_config, "ai_runtime", {"tick_seconds": 10})
+    decision_path = tmp_path / "decision.json"
+    fresh_sim_old_wall = {
+        "run_uuid": RUN_ID, "timestamp": now - 600, "status": "OK", "turn": 1,
+        "telemetry_frame": 5000, "flags": valid_flags(),
+    }
+    decision_path.write_text(json.dumps(fresh_sim_old_wall), encoding="utf-8")
+    monkeypatch.setitem(main._current_frame, "n", 5000 + 60 * 5)     # 5 sim s old
+    assert main.merge_ai_decision(decision_path)
+    monkeypatch.setitem(main._current_frame, "n", 5000 + 60 * 40)    # 40 sim s > 3 x tick
+    assert not main.merge_ai_decision(decision_path)
+    assert control_panel.global_config["ai_runtime"]["last_status"] == "STALE_DECISION"
+
+
+def test_the_agent_stamps_the_call_latency_on_the_decision(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "DECISION_PATH", tmp_path / "decision.json")
+    published = agent.publish_decision({"turn": 1}, "RUN", 42, 1234.5)
+    assert published["latency_ms"] == 1234.5 and published["telemetry_frame"] == 42
+
+
+def test_a_turn_occupies_the_schedule_for_its_real_latency_at_any_pace():
+    """Below real-time pace the sim advances less than a call's latency while
+    it runs; the turn still occupies decided_at + latency on the sim clock
+    (main releases the decision then), so a slow model skips the grid
+    points it would skip in real time -- and a fast one none."""
+    # 12 s call decided at t=100 on a 10 s grid; the sim only reached 106.
+    busy = agent.turn_busy_until(100.0, 12.0, 106.0)
+    assert busy == 112.0
+    assert agent.grid_points_skipped(100.0, 10.0, busy) == ([110.0], 120.0)
+    # Faster than real time: the sim clock already passed the latency.
+    assert agent.turn_busy_until(100.0, 1.5, 104.0) == 104.0
+    assert agent.grid_points_skipped(100.0, 10.0, 104.0) == ([], 110.0)
+    # Unknown latency (a held or failed turn): the sim clock alone, as before.
+    assert agent.turn_busy_until(100.0, None, 125.0) == 125.0
+    assert agent.grid_points_skipped(100.0, 10.0, None) == ([], 110.0)

@@ -9,7 +9,7 @@ import tempfile
 import sys
 
 from src.experiments import batch_runner
-from src.ui.canvas_gemini import INT_X
+from src.ui.canvas_gemini import INT_X, PX_PER_M
 from src.telemetry import real_world_units as units
 
 NODE_A_X, NODE_B_X = INT_X[0], INT_X[1]
@@ -170,9 +170,11 @@ BATCH_BASELINE_LABEL = "None (baseline)"
 AGENT_CALL_TIMEOUT_CEILING_SEC = 45
 # One decision interval for every arm (the paired DV needs one schedule).
 # It is set by the bus, not by the slowest model: a bus reaches Node A's
-# stop line about 20 s after entering (200 m at 9 m/s) and is in its
-# priority zone the whole way, so 10 s gives it two decision points; 60 s
-# left two buses in three reaching A before any decision had seen them. It
+# stop line about 39 s after entering (350 m at 9 m/s) and is inside the
+# TSP eligibility zone for the last 100 m (default; up to 350 m), about
+# 11 s, so 10 s gives every bus about four decision points on its approach
+# and at least one inside the zone; 60 s left many buses reaching A before
+# any decision had seen them. It
 # must also clear the slowest arm's p95 latency by a margin -- the kept
 # local models answer in 0.7-1.7 s median, 2.0 s worst, at the fixed 8k
 # context (2026-09-23 benchmark) -- and print_campaign_summary flags any
@@ -269,7 +271,7 @@ global_config = {
     # steady window long enough for the cumulative DV to converge. None = free run.
     "test_duration_sim_seconds": 3600,
     # Frames discarded from the front of every steady-state DV (main.py).
-    "warmup_discard_frames": 7200,
+    "warmup_discard_frames": 18000,
     "test_running": False,   # True while a timed benchmark run is active
     "test_model": "None",    # Model captured when the test started
     "test_seed": None,       # Seed captured when the test started
@@ -321,9 +323,17 @@ def set_random_seed(value):
     return normalized
 
 
+# TSP eligibility zone slider: 62.5 m up to 350 m (default 100 m, 400 px).
+PRIORITY_ELIGIBILITY_UI_MIN_PX = 250
+PRIORITY_ELIGIBILITY_UI_MAX_PX = 350 * PX_PER_M
+
+
 def set_priority_eligibility_px(value):
     """Store the eligibility distance to apply on the next START/reset."""
-    normalized = max(250, min(400, int(round(float(value)))))
+    normalized = max(
+        PRIORITY_ELIGIBILITY_UI_MIN_PX,
+        min(PRIORITY_ELIGIBILITY_UI_MAX_PX, int(round(float(value)))),
+    )
     global_config["priority_eligibility_px"] = normalized
     return normalized
 
@@ -2797,7 +2807,8 @@ def create_dashboard_window(parent=None):
     eligibility_value, eligibility_slider = add_slider_row(
         tuning_body, "Eligibility zone",
         f"{units.px_to_m(global_config['priority_eligibility_px']):.0f} m",
-        250, 400, global_config["priority_eligibility_px"],
+        PRIORITY_ELIGIBILITY_UI_MIN_PX, PRIORITY_ELIGIBILITY_UI_MAX_PX,
+        global_config["priority_eligibility_px"],
         update_priority_eligibility, step=10, style="Global.Horizontal.TScale",
         pady=(0, 0),
     )

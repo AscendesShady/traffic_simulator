@@ -1,9 +1,14 @@
 import src.ui.control_panel as control_panel
-from src.ui.canvas_gemini import H_Y, INT_X, LANE, ROAD_W, STOP
+from src.ui.canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
 from src.core.vehicle import Bus
 
 # Node x-coordinates by name, so tests never hard-code the geometry.
 NODE_A, NODE_B = INT_X[0], INT_X[1]
+
+# Frames for a vehicle at 1 px/frame to cross the network by its longest
+# route with signal waits to spare; it scales with the geometry, so a
+# resized network does not strand a test's vehicle mid-route.
+NETWORK_CROSSING_FRAMES = 2 * (WIDTH + HEIGHT)
 
 
 def make_bus_for_leg(route_id, node_x, bus_id="TEST_BUS"):

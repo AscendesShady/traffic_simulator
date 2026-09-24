@@ -6,7 +6,7 @@ import random
 
 import pygame
 
-from src.ui.canvas_gemini import HEIGHT, INT_X, WIDTH
+from src.ui.canvas_gemini import H_Y, HEIGHT, INT_X, LANE, ROAD_W, STOP, WIDTH
 
 
 CAR_PASSENGERS = 4
@@ -223,7 +223,7 @@ def is_idm():
     return _movement_model["name"] == MOVEMENT_MODEL_IDM
 
 
-def lane_change_step_px(lane_w=22):
+def lane_change_step_px(lane_w=LANE):
     """Lateral px per frame of every lane change (cars, evictions, bus merges)."""
     if is_idm():
         return lane_w / (LANE_CHANGE_DURATION_S * FPS)
@@ -378,7 +378,7 @@ _INDEX_CELL_PX = 64.0
 class _FrameIndex:
     """Uniform grid of (list position, vehicle) over one frame's vehicles."""
 
-    __slots__ = ("source", "length", "cells", "margin", "buses", "bounds", "receiving")
+    __slots__ = ("source", "length", "cells", "margin", "buses", "bounds", "receiving", "standing")
 
     def __init__(self, vehicles):
         self.source = vehicles
@@ -387,6 +387,9 @@ class _FrameIndex:
         # frame-start snapshot, so it cannot change within a frame unless a
         # vehicle leaves; drop() clears it.
         self.receiving = {}
+        # direction -> [(vehicle, x, y)] of vehicles standing at the frame's
+        # start (snapshot), built on first use by standing_in().
+        self.standing = None
         cells = {}
         buses = []
         half_max = 0.0
@@ -429,6 +432,9 @@ class _FrameIndex:
     def drop(self, vehicle):
         """Forget one vehicle the frame has just removed from the network."""
         self.receiving.clear()
+        if self.standing is not None:
+            for group in self.standing.values():
+                group[:] = [item for item in group if item[0] is not vehicle]
         key = (int(vehicle.x // _INDEX_CELL_PX), int(vehicle.y // _INDEX_CELL_PX))
         bucket = self.cells.get(key)
         if bucket is not None:
@@ -442,6 +448,21 @@ class _FrameIndex:
         # Moved out of its indexed cell before leaving: fall back to a
         # rebuild-on-next-query rather than carry a phantom.
         self.length = -1
+
+    def standing_in(self, direction):
+        """The vehicles heading ``direction`` that were standing when the
+        frame began, with their snapshot x, y, in list order. The only ones
+        a receiving-space scan can count (_receiving_scan's first test), so
+        its 24-30 scans a frame walk these instead of every vehicle."""
+        if self.standing is None:
+            slow = slow_vehicle_speed()
+            groups = {}
+            for vehicle in self.source:
+                ox, oy, odir, ospeed = _seen(vehicle)
+                if ospeed < slow:
+                    groups.setdefault(odir, []).append((vehicle, ox, oy))
+            self.standing = groups
+        return self.standing.get(direction, ())
 
     def column(self, along_cell, cross_lo, cross_hi, vertical):
         """Every (pos, vehicle) in one along-axis cell slice, across the
@@ -580,13 +601,16 @@ def _gap_ahead(vehicle, other, my_y, my_half_w):
     return dist if dist >= 0 else None
 
 
-def _lead_candidates(vehicle, all_vehicles, my_y, my_half_w):
-    """Candidate leaders for ``get_lead_vehicle``, in list order, or None
-    when there is no usable index and the caller should scan everything.
+def _lead_from_index(vehicle, all_vehicles, my_y, my_half_w):
+    """``get_lead_vehicle``'s answer from the index, or None when there is no
+    usable index and the caller should scan everything.
 
     Walks cells away from the vehicle along its own travel axis and stops
     once the closest gap found beats anything an unscanned cell could still
-    hold, so the set always contains the true leader.
+    hold, so the true leader is always among those judged. Each candidate is
+    judged once, by _gap_ahead, and ties go to the earlier list position --
+    the full scan's rule. (It used to return the candidates for a second
+    _gap_ahead pass: every gap computed twice, 2026-09-24.)
     """
     index = _index_for(all_vehicles)
     if index is None:
@@ -619,23 +643,21 @@ def _lead_candidates(vehicle, all_vehicles, my_y, my_half_w):
     else:
         first, last = min(first, along_max), along_min
 
-    found = []
     best = float("inf")
+    best_pos = None
+    leader = None
     for at in range(first, last + sign, sign):
         bucket = index.column(at, cross_lo, cross_hi, vertical)
-        if bucket:
-            found.extend(bucket)
-            for _, other in bucket:
-                gap = _gap_ahead(vehicle, other, my_y, my_half_w)
-                if gap is not None and gap < best:
-                    best = gap
+        for pos, other in bucket:
+            gap = _gap_ahead(vehicle, other, my_y, my_half_w)
+            if gap is not None and (gap < best or (gap == best and pos < best_pos)):
+                best, best_pos, leader = gap, pos, other
         # Closest a vehicle in any cell past this one could be, allowing for
         # staleness. Once the best gap beats it, nothing further can win.
         edge = (at + 1) * cell if forward else at * cell
         if best <= (edge - margin - front) * sign:
             break
-    found.sort(key=lambda item: item[0])  # list order, so ties break as before
-    return [item[1] for item in found]
+    return best, leader
 
 
 def corridor_blockers(mover, desired_y, all_vehicles):
@@ -664,7 +686,7 @@ def corridor_blockers(mover, desired_y, all_vehicles):
     return blockers
 
 
-def lane_band_blockers(mover, desired_y, all_vehicles, origin_y, lane_w=22):
+def lane_band_blockers(mover, desired_y, all_vehicles, origin_y, lane_w=LANE):
     """Same-direction vehicles alongside `mover` anywhere it sweeps between
     its current y and ``desired_y``, except those centred in the lane it is
     leaving (``origin_y``). Unlike corridor_blockers this ignores the origin
@@ -689,7 +711,7 @@ def lane_band_blockers(mover, desired_y, all_vehicles, origin_y, lane_w=22):
     return blockers
 
 
-def dbl_lane_center_y(direction, h_y, lane_w=22):
+def dbl_lane_center_y(direction, h_y, lane_w=LANE):
     """Centre line of the DBL lane for an EB or WB approach."""
     offset = (DBL_LANE_INDEX + 0.5) * lane_w
     return h_y - offset if direction == "EB" else h_y + offset
@@ -703,7 +725,7 @@ def _is_ahead_on_approach(bus, other):
     return False
 
 
-def dbl_lane_queue_ahead(bus, all_vehicles, h_y, target_node=None, lane_w=22):
+def dbl_lane_queue_ahead(bus, all_vehicles, h_y, target_node=None, lane_w=LANE):
     """Stopped/crawling vehicles ahead of ``bus`` in the reserved DBL lane.
 
     When ``target_node`` is supplied, only the current approach between the
@@ -770,7 +792,7 @@ def _is_queued_for_dbl(vehicle, all_vehicles, lane_y):
 
 
 def dbl_lane_is_obstructed(
-    bus, all_vehicles, h_y, lane_w=22, target_node=None
+    bus, all_vehicles, h_y, lane_w=LANE, target_node=None
 ):
     """Whether DBL would strand ``bus`` behind traffic or block its merge.
 
@@ -796,7 +818,7 @@ def dbl_lane_is_obstructed(
 LEFT_EXIT_DIRECTION = {"EB": "NB", "WB": "SB", "NB": "WB", "SB": "EB"}
 
 
-def receiving_lane(node_x, direction, movement, lane_cross, h_y=300, lane_w=22):
+def receiving_lane(node_x, direction, movement, lane_cross, h_y=H_Y, lane_w=LANE):
     """``(exit_direction, cross)`` of the lane a movement enters after
     ``node_x``: ``cross`` is the lane centre's y on EB/WB, x on NB/SB. A
     straight movement keeps its own lane (``lane_cross``); a left turn's
@@ -812,7 +834,7 @@ def receiving_lane(node_x, direction, movement, lane_cross, h_y=300, lane_w=22):
 
 def receiving_space_px(
     node_x, direction, movement, lane_cross, all_vehicles,
-    h_y=300, road_w=132, lane_w=22, int_x_list=INT_X,
+    h_y=H_Y, road_w=ROAD_W, lane_w=LANE, int_x_list=INT_X,
 ):
     """Free road in the one lane a movement enters after ``node_x``: from
     the far edge of the conflict box to the tail of the nearest standing
@@ -831,13 +853,17 @@ def receiving_space_px(
     key = (node_x, exit_dir, cross, h_y, road_w, lane_w, tuple(int_x_list))
     if index is not None and key in index.receiving:
         return index.receiving[key]
-    free = _receiving_scan(exit_dir, cross, node_x, all_vehicles, h_y, road_w, lane_w, int_x_list)
+    free = _receiving_scan(
+        exit_dir, cross, node_x, all_vehicles, h_y, road_w, lane_w, int_x_list,
+        standing=index.standing_in(exit_dir) if index is not None else None,
+    )
     if index is not None:
         index.receiving[key] = free
     return free
 
 
-def _receiving_scan(exit_dir, cross, node_x, all_vehicles, h_y, road_w, lane_w, int_x_list):
+def _receiving_scan(exit_dir, cross, node_x, all_vehicles, h_y, road_w, lane_w, int_x_list,
+                    standing=None):
     half_w = road_w / 2.0
     horizontal = exit_dir in ("EB", "WB")
     if exit_dir == "EB":
@@ -856,11 +882,14 @@ def _receiving_scan(exit_dir, cross, node_x, all_vehicles, h_y, road_w, lane_w, 
     sign = 1.0 if end > start else -1.0
     free = abs(end - start)
     half_band = lane_w / 2.0
-    slow = slow_vehicle_speed()
-    for other in all_vehicles or []:
-        ox, oy, odir, ospeed = _seen(other)
-        if odir != exit_dir or ospeed >= slow:
-            continue
+    if standing is None:
+        slow = slow_vehicle_speed()
+        standing = []
+        for other in all_vehicles or []:
+            ox, oy, odir, ospeed = _seen(other)
+            if odir == exit_dir and ospeed < slow:
+                standing.append((other, ox, oy))
+    for other, ox, oy in standing:
         # Straight-line arithmetic, not per-call lambdas: this runs for
         # every vehicle on every call and the call itself runs per vehicle
         # per frame (2026-09-23 audit).
@@ -899,16 +928,19 @@ def should_yield_for_route_merge(vehicle, all_vehicles, int_x_list, h_y, road_w)
     discharging and create the forward half of the gap.  A vehicle already in
     an intersection is never stopped by this cooperative rule.
     """
-    if vehicle_is_inside_any_intersection(vehicle, int_x_list, h_y, road_w):
+    # Merging buses first: they are rare, and the intersection geometry below
+    # (no side effects) only matters once one qualifies -- it ran for every
+    # vehicle every frame, 9 % of the frame on the 500 m network.
+    merging = [
+        bus for bus in buses_in(all_vehicles)
+        if bus is not vehicle
+        and getattr(bus, "route_merge_active", False)
+        and vehicle.direction == bus.direction
+    ]
+    if not merging or vehicle_is_inside_any_intersection(vehicle, int_x_list, h_y, road_w):
         return False
 
-    for bus in buses_in(all_vehicles):
-        if bus is vehicle:
-            continue
-        if not getattr(bus, "route_merge_active", False):
-            continue
-        if vehicle.direction != bus.direction:
-            continue
+    for bus in merging:
         desired_y = getattr(bus, "route_merge_desired_y", None)
         if desired_y is None or abs(vehicle.y - desired_y) >= 8.0:
             continue
@@ -1030,14 +1062,14 @@ class Vehicle:
         # which shares the same horizontal y-coordinate.
         self.assigned_node_x = assigned_node_x
 
-    def lane_center_y(self, lane_index, h_y, lane_w=22):
+    def lane_center_y(self, lane_index, h_y, lane_w=LANE):
         offset = (lane_index + 0.5) * lane_w
         return h_y - offset if self.direction == "EB" else h_y + offset
 
     def is_target_lane_clear(self, desired_y, all_vehicles):
         return not corridor_blockers(self, desired_y, all_vehicles)
 
-    def is_lane_band_clear(self, desired_y, all_vehicles, h_y, lane_w=22):
+    def is_lane_band_clear(self, desired_y, all_vehicles, h_y, lane_w=LANE):
         origin_y = self.lane_center_y(self.lane_index, h_y, lane_w)
         return not lane_band_blockers(self, desired_y, all_vehicles, origin_y, lane_w)
 
@@ -1229,17 +1261,19 @@ class Vehicle:
         my_y = self.y if at_y is None else at_y
 
         # The grid narrows WHICH vehicles are considered, never how one is
-        # judged: _gap_ahead below is the same test the full scan applies,
-        # over the same list order (_lead_candidates sorts by it).
-        candidates = _lead_candidates(self, all_vehicles, my_y, my_half_w)
-        for other in (all_vehicles if candidates is None else candidates):
+        # judged: _lead_from_index applies the same _gap_ahead test, with the
+        # same list-order tie-break, as the full scan below.
+        indexed = _lead_from_index(self, all_vehicles, my_y, my_half_w)
+        if indexed is not None:
+            return indexed
+        for other in all_vehicles:
             dist = _gap_ahead(self, other, my_y, my_half_w)
             if dist is not None and dist < min_dist:
                 min_dist, leader = dist, other
 
         return min_dist, leader
 
-    def is_front_bumper_upstream(self, target_node_x, h_y=300, road_w=132, stop_offset=10):
+    def is_front_bumper_upstream(self, target_node_x, h_y=H_Y, road_w=ROAD_W, stop_offset=STOP):
         half_w = road_w // 2
         fx = self.x + self.length / 2.0 if self.direction == "EB" else self.x - self.length / 2.0
         fy = self.y + self.length / 2.0 if self.direction == "SB" else self.y - self.length / 2.0
@@ -1250,7 +1284,7 @@ class Vehicle:
         elif self.direction == "SB": return fy < (h_y - half_w - stop_offset)
         return False
 
-    def distance_to_node_stop_bar(self, target_node_x, h_y=300, road_w=132, stop_offset=10):
+    def distance_to_node_stop_bar(self, target_node_x, h_y=H_Y, road_w=ROAD_W, stop_offset=STOP):
         half_w = road_w // 2
         if self.direction == "EB": return (target_node_x - half_w - stop_offset) - (self.x + self.length / 2.0)
         elif self.direction == "WB": return (self.x - self.length / 2.0) - (target_node_x + half_w + stop_offset)
@@ -1258,7 +1292,7 @@ class Vehicle:
         elif self.direction == "SB": return (h_y - half_w - stop_offset) - (self.y + self.length / 2.0)
         return 0.0
 
-    def receiving_space_px(self, target_node_x, all_vehicles, h_y=300, road_w=132, lane_w=22):
+    def receiving_space_px(self, target_node_x, all_vehicles, h_y=H_Y, road_w=ROAD_W, lane_w=LANE):
         """Free road in the lane this vehicle's movement enters after the node."""
         lane_cross = self.y if self.direction in ("EB", "WB") else self.x
         return receiving_space_px(
@@ -1273,7 +1307,7 @@ class Vehicle:
             < self.length + SAFE_GAP_PX
         )
 
-    def update(self, signal_data, int_x_list, h_y, road_w=132, stop_offset=10, lane_w=22, all_vehicles=None, signal_controller=None):
+    def update(self, signal_data, int_x_list, h_y, road_w=ROAD_W, stop_offset=STOP, lane_w=LANE, all_vehicles=None, signal_controller=None):
         if all_vehicles is None: all_vehicles = []
         self.prev_x, self.prev_y, self.prev_direction = self.x, self.y, self.direction
         target_node_x = self.get_next_target_node(int_x_list)
@@ -1946,7 +1980,7 @@ class Bus(Vehicle):
             return blocker.x < self.x
         return False
 
-    def update(self, signal_data, int_x_list, h_y, road_w=132, stop_offset=10, lane_w=22, all_vehicles=None, signal_controller=None):
+    def update(self, signal_data, int_x_list, h_y, road_w=ROAD_W, stop_offset=STOP, lane_w=LANE, all_vehicles=None, signal_controller=None):
         if all_vehicles is None: all_vehicles = []
         leg = self.get_active_route_leg(int_x_list)
         target_node_x = leg["node_x"] if leg else self.get_next_target_node(int_x_list)

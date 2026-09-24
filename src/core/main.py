@@ -166,11 +166,12 @@ network_throughput = {
 # network_throughput as it stood when the warm-up window ended, so a
 # steady-state DV is "current counter minus this". Empty until that frame.
 network_throughput_at_warmup = {}
-# 120 s at 60 fps: the network takes ~90 s to fill from empty, so a
-# cumulative DV over a short run is mostly fill. Operator-configurable.
-# Discarded before the steady-state DVs: 300 s, about 2.5 crossings of the
-# 1.2 km arterial at mean car speed (was 120 s on the 600 m network).
-WARMUP_DISCARD_FRAMES = 18000
+# Discarded before the steady-state DVs: 600 s, set from data. MSER-5
+# (White 1997) on the per-minute vehicles in the network puts the end of
+# the fill at minute 10 in all nine runs of campaign 3e9df990 (2026-09-24,
+# 500 m network, v/c 0.99); served pax/min settles by minute 5. The former
+# 300 s left the steady window loading. Operator-configurable.
+WARMUP_DISCARD_FRAMES = 36000
 
 
 def _empty_approach_metric():

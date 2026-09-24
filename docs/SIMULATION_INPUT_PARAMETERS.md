@@ -26,7 +26,7 @@ Source: `control_panel.py` (as of the current working tree). These are the defau
 | `fcd_period_s` | `0` | Floating-car-data sampling period (sim s); `0` = off |
 | `priority_eligibility_px` | `400` (100 m) | TSP eligibility zone before a node; panel slider 250–1400 px (62.5–350 m), clamped to the 500 m link |
 | `max_cycle_sec` | `150.0` | Longest cycle Webster may choose, at any flow ratio (NCHRP 812 large-intersection range; 120 s cost 3-10 % more person-hours at 0.7-1.0x campaign demand, 180 s gained under 1 %) |
-| `warmup_discard_frames` | `18000` (300 s) | Discarded before steady-state DVs; about 2.5 crossings of the 1.2 km arterial |
+| `warmup_discard_frames` | `36000` (600 s) | Discarded before steady-state DVs; end of the network fill by MSER-5 (campaign 3e9df990) |
 
 ### `discharge_runtime` (nested)
 

@@ -273,7 +273,7 @@ global_config = {
     # steady window long enough for the cumulative DV to converge. None = free run.
     "test_duration_sim_seconds": 3600,
     # Frames discarded from the front of every steady-state DV (main.py).
-    "warmup_discard_frames": 18000,
+    "warmup_discard_frames": 36000,
     "test_running": False,   # True while a timed benchmark run is active
     "test_model": "None",    # Model captured when the test started
     "test_seed": None,       # Seed captured when the test started

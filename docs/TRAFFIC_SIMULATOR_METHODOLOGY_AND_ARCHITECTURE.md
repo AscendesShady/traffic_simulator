@@ -610,9 +610,14 @@ All counters are accumulated once per simulated frame in
   N = (t₀.₉₇₅,ₙ₋₁ · s / e)² (FHWA Traffic Analysis Toolbox Vol. III), and
   flags an under-replicated arm.
 - **Warm-up.** Every steady-state DV (`*_steady`, `converged`) discards the
-  first 300 s (`warmup_discard_frames` = 18,000, about 2.5 crossings of the
-  1.2 km arterial) via a snapshot taken once per
-  run; cumulative columns are kept alongside. `converged` requires the
+  first 600 s (`warmup_discard_frames` = 36,000) via a snapshot taken once per
+  run. The value is measured: MSER-5 (White, 1997) on the per-minute
+  vehicles in the network ends the fill at minute 10 in all nine runs of
+  campaign 3e9df990 (served pax/min settles by minute 5); the former 300 s
+  left the steady window loading. `time_to_converge_sec` is not a warm-up
+  estimate -- it follows the cumulative pax/min, which includes the fill
+  from t = 0, and read ~1,100 s on the same runs. A checkpoint inside the
+  warm-up has no steady window; cumulative columns are kept alongside. `converged` requires the
   cumulative pax/min within 5 % between 0.8 T and T *and* `vehicles_in_network`
   within 10 % over the same span -- a cumulative mean is stable by
   construction and on its own flagged runs whose accumulation was still
@@ -909,3 +914,6 @@ baseline, rule and pressure arms run without either.
   IDM parameter values (§5.2).
 - Toledo, T., Zohar, D. (2007). Modeling duration of lane changes.
   *Transp. Res. Rec.* 1999, 71–78. — 3 s lane change (§5.2).
+- White, K. P. (1997). An effective truncation heuristic for bias reduction
+  in simulation output. *Simulation* 69(6), 323–334. — MSER-5 warm-up
+  truncation (§12).

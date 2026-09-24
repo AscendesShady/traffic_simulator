@@ -744,17 +744,17 @@ def test_old_summary_csv_is_rotated_not_misaligned():
     assert rotated[0].read_text(encoding="utf-8") == old_header + "1,rule-based,1\n"
 
 
-def test_default_benchmark_is_an_hour_with_five_minute_warmup():
-    """300 s: about 2.5 crossings of the 1.2 km arterial at mean car speed."""
+def test_default_benchmark_is_an_hour_with_ten_minute_warmup():
+    """600 s: where MSER-5 put the end of the fill in campaign 3e9df990."""
     assert control_panel.TEST_DURATIONS["1 hr"] == 3600
-    assert main.WARMUP_DISCARD_FRAMES == 18000
+    assert main.WARMUP_DISCARD_FRAMES == 36000
     fresh = {
         key: value for key, value in control_panel.global_config.items()
         if key in ("warmup_discard_frames",)
     }
-    assert fresh == {"warmup_discard_frames": 18000}
+    assert fresh == {"warmup_discard_frames": 36000}
     assert any(
-        param == "warmup_discard_frames" and value == 18000
+        param == "warmup_discard_frames" and value == 36000
         for _section, param, value in main.control_panel_input_rows()
     )
 

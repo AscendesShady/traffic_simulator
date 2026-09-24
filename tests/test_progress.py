@@ -87,6 +87,7 @@ def test_a_pytest_session_row_counts_tests_and_removes_itself(tmp_path, monkeypa
         "pytest tests", 4, kind="tests", every_frames=1, mean_rate=True, stale_after_sec=600
     )
     reporter.meta["failed"] = 1
+    reporter.started -= 60  # time.time() ticks every 15.6 ms on Windows: no elapsed time, no rate
     reporter.update(2)
     [record] = progress.read_all(tmp_path, now=time.time() + 300)  # a 5-minute test, not a dead process
     assert record["state"] == "running"

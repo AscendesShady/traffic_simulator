@@ -449,7 +449,7 @@ def test_rule_decision_logged_and_exported(tmp_path, monkeypatch):
             "Decisions", "Telemetry", "AI Decision Audit",
             "LLM Performance", "LLM Summary",
             "Control Panel Inputs", "Control Panel Inputs (start)",
-            "Bus Events", "Unit Conversions", "Experiment Summary",
+            "Calibration", "Bus Events", "Unit Conversions", "Experiment Summary",
             "Trip Info",
         ]
         decisions = workbook["Decisions"]

@@ -243,6 +243,8 @@ global_config = {
     # own Webster cycle from phase 0 (the former behaviour, whose relative
     # offset drifts). Progression is timed for this direction.
     "signal_coordination": "coordinated",
+    # Longest cycle Webster may choose (webster.MAX_CYCLE_SEC; NCHRP 812).
+    "max_cycle_sec": 150.0,
     "coordination_direction": "EB",
     # Bus dwell at each route stop (bus_routes_config[...]["stops"]), per the
     # Transit Capacity and Quality of Service Manual, 3rd ed. (TCRP Report
@@ -1114,9 +1116,9 @@ def make_subsection_heading(parent, title, first=False):
 # ----------------------------------------------------------
 # 6 SIMULTANEOUS BUS ROUTES (waypoints/lanes keyed by node x from canvas.INT_X)
 # ----------------------------------------------------------
-# Headway slider ceiling: 300 s (5 min) covers an off-peak feeder service.
-# 0 is the OFF position, so the usable band is 1-300 s.
-MAX_HEADWAY_SEC = 300
+# Headway slider ceiling: 600 s (10 min) covers an off-peak feeder service.
+# 0 is the OFF position, so the usable band is 1-600 s.
+MAX_HEADWAY_SEC = 600
 
 # Mean of the car desired-speed draw in main._draw_arrival, uniform(1.0, 1.4)
 # px/frame before the speed scale. Used only to show the operator what a
@@ -1131,7 +1133,7 @@ bus_routes_config = {
         "waypoints": {NODE_A_X: "LEFT"},
         "lanes": {NODE_A_X: 2},
         "active": True,
-        "headway_sec": 30,
+        "headway_sec": 180,
         "tsp_enabled": False,
         "dbl_enabled": False,
         "manual_dispatch": False,
@@ -1144,7 +1146,7 @@ bus_routes_config = {
         "waypoints": {NODE_A_X: "STRAIGHT", NODE_B_X: "LEFT"},
         "lanes": {NODE_A_X: 1, NODE_B_X: 2},
         "active": True,
-        "headway_sec": 45,
+        "headway_sec": 240,
         "tsp_enabled": False,
         "dbl_enabled": False,
         "manual_dispatch": False,
@@ -1157,7 +1159,7 @@ bus_routes_config = {
         "waypoints": {NODE_A_X: "STRAIGHT", NODE_B_X: "STRAIGHT"},
         "lanes": {NODE_A_X: 1, NODE_B_X: 1},
         "active": True,
-        "headway_sec": 90,
+        "headway_sec": 300,
         "tsp_enabled": False,
         "dbl_enabled": False,
         "manual_dispatch": False,
@@ -1170,7 +1172,7 @@ bus_routes_config = {
         "waypoints": {NODE_B_X: "STRAIGHT", NODE_A_X: "LEFT"},
         "lanes": {NODE_B_X: 1, NODE_A_X: 2},
         "active": True,
-        "headway_sec": 30,
+        "headway_sec": 240,
         "tsp_enabled": False,
         "dbl_enabled": False,
         "manual_dispatch": False,
@@ -1183,7 +1185,7 @@ bus_routes_config = {
         "waypoints": {NODE_B_X: "LEFT"},
         "lanes": {NODE_B_X: 2},
         "active": True,
-        "headway_sec": 45,
+        "headway_sec": 240,
         "tsp_enabled": False,
         "dbl_enabled": False,
         "manual_dispatch": False,
@@ -1196,7 +1198,7 @@ bus_routes_config = {
         "waypoints": {NODE_B_X: "STRAIGHT", NODE_A_X: "STRAIGHT"},
         "lanes": {NODE_B_X: 1, NODE_A_X: 1},
         "active": False,
-        "headway_sec": 90,
+        "headway_sec": 180,
         "tsp_enabled": False,
         "dbl_enabled": False,
         "manual_dispatch": False,

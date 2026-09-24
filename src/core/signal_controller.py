@@ -140,8 +140,8 @@ class PriorityRequest:
     tsp_action: str = TSP_ACTION_NONE
     tsp_adjust_frames: int = 0
     tsp_gate_reason: str = ""
-    # Instrumentation only: DBL becomes an actual grant when this request is
-    # promoted to the node's active request and owns the reserved lane.
+    # DBL is granted when requested: it reserves lane 2 on the bus's own
+    # approach and never waits for the node's one TSP slot (_dbl_requests).
     dbl_granted: bool = False
     dbl_revoke_reason: str = ""
     metrics_finalized: bool = False
@@ -1752,10 +1752,10 @@ class SignalController:
     def _request_key(request):
         return (request.bus_id, request.node_x, request.route_leg_index)
 
-    def _has_request(self, node, key):
+    def _find_request(self, node, key):
         if node.active_request and self._request_key(node.active_request) == key:
-            return True
-        return any(self._request_key(item) == key for item in node.request_queue)
+            return node.active_request
+        return next((item for item in node.request_queue if self._request_key(item) == key), None)
 
     def _build_request(self, bus, leg, tsp_requested, dbl_requested):
         self._request_sequence += 1
@@ -1786,6 +1786,7 @@ class SignalController:
             expires_at_frame=self.frame_number + self.priority_request_timeout,
             tsp_requested=tsp_requested,
             dbl_requested=dbl_requested,
+            dbl_granted=dbl_requested,
             attempt_number=attempt_number,
         )
 
@@ -1805,7 +1806,22 @@ class SignalController:
             node = self.nodes[node_x]
             key = (vehicle.bus_id, node_x, leg["route_leg_index"])
             eligible_keys[node_x].add(key)
-            if key in node.suppressed_keys or self._has_request(node, key):
+            if key in node.suppressed_keys:
+                continue
+            existing = self._find_request(node, key)
+            if existing is not None:
+                # With TSP and DBL both on, a bus that enters the zone before
+                # it has reached lane 2 checks in for TSP alone (at the default
+                # 100 m zone buses are in lane 2 long before; the 350 m zone
+                # starts at the network entry). When it reaches lane 2 the
+                # request it holds takes DBL on, or it never would, and its
+                # entry lane moves with it as _build_request sets it, or the
+                # grant stays unusable from lane 2 (_bus_can_use_grant). A
+                # revoked DBL is not re-taken on this request.
+                if dbl_requested and not existing.dbl_requested and not existing.dbl_revoke_reason:
+                    existing.dbl_requested = existing.dbl_granted = True
+                    existing.entry_lane = DBL_LANE_INDEX
+                    self.experiment_metrics["dbl_requests_raised"] += 1
                 continue
             request = self._build_request(
                 vehicle, leg, tsp_requested=tsp_requested, dbl_requested=dbl_requested
@@ -2025,8 +2041,9 @@ class SignalController:
         """Retire a finished or dead head request, then arm the next one.
 
         Arming attaches the request immediately -- there is no signal
-        transition to wait for, since TSP only nudges the running cycle. An
-        armed DBL request reserves its lane from this moment.
+        transition to wait for, since TSP only nudges the running cycle.
+        Arming is about TSP only: a DBL request holds its lane from the frame
+        it is raised, armed or queued (_dbl_requests).
         """
         request = node.active_request
         if request is not None:
@@ -2048,8 +2065,6 @@ class SignalController:
         if node.active_request is None and node.request_queue:
             request = node.request_queue.pop(0)
             request.state = ARMED
-            if request.dbl_requested:
-                request.dbl_granted = True
             node.active_request = request
 
     def _begin_extension(self, node, request, cap):
@@ -2332,14 +2347,34 @@ class SignalController:
             "commanded": True,
         }
 
+    @staticmethod
+    def _dbl_requests(node, direction=None):
+        """Every live request holding a DBL at this node, the armed one first.
+
+        DBL reserves lane 2 on the bus's own approach and touches no signal
+        timing, so it never waits for the node's one TSP slot. It used to be
+        granted only to the armed request: a bus's lane then waited behind a
+        TSP-only request or a bus on the opposite approach, left-turners
+        refilled it, and the next bus gave DBL up -- the TSP+DBL arm held the
+        lane 44-318 s per 15-minute run against 3,000-4,800 s DBL-only
+        (2026-09-24 scenario matrix)."""
+        requests = ([node.active_request] if node.active_request else []) + node.request_queue
+        return [
+            request for request in requests
+            if request.dbl_requested
+            and (direction is None or request.originating_approach == direction)
+        ]
+
+    def dbl_buses_for_approach(self, target_node_x, direction):
+        """The buses holding a DBL on this approach (none for a commanded lane)."""
+        node = self.nodes.get(target_node_x)
+        return [request.bus for request in self._dbl_requests(node, direction)] if node else []
+
     def is_dbl_active_for_approach(self, target_node_x, direction, all_vehicles=None):
         node = self.nodes.get(target_node_x)
         if node and direction in node.dbl_commanded:
             return True
-        if not node or not node.active_request:
-            return False
-        request = node.active_request
-        return request.dbl_requested and request.originating_approach == direction
+        return bool(node and self._dbl_requests(node, direction))
 
     def get_active_dbl_request(self, target_node_x, direction=None):
         node = self.nodes.get(target_node_x)
@@ -2349,12 +2384,8 @@ class SignalController:
             )
             if commanded is not None:
                 return self._commanded_dbl_dict(target_node_x, commanded)
-        if not node or not node.active_request or not node.active_request.dbl_requested:
-            return None
-        request = node.active_request
-        if direction is not None and request.originating_approach != direction:
-            return None
-        return request.as_dict()
+        requests = self._dbl_requests(node, direction) if node else []
+        return requests[0].as_dict() if requests else None
 
     def get_all_dbl_states(self, int_x_list=INT_X, vehicles=None):
         states = {}
@@ -2369,17 +2400,12 @@ class SignalController:
             if node:
                 for approach in node.dbl_commanded:
                     result[approach] = "ACTIVE"
-                for queued in node.request_queue:
-                    if queued.dbl_requested:
-                        result[queued.originating_approach] = "TRANSITIONING"
-                request = node.active_request
-                if request and request.dbl_requested:
-                    upstream = request.bus.is_front_bumper_upstream(
-                        node_x, H_Y, ROAD_W, STOP
-                    )
-                    result[request.originating_approach] = (
-                        "ACTIVE" if upstream else "CLEARING"
-                    )
+                for request in self._dbl_requests(node):
+                    approach = request.originating_approach
+                    if request.bus.is_front_bumper_upstream(node_x, H_Y, ROAD_W, STOP):
+                        result[approach] = "ACTIVE"
+                    elif result[approach] != "ACTIVE":
+                        result[approach] = "CLEARING"
             states[node_x] = result
         return states
 

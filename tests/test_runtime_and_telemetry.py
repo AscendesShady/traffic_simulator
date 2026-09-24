@@ -2178,9 +2178,9 @@ def test_llm_callbacks_write_runtime_control_instead_of_remaining_placeholders()
 
 
 def test_priority_telemetry_distinguishes_pending_from_active():
-    """A DBL request is pending only while queued behind another bus; the
-    node's live (armed) request is active from the moment it arms, since a
-    lane reservation needs no signal transition."""
+    """A request queued behind another bus is pending for TSP, but its DBL is
+    in force from the frame it is raised: a lane reservation on the bus's own
+    approach never waits for the node's one TSP slot."""
     control_panel.bus_routes_config["R1_EB_A_NB"]["dbl_enabled"] = True
     first = make_bus_for_leg("R1_EB_A_NB", NODE_A, "TELEMETRY_BUS_A")
     second = make_bus_for_leg("R1_EB_A_NB", NODE_A, "TELEMETRY_BUS_B")
@@ -2194,9 +2194,9 @@ def test_priority_telemetry_distinguishes_pending_from_active():
     pending = by_id["TELEMETRY_BUS_B"]
     assert pending["priority_transitioning"] is True
     assert pending["priority_requested"] is True
-    assert pending["dbl_priority_pending"] is True
+    assert pending["dbl_priority_pending"] is False
     assert pending["priority_granted"] is False
-    assert pending["dbl_active_triggered"] is False
+    assert pending["dbl_active_triggered"] is True
 
     active = by_id["TELEMETRY_BUS_A"]
     assert active["priority_transitioning"] is False

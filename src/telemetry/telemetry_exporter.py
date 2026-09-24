@@ -378,9 +378,11 @@ class TelemetryExporter:
             "priority_terminal": latest_terminal if priority is None else None,
             "latest_priority_terminal_event": latest_terminal,
             "tsp_priority_pending": tsp_requested and is_pending,
-            "dbl_priority_pending": dbl_requested and is_pending,
+            # DBL holds its lane from the frame it is requested, queued or
+            # armed (SignalController._dbl_requests), so it never pends.
+            "dbl_priority_pending": False,
             "tsp_active_triggered": tsp_requested and is_active,
-            "dbl_active_triggered": dbl_requested and is_active,
+            "dbl_active_triggered": dbl_requested,
             "priority_request": priority,
         }
 

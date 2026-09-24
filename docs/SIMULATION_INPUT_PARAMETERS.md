@@ -25,6 +25,7 @@ Source: `control_panel.py` (as of the current working tree). These are the defau
 | `bus_dwell` | door 4.0 s, board 3.0 s/pax, alight 2.0 s/pax, mean 4 on / 4 off, 2 doors | TCQSM 3rd ed. Ch. 6 dwell model at each route stop |
 | `fcd_period_s` | `0` | Floating-car-data sampling period (sim s); `0` = off |
 | `priority_eligibility_px` | `400` (100 m) | TSP eligibility zone before a node; panel slider 250–1400 px (62.5–350 m), clamped to the 500 m link |
+| `max_cycle_sec` | `150.0` | Longest cycle Webster may choose, at any flow ratio (NCHRP 812 large-intersection range; 120 s cost 3-10 % more person-hours at 0.7-1.0x campaign demand, 180 s gained under 1 %) |
 | `warmup_discard_frames` | `18000` (300 s) | Discarded before steady-state DVs; about 2.5 crossings of the 1.2 km arterial |
 
 ### `discharge_runtime` (nested)
@@ -82,18 +83,18 @@ Field definitions:
 <!-- BEGIN GENERATED ROUTES -->
 | Route ID | Name | Origin to destination | Waypoints | Lanes | Stops | Active | Headway | TSP | DBL | Manual dispatch |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `R1_EB_A_NB` | EB → Node A (NB) | EB to NODE_A_NB | 1400: LEFT | 1400: 2 | 1400: far-side | Yes | 30s | No | No | No |
-| `R2_EB_B_NB` | EB → Node B (NB) | EB to NODE_B_NB | 1400: STRAIGHT, 3400: LEFT | 1400: 1, 3400: 2 | 1400: far-side | Yes | 45s | No | No | No |
-| `R3_EB_ONLY` | EB Corridor (Straight) | EB to EB_CORRIDOR | 1400: STRAIGHT, 3400: STRAIGHT | 1400: 1, 3400: 1 | 1400: far-side | Yes | 90s | No | No | No |
-| `R4_WB_A_SB` | WB → Node A (SB) | WB to NODE_A_SB | 3400: STRAIGHT, 1400: LEFT | 3400: 1, 1400: 2 | 3400: far-side | Yes | 30s | No | No | No |
-| `R5_WB_B_SB` | WB → Node B (SB) | WB to NODE_B_SB | 3400: LEFT | 3400: 2 | 3400: far-side | Yes | 45s | No | No | No |
-| `R6_WB_ONLY` | WB Corridor (Straight) | WB to WB_CORRIDOR | 3400: STRAIGHT, 1400: STRAIGHT | 3400: 1, 1400: 1 | 3400: far-side | No | 90s | No | No | No |
+| `R1_EB_A_NB` | EB → Node A (NB) | EB to NODE_A_NB | 1400: LEFT | 1400: 2 | 1400: far-side | Yes | 180s | No | No | No |
+| `R2_EB_B_NB` | EB → Node B (NB) | EB to NODE_B_NB | 1400: STRAIGHT, 3400: LEFT | 1400: 1, 3400: 2 | 1400: far-side | Yes | 240s | No | No | No |
+| `R3_EB_ONLY` | EB Corridor (Straight) | EB to EB_CORRIDOR | 1400: STRAIGHT, 3400: STRAIGHT | 1400: 1, 3400: 1 | 1400: far-side | Yes | 300s | No | No | No |
+| `R4_WB_A_SB` | WB → Node A (SB) | WB to NODE_A_SB | 3400: STRAIGHT, 1400: LEFT | 3400: 1, 1400: 2 | 3400: far-side | Yes | 240s | No | No | No |
+| `R5_WB_B_SB` | WB → Node B (SB) | WB to NODE_B_SB | 3400: LEFT | 3400: 2 | 3400: far-side | Yes | 240s | No | No | No |
+| `R6_WB_ONLY` | WB Corridor (Straight) | WB to WB_CORRIDOR | 3400: STRAIGHT, 1400: STRAIGHT | 3400: 1, 1400: 1 | 3400: far-side | No | 180s | No | No | No |
 <!-- END GENERATED ROUTES -->
 
 Field definitions:
 - **waypoints** — for each signal node the route passes through, the turn move the bus makes there (`STRAIGHT`/`LEFT`).
 - **lanes** — the lane index the bus occupies at each node.
-- **headway_sec** — scheduled interval, in seconds, between automatic dispatches on that route.
+- **headway_sec** — scheduled interval, in seconds, between automatic dispatches on that route (panel slider 0–600 s, `MAX_HEADWAY_SEC`; 0 = no automatic dispatch).
 - **tsp_enabled** — Transit Signal Priority; grants the bus priority green requests at nodes (off by default).
 - **dbl_enabled** — Dedicated Bus Lane behavior (off by default).
 - **manual_dispatch** — if `True`, the route only dispatches on manual trigger rather than automatically on `headway_sec`.

@@ -28,13 +28,24 @@ import pytest
 
 from src.core import main
 from src.experiments import headless_run
+from src.ui import control_panel
 from tests.test_step_equivalence import _fingerprint
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "scenarios.json"
 SCENARIOS = {
-    # name: (seed, frames, tsp, dbl) on the default configuration
+    # name: (seed, frames, tsp, dbl) on the default configuration, except the
+    # bus headways (GOLDEN_HEADWAYS)
     "baseline_seed234": (234, 7600, False, False),
     "tsp_dbl_seed234": (234, 7600, True, True),
+}
+
+
+# The bus headways that were the defaults until 2026-09-24. The current
+# defaults (180-300 s) put the first departure beyond these 127 s runs, and the
+# tsp_dbl scenario would then pin no priority at all.
+GOLDEN_HEADWAYS = {
+    "R1_EB_A_NB": 30, "R2_EB_B_NB": 45, "R3_EB_ONLY": 90,
+    "R4_WB_A_SB": 30, "R5_WB_B_SB": 45, "R6_WB_ONLY": 90,
 }
 
 
@@ -51,6 +62,8 @@ def _canonical(value):
 
 
 def _run(seed, frames, tsp, dbl):
+    for route_id, headway in GOLDEN_HEADWAYS.items():
+        control_panel.bus_routes_config[route_id]["headway_sec"] = headway
     state = {}
     headless_run.run(
         seed, frames, tsp=tsp, dbl=dbl,

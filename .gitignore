@@ -31,6 +31,7 @@ excel_exports/
 # paired_dv_<campaign>.csv beside it. All of it is run output, not source.
 results/experiment_summary*.csv
 results/paired_dv_*.csv
+results/calibration_report_*.html
 *.log
 *.tmp
 

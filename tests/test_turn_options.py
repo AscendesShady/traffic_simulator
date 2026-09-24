@@ -140,3 +140,28 @@ def test_a_left_turner_stuck_out_of_its_lane_takes_the_missed_turn():
             break
     assert V.SAFETY_COUNTERS["missed_turns"] == before + 1
     assert NODE_A in car.passed_nodes and car.direction == "EB"   # straight through A
+
+
+def test_a_turner_half_way_out_of_lane_2_is_held_and_turns_from_lane_2():
+    """A DBL eviction slide keeps lane_index 2 until it completes. A left-turner
+    frozen half-way used to count as in lane 2 and pivot from the straddle,
+    across lane 1 (a configured-mode soak, 2026-09-24). It must be held,
+    slide back, and turn from the centre of lane 2."""
+    bar = NODE_A - ROAD_W / 2 - STOP
+    car = Vehicle(bar - 100, (LANES["EB"][2] + LANES["EB"][1]) / 2, "EB", max_speed=1.0,
+                  lane_index=DBL_LANE_INDEX, left_nodes=(NODE_A,))
+    car.lane_vacate_target = 1
+    controller = SignalController({"green_time": 100000}, 60, 60)
+    vehicles = [car]
+    controller.update(vehicles)
+    car.update(controller.get_all_signals(INT_X), INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
+    assert car.must_hold_for_lane and car.lane_vacate_target == DBL_LANE_INDEX
+    y_before_turn = None
+    for _ in range(3000):
+        y_before_turn = car.y
+        controller.update(vehicles)
+        car.update(controller.get_all_signals(INT_X), INT_X, H_Y, ROAD_W, STOP, LANE, vehicles, controller)
+        if car.direction != "EB":
+            break
+    assert car.direction == "NB"
+    assert abs(y_before_turn - LANES["EB"][2]) < 1.0

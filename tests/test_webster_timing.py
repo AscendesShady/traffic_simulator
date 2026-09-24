@@ -91,9 +91,10 @@ def test_oversaturated_node_caps_cycle():
 def test_per_node_cycles_can_differ():
     flows = reference_flows()
     flows["A_NB"]["rate"] = flows["A_SB"]["rate"] = 8
-    flows["B_NB"]["rate"] = flows["B_SB"]["rate"] = 12
+    flows["B_NB"]["rate"] = flows["B_SB"]["rate"] = 9
 
-    # S low enough that both nodes' optima clear the 40 s floor.
+    # S low enough that both nodes' optima clear the 40 s floor, demand low
+    # enough that neither reaches the maximum cycle.
     splits = webster.compute_all_nodes(flows, s=600.0, lost_time_sec=4.0)
 
     assert splits[NODE_A]["cycle_time_sec"] != splits[NODE_B]["cycle_time_sec"]
@@ -238,8 +239,8 @@ def test_cycle_is_autoset_to_optimal(monkeypatch):
         node_x: split["cycle_time_sec"] for node_x, split in splits.items()
     }
     for split in splits.values():
-        assert split["cycle_time_sec"] == max(
-            split["webster_optimal_cycle_sec"], webster.MIN_CYCLE_SEC
+        assert split["cycle_time_sec"] == min(
+            max(split["webster_optimal_cycle_sec"], webster.MIN_CYCLE_SEC), webster.MAX_CYCLE_SEC
         )
 
 
@@ -554,3 +555,20 @@ def test_baseline_and_llm_identical_timing(monkeypatch):
     with_llm = webster.compute_all_nodes(flows, 1366.0, lost_time_sec=4.0)
 
     assert baseline == with_llm
+
+
+def test_the_maximum_cycle_bounds_webster_below_saturation_too():
+    """Webster's optimum diverges as Y -> 1: at Y = 0.94 it is ~370 s. The
+    maximum cycle binds there as well as at Y >= 1 (it once bound only at
+    Y >= 1 and ran a 68-minute cycle at Y = 0.99)."""
+    s = 1400.0
+    near = webster.compute_node_green_splits({"EW": 0.56 * s, "NS": 0.38 * s}, s, lost_time_sec=12.6)
+    assert near["webster_optimal_cycle_sec"] > 300
+    assert near["cycle_time_sec"] == webster.MAX_CYCLE_SEC
+    assert near["cycle_source"] == "max_cycle_cap"
+    wider = webster.compute_node_green_splits(
+        {"EW": 0.56 * s, "NS": 0.38 * s}, s, lost_time_sec=12.6, oversaturated_cycle_cap_sec=150.0
+    )
+    assert wider["cycle_time_sec"] == 150.0
+    moderate = webster.compute_node_green_splits({"EW": 0.40 * s, "NS": 0.28 * s}, s, lost_time_sec=12.6)
+    assert moderate["cycle_source"] == "webster_optimal" and moderate["cycle_time_sec"] < webster.MAX_CYCLE_SEC

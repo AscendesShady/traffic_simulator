@@ -563,8 +563,11 @@ def log_skipped_tick(
         pass
 
 
-def read_ai_control(path: Path = AI_CONTROL_PATH) -> dict:
-    """Read the panel mirror; any failure is equivalent to disarmed."""
+def read_ai_control(path: Path | None = None) -> dict:
+    """Read the panel mirror; any failure is equivalent to disarmed. The path
+    defaults when called, not when imported, so a redirected AI_CONTROL_PATH
+    (parallel_campaign workers, the test isolation) is the file read."""
+    path = AI_CONTROL_PATH if path is None else path
     try:
         with Path(path).open("r", encoding="utf-8") as control_file:
             payload = json.load(control_file)
@@ -594,7 +597,12 @@ def is_configured(state) -> bool:
     return state.get("control_mode") == CONTROL_MODE_CONFIGURED
 
 
-def _read_telemetry(path: Path = TELEMETRY_PATH) -> dict | None:
+def _read_telemetry(path: Path | None = None) -> dict | None:
+    # Resolved when called: bound at import, a redirected TELEMETRY_PATH was
+    # ignored and every headless rule decision in a parallel campaign read the
+    # repository's stale data/ snapshot -- another run's, so the guard held
+    # every turn all-off (guard_reject_rate 1.0; found 2026-09-24).
+    path = TELEMETRY_PATH if path is None else path
     try:
         with Path(path).open("r", encoding="utf-8") as telemetry_file:
             telemetry = json.load(telemetry_file)
@@ -1447,7 +1455,15 @@ def ai_turn(state: AgentState) -> dict:
             raise TypeError("model response content is not text")
         if not isinstance(call_metrics, dict):
             call_metrics = {}
-        latency_ms = round((time.time() - started) * 1000.0, 1)
+        # A rule has no inference: its compute time (milliseconds, longer
+        # under CPU load) must not move the release frame
+        # (main._decision_release_frame), or a rule arm stops being
+        # deterministic -- beside other workers some turns landed a frame
+        # later than in a lone run (2026-09-24).
+        latency_ms = (
+            0.0 if rule_controller.is_rule_model(model)
+            else round((time.time() - started) * 1000.0, 1)
+        )
         return {
             "raw_output": raw_output,
             "status": "OK",

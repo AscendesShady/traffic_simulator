@@ -55,6 +55,10 @@ def test_tk_loop_runs_nothing_but_step_simulation():
 
 def test_headless_run_is_deterministic_and_keeps_production_bookkeeping(monkeypatch):
     monkeypatch.setitem(main.control_panel.global_config, "warmup_discard_frames", 600)
+    # A frequent service, so buses run inside this short window (the default
+    # headways put the first departure at 180 s).
+    for route in main.control_panel.bus_routes_config.values():
+        monkeypatch.setitem(route, "headway_sec", 30)
     states = []
     decisions = []
 

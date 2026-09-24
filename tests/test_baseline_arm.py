@@ -111,7 +111,10 @@ def test_baseline_reset_clears_route_flags_left_by_a_previous_model():
 def test_headless_baseline_minute_has_no_tsp_treatment():
     control_panel.global_config["test_model"] = "None"
     # Three sim-minutes: a bus needs over a minute to spawn, cross and exit,
-    # and only completed buses are recorded.
+    # and only completed buses are recorded -- so a frequent service (the
+    # default headways put the first departure at 180 s).
+    for route in control_panel.bus_routes_config.values():
+        route["headway_sec"] = 30
     records = headless_run.run(seed=3, frames=3 * 3600, tsp=False)
     treated = [
         node for record in records for node in record["nodes"] if node.get("tsp_treated")

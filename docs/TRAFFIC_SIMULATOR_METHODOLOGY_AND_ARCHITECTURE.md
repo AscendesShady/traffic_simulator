@@ -182,7 +182,11 @@ lane 2 at the source; a far-node left rides lanes 0–1 through the near node
 and starts working into lane 2 as soon as it has passed it (a driver
 positions for the next junction; two 3 s lane changes do not fit in the
 last 62.5 m of a queued link). It must be in lane 2 to turn and holds at the
-stop line until it is, booking nothing; one still out of its lane after
+stop line until it is, booking nothing. "In lane 2" is physical: a vehicle
+still sliding out of lane 2 (an eviction for a bus's DBL) counts as out of
+it, is held, and slides back unless the bus's DBL keeps it out; a lane
+commanded in the AI Configured mode is shared with left-turners and never
+evicts them. One still out of its lane after
 10 s at the line takes the missed turn and goes straight, counted as
 `missed_turns_total`. After any left the vehicle lands in the exit
 road's lane 2 and keeps it. Buses follow six fixed routes (§8). A vehicle is
@@ -239,12 +243,12 @@ with the movement and lane the bus uses at every node it meets:
 
 | Route | Path | Node movements (lane) | Headway | Default |
 |---|---|---|---|---|
-| R1_EB_A_NB | EB, left at A to NB | A: LEFT (2) | 30 s | active |
-| R2_EB_B_NB | EB through A, left at B to NB | A: STRAIGHT (1), B: LEFT (2) | 45 s | active |
-| R3_EB_ONLY | EB through both | A, B: STRAIGHT (1) | 90 s | active |
-| R4_WB_A_SB | WB through B, left at A to SB | B: STRAIGHT (1), A: LEFT (2) | 30 s | active |
-| R5_WB_B_SB | WB, left at B to SB | B: LEFT (2) | 45 s | active |
-| R6_WB_ONLY | WB through both | B, A: STRAIGHT (1) | 90 s | inactive |
+| R1_EB_A_NB | EB, left at A to NB | A: LEFT (2) | 180 s | active |
+| R2_EB_B_NB | EB through A, left at B to NB | A: STRAIGHT (1), B: LEFT (2) | 240 s | active |
+| R3_EB_ONLY | EB through both | A, B: STRAIGHT (1) | 300 s | active |
+| R4_WB_A_SB | WB through B, left at A to SB | B: STRAIGHT (1), A: LEFT (2) | 240 s | active |
+| R5_WB_B_SB | WB, left at B to SB | B: LEFT (2) | 240 s | active |
+| R6_WB_ONLY | WB through both | B, A: STRAIGHT (1) | 180 s | inactive |
 
 Each route has stops (`stops`, default one far-side stop at the route's
 first node — the placement transit-priority guidance pairs with TSP). A bus
@@ -301,8 +305,19 @@ arterial's lane 2 loads that lane at the *next* node. Then
 
 C_opt = (1.5 L + 5) / (1 − Y),
 
-floored at 40 s and, when Y ≥ 1 (oversaturated), replaced by a 120 s cap
-that is reported as such; effective green C − L is split in proportion to
+bounded to 40–150 s (`webster.MIN_CYCLE_SEC`, `max_cycle_sec`, default 150 s,
+within the Signal Timing Manual's range for large intersections, NCHRP Report
+812) and, when
+Y ≥ 1 and the optimum is undefined, set to the maximum; the source is
+reported (`webster_optimal`, `min_cycle_floor`, `max_cycle_cap`,
+`oversaturation_cap`). The maximum binds below saturation too: the optimum
+diverges as Y → 1 (371 s at Y = 0.94, 4,111 s at Y = 0.99 on this network),
+and until 2026-09-24 it was applied only at Y ≥ 1. At 150 s a node stays
+below capacity up to Y = (C − L)/C ≈ 0.916. The value was chosen by a
+sensitivity run on this network (baseline arm, seeds 234/764, 15 min): against
+120 s, 150 s cut total person-hours by 10 % at 0.7× campaign demand (which then
+runs its own 132 s optimum), 7 % at 0.8× and 3 % at 1.0×; 180 s added under 1 %
+while bus delay rose with the longer reds. Effective green C − L is split in proportion to
 y, and converted to displayed green G = g + l1 − e so the controller's real
 cycle equals the cycle Webster chose. Minimum green is 5 s (300 frames).
 Saturation flow is measured once per regime (speed scale, vehicle mix,
@@ -358,8 +373,8 @@ not hidden.
 **9.3 Transit Signal Priority.** TSP is a bounded perturbation of the
 running Webster cycle, never a phase override. A bus becomes eligible when
 its route flag is on for the leg it is on and it is within the eligibility
-distance of the stop line (default 100 m = 400 px, clamped to 62.5–200 m,
-the upper bound being the A–B link). One request per (bus, node, leg) is
+distance of the stop line (default 100 m = 400 px; the panel offers
+62.5–350 m and the controller clamps it to the 500 m A–B link). One request per (bus, node, leg) is
 queued per node; the head request is *armed* and may receive **one**
 action:
 
@@ -412,7 +427,12 @@ refusal) says, so a decision can only ever gate *new* requests and
 `FEATURE_DISABLED` is reachable only by an operator toggling a route off.
 
 **9.4 Dynamic Bus Lane.** A DBL reserves the kerb lane (lane 2) on the
-bus's approach leg while its request is armed. Through cars in that lane
+bus's approach leg from the frame its request is raised until the bus has
+cleared the node. The node's one armed slot (§9.3) is about TSP only: a DBL
+is a lane reservation on the bus's own approach and touches no signal timing,
+so it holds while its request is queued as well, several buses may hold one
+approach's lane at once, and the opposite approach's lane is independent.
+Through cars in that lane
 are ordered to vacate (unconditionally along the whole approach, not only
 near the bus); new left-turn arrivals, which must use lane 2, are retained
 at the source, and left-turners already on the approach hold in their
@@ -424,7 +444,20 @@ or ≤ 35 % of its own desired speed with a leader within 9 m), even once the
 bus is in the lane; the veto is re-run every frame the request lives and
 revokes DBL (`DBL_REVOKED_LANE_BLOCKED`) if a vehicle the gate accepted
 while moving later stands ahead, the request continuing as plain TSP if it
-also asked for TSP. An optional (non-route-required) merge is abandoned
+also asked for TSP. With both treatments on, a bus that enters the zone
+before reaching lane 2 checks in for TSP alone; when it reaches lane 2 that
+request takes DBL on and its entry lane moves with the bus
+(`SignalController._collect_priority_requests`). At the default 100 m zone
+buses are in lane 2 well before the zone, so this matters only for zones that
+begin before the merge (the 350 m option starts at the network entry).
+Until 2026-09-24 DBL was granted only to the node's armed request, so a bus's
+lane reservation waited behind any other request at that node; in the TSP+DBL
+arm, buses that had given DBL up kept raising TSP requests that held the slot
+for up to the 120 s request timeout, left-turners refilled the unprotected
+lane and the next bus gave DBL up too, so lane 2 was reserved 44–318 s per
+15-minute run against 3,000–4,800 s in the DBL-only arm. DBL-only and
+TSP+DBL results from before that date measure the coupled mechanism. An optional
+(non-route-required) merge is abandoned
 after a bounded 5 s (300 frames) wait, or immediately and stickily on a
 veto, so a DBL can never leave a bus worse off than baseline; a
 route-required merge (the bus needs lane 2 to turn) is never abandoned.
@@ -550,6 +583,7 @@ All counters are accumulated once per simulated frame in
 | Pace | achieved sim-seconds per wall-second; must be 1.0 for decision latency to mean what the agent assumes |
 | Control delay | per decision, sim seconds from the telemetry frame the decider saw to the first frame the decision took effect (grid-point detection + model call + 30-frame merge), measured on the sim clock: `control_delay_sim_s` (audit sheet), `control_delay_sim_sec_median/_p95` (summary) |
 | Trip records | one per vehicle (depart, arrival, duration, time loss, waiting time, depart delay, dwell, credited) in the workbook's Trip Info sheet, unfinished vehicles appended at export (SUMO tripinfo); optional floating-car data (`fcd_period_s`) |
+| Calibration record | every run workbook's Calibration sheet (`main.calibration_rows`): network scale, demand, vehicle parameters, the saturation-flow sample (queue size, headways used and excluded, mean headway, S, measured l1), ITE inputs and intervals, HCM lost time, per-node Webster derivation (critical lane flows, y, Y, C0, cycle used and its source, displayed greens, X), coordination and priority settings, each with its unit and source; `calibration_report_<campaign>.html` gathers it per regime with each run's validation checks (`src/telemetry/calibration_report.py`, written at batch end) |
 | Gridlock | onset/clearance times, stopped share, queue-head diagnosis |
 | Real-world readouts | v/c per approach from `approach_critical_lane_flow_veh_hr` (so v/c and Webster's y agree by construction), queue lengths in m, downstream space per lane in m — display/export only, never fed back |
 
@@ -560,12 +594,24 @@ All counters are accumulated once per simulated frame in
   (`demand_draw_hash`), as are each vehicle's behavioural draws and each
   bus trip's dwells, giving the standard variance-reduction design for
   paired simulation comparisons (Law, 2015).
+- **Two-phase execution.** The non-LLM arms (baseline, rule-based,
+  passenger-pressure-tsp) run first as parallel headless processes
+  (`src/experiments/parallel_campaign.py`), several at once on the CPU; the
+  LLM arms then run one at a time in the windowed application, with the
+  model on the GPU and the simulation alone on the CPU, joining the same
+  campaign. Every run follows the same per-run path (reset, frame step,
+  telemetry, checkpoints, export), and runs are deterministic: a run's end
+  state is bit-identical whether it ran alone or beside seven others
+  (measured). Running the LLM arms alone keeps their conditions identical
+  to one another: with six headless runs beside it, a model's latency was
+  unchanged within noise but the windowed simulation slowed by 15–22 %.
 - **Replications.** `print_campaign_summary` states, per arm, the runs
   needed for the mean paired DV to lie within ±10 % of itself at 95 %:
   N = (t₀.₉₇₅,ₙ₋₁ · s / e)² (FHWA Traffic Analysis Toolbox Vol. III), and
   flags an under-replicated arm.
 - **Warm-up.** Every steady-state DV (`*_steady`, `converged`) discards the
-  first 120 s (`warmup_discard_frames` = 7,200) via a snapshot taken once per
+  first 300 s (`warmup_discard_frames` = 18,000, about 2.5 crossings of the
+  1.2 km arterial) via a snapshot taken once per
   run; cumulative columns are kept alongside. `converged` requires the
   cumulative pax/min within 5 % between 0.8 T and T *and* `vehicles_in_network`
   within 10 % over the same span -- a cumulative mean is stable by
@@ -709,6 +755,9 @@ files.
 | LLM / rule turn loop, single decision writer | `src/agents/agent.py` | writes `decision.json` only |
 | Rule and pressure comparators | `src/agents/rule_controller.py` | agent |
 | Headless engine, batch | `src/experiments/headless_run.py`, `batch_runner.py` | tests, training, campaigns |
+| Parallel non-LLM campaign phase | `src/experiments/parallel_campaign.py` | campaigns (phase one) |
+| Progress records and their monitor | `src/experiments/progress.py`, `run_monitor.py` | headless runs, campaigns, pytest sessions |
+| Calibration report | `src/telemetry/calibration_report.py` | `print_campaign_summary`, CLI |
 | Real-world unit conversion (display/export only) | `src/telemetry/real_world_units.py` | dashboard, exports |
 | Bus TSP/DBL event log | `src/telemetry/bus_event_log.py` | exports |
 | Gridlock monitor | `src/telemetry/gridlock_monitor.py` | main, `<workbook>_gridlock.xlsx`, CLI `--watch` |
@@ -828,6 +877,16 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m pytest -c tests\pytest.ini tests -q
 .\.venv\Scripts\python.exe -m src.telemetry.gridlock_monitor --watch
 .\.venv\Scripts\python.exe docs\generate_geometry_tables.py
+
+# A campaign (commit first: rows pair only on one git_sha).
+# Phase one, the non-LLM arms in parallel headless workers; prints the campaign id:
+.\.venv\Scripts\python.exe -m src.experiments.parallel_campaign --arms baseline rule-based passenger-pressure-tsp --seeds 234 764 101 --minutes 60
+# Phase two, the LLM arms in the windowed app, joining that campaign:
+$env:TRAFFIC_JOIN_CAMPAIGN = '<campaign id>'; .\.venv\Scripts\python.exe run.py
+# Live progress of headless runs, campaigns and pytest sessions:
+.\.venv\Scripts\python.exe run_monitor.py
+# Regenerate a campaign's calibration report (written automatically at batch end):
+.\.venv\Scripts\python.exe -m src.telemetry.calibration_report [CAMPAIGN_ID]
 ```
 
 Ollama (local) or a `GEMINI_API_KEY` is needed only for LLM arms; the

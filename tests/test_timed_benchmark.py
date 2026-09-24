@@ -197,6 +197,7 @@ def test_test_autoexports_with_correct_filename(tmp_path, monkeypatch):
         # The run's verifiable setup, from the snapshot perform_full_reset
         # stores in global_config["_initial_input_rows"] (main.py).
         "Control Panel Inputs (start)",
+        "Calibration",  # how the regime was calibrated (main.calibration_rows)
         "Bus Events",
         "Unit Conversions",
         "Experiment Summary",

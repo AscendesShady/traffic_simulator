@@ -66,6 +66,28 @@ The simulator also rejects a decision whose timestamp is missing, invalid, or ol
 
 Each AI turn also records a concise model-supplied `reason`, the full raw model output, and the recent passenger throughput from the telemetry snapshot used for that decision. The reason is annotation only: missing or malformed reason text never rejects otherwise-valid flags, while held decisions always leave it blank. On shutdown, the Decisions worksheet includes readable `reason` and `pax_per_min_at_turn` columns.
 
+## Running experiments
+
+A campaign runs in two phases so every LLM arm runs under the same conditions.
+
+```powershell
+# Phase one: the non-LLM arms as parallel headless runs; prints the campaign id
+.\.venv\Scripts\python.exe -m src.experiments.parallel_campaign --arms baseline rule-based passenger-pressure-tsp --seeds 234 764 101 --minutes 60
+
+# Phase two: the LLM arms in the windowed app, joining that campaign
+$env:TRAFFIC_JOIN_CAMPAIGN = '<campaign id>'; .\.venv\Scripts\python.exe run.py
+
+# Watch headless runs, campaigns and pytest sessions live
+.\.venv\Scripts\python.exe run_monitor.py
+```
+
+Each run writes a workbook (with a Calibration sheet) and a summary row to
+`results/experiment_summary_<date>.csv`; at the end of a batch the arms are
+paired against the baseline on the same seed (`paired_dv_<campaign>.csv`) and
+`calibration_report_<campaign>.html` records how the simulation was calibrated
+and whether each run passed its validation checks. Commit before a campaign:
+rows only pair when their `git_sha` matches.
+
 ## Tests
 
 Run the complete regression suite:
@@ -100,6 +122,9 @@ Compile-check the application modules:
 | `vehicle.py` | Vehicle and bus routing, movement, following, and conflict behavior |
 | `telemetry_exporter.py` | Atomic telemetry snapshot generation |
 | `telemetry_dashboard.py` | Live metrics, in-memory trends, and phase visualization |
+| `parallel_campaign.py` | Parallel headless runs of the non-LLM arms, folded into one paired campaign |
+| `run_monitor.py`, `progress.py` | Live progress of headless runs, campaigns and pytest sessions |
+| `calibration_report.py` | Per-campaign calibration and validation report (HTML) |
 | `docs/audits/` | Historical, incident, callback, and step-by-step audit reports |
 | `results/` | Session Excel exports generated when the simulator closes |
 | `tests/` | Automated route, safety, callback, priority, discharge, and telemetry checks |
@@ -110,6 +135,7 @@ Compile-check the application modules:
 - [Model validation and verification note](MODEL_VALIDATION_AND_VERIFICATION_NOTE.md)
 - [Simulation input parameters](SIMULATION_INPUT_PARAMETERS.md)
 - [Audit report index](audits/README.md)
+- [TSP/DBL scenario matrix on the 500 m network — 2026-09-24](audits/2026-09-24-tsp-dbl-scenario-matrix.md)
 - [Audit and step-by-step fix report](audits/TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)
 - [Gridlock incident report](audits/TRAFFIC_SIMULATOR_GRIDLOCK_INCIDENT_REPORT.md)
 - [Pre-integration callback and placeholder audit](audits/TRAFFIC_SIMULATOR_CALLBACK_AND_PLACEHOLDER_AUDIT.md)

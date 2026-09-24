@@ -34,7 +34,9 @@ from src.core import vehicle as vehicle_module
 from src.core.vehicle import (
     Vehicle, Bus, DBL_LANE_INDEX, BUS_PASSENGERS, lane_changes_suspended,
 )
-from src.core.signal_controller import SignalController, TSP_MAX_ADJUST_FRACTION, MIN_GREEN_FRAMES
+from src.core.signal_controller import (
+    SignalController, TSP_MAX_ADJUST_FRACTION, MIN_GREEN_FRAMES, COORDINATION_MAX_ADJUST_FRACTION,
+)
 from src.ui.telemetry_dashboard import TelemetryDashboard, build_excel_export_filename
 from src.telemetry.telemetry_exporter import TelemetryExporter
 from src.telemetry.gridlock_monitor import GridlockMonitor, report_path_for
@@ -415,7 +417,7 @@ _CONFIG_HASH_GLOBAL_KEYS = (
     "vehicle_speed_scale", "priority_eligibility_px", "measured_saturation_flow",
     "warmup_discard_frames", "cycle_time_sec", "test_duration_sim_seconds",
     "signal_change_intervals", "signal_coordination", "coordination_direction",
-    "_signal_timing",
+    "max_cycle_sec", "_signal_timing",
 )
 _ROUTE_TREATMENT_KEYS = ("tsp_enabled", "dbl_enabled", "manual_dispatch")
 
@@ -823,6 +825,33 @@ def reset_session_logs():
             pass
         except OSError as exc:
             print(f"Session log reset warning for {path.name}: {exc}")
+
+
+def record_telemetry(telemetry, signals, vehicles, frame_number):
+    """Write the telemetry snapshot when the exporter's interval is due, and
+    feed the written payload to the telemetry log and the gridlock monitor.
+    One copy for the Tk loop and the headless campaign worker
+    (src/experiments/parallel_campaign.py), so both runs leave the same logs
+    behind for the summary row and the workbook."""
+    exported = telemetry.export(
+        signal_controller=signals,
+        vehicles=vehicles,
+        frame_number=frame_number,
+        demand_state=get_demand_telemetry(),
+        throughput_state=network_throughput,
+    )
+    if exported:
+        try:
+            with TELEMETRY_PATH.open("r", encoding="utf-8") as telemetry_file:
+                exported_payload = json.load(telemetry_file)
+            log_telemetry_sample(
+                exported_payload.get("frame_number", frame_number),
+                exported_payload,
+            )
+            gridlock_monitor.sample(exported_payload)
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    return exported
 
 
 def log_telemetry_sample(frame_number, payload):
@@ -1654,6 +1683,172 @@ def write_unit_conversions_sheet(sheet, telemetry=None):
         control_panel.APPROACH_NAMES,
         telemetry,
     )
+
+
+CALIBRATION_COLUMNS = ("section", "parameter", "value", "unit", "basis")
+
+
+def calibration_rows(config=None):
+    """How this run's regime was calibrated, as (section, parameter, value,
+    unit, basis) rows: every input, each derived value and the standard it
+    follows. Read from what perform_full_reset froze, so a checkpoint export
+    reports the regime the run started with."""
+    config = control_panel.global_config if config is None else config
+    cal = config.get("_calibration") or {}
+    timing = config.get("_signal_timing") or {}
+    splits = config.get("webster_splits") or {}
+    m_px, fps = vehicle_module.METERS_PER_PX, vehicle_module.FPS
+    scale = float(config.get("vehicle_speed_scale", 0.5) or 0.5)
+    kmh = scale * m_px * fps * 3.6   # px/frame before the speed scale -> km/h
+    rows = []
+
+    def add(section, parameter, value, unit="", basis=""):
+        rows.append((section, parameter, value, unit, basis))
+
+    add("Network", "Scale", m_px, "m/px", "HCM jam spacing 7.5 m per queued vehicle")
+    add("Network", "Link between nodes", abs(canvas.INT_X[1] - canvas.INT_X[0]) * m_px, "m")
+    add("Network", "Approach length", canvas.INT_X[0] * m_px, "m")
+    add("Network", "Lanes per direction", canvas.LANES, "", "lanes 0-1 through, lane 2 left turn / DBL")
+    add("Network", "Lane width", canvas.LANE * m_px, "m")
+    add("Network", "Physics step", round(1.0 / fps, 4), "s", "fixed 60 Hz")
+
+    for key, cfg in control_panel.approach_configs.items():
+        if not cfg.get("active", True):
+            add("Demand", control_panel.APPROACH_NAMES.get(key, key), 0, "veh/h", "inactive")
+            continue
+        straight = float(cfg.get("turn_split", 0.8))
+        # As _draw_arrival: the second left option exists only where the table has one.
+        second = float(cfg.get("left_far_share", 0)) if len(control_panel.APPROACH_TURN_OPTIONS[key]) > 1 else 0.0
+        add("Demand", control_panel.APPROACH_NAMES.get(key, key),
+            round(float(cfg.get("rate", 0)) * 60), "veh/h",
+            f"{cfg.get('model', 'Poisson')} arrivals; straight {straight:.0%}, "
+            f"left {max(0.0, 1 - straight - second):.0%}, second left option {second:.0%}, "
+            f"heavy {float(cfg.get('heavy_ratio', 0)):.0%}")
+
+    lo, hi = CAR_DESIRED_SPEED_RANGE
+    add("Vehicles", "Movement model", config.get("movement_model", "idm"))
+    add("Vehicles", "Speed scale", scale, "", "multiplies every desired speed")
+    add("Vehicles", "Car desired speed", f"{lo * kmh:.1f}-{hi * kmh:.1f}", "km/h", "uniform per driver")
+    lo_t, hi_t = TRUCK_DESIRED_SPEED_RANGE
+    add("Vehicles", "Truck desired speed", f"{lo_t * kmh:.1f}-{hi_t * kmh:.1f}", "km/h", "uniform per driver")
+    add("Vehicles", "Bus desired speed", round(1.0 * kmh, 1), "km/h")
+    add("Vehicles", "Passengers per car / truck / bus",
+        f"{vehicle_module.CAR_PASSENGERS} / {vehicle_module.TRUCK_PASSENGERS} / {vehicle_module.BUS_PASSENGERS}")
+    s0 = round(vehicle_module.IDM_S0_PX * m_px, 2)
+    for cls, p in vehicle_module.IDM_PARAMS_MPS.items():
+        add("Vehicles", f"IDM {cls}", f"T {p['T']} s, a {p['a']} m/s², b {p['b']} m/s², s0 {s0} m",
+            "", "Treiber & Kesting (2013) urban values")
+    add("Vehicles", "MOBIL",
+        f"politeness {vehicle_module.MOBIL_POLITENESS}, threshold {vehicle_module.MOBIL_THRESHOLD_MPS2} m/s², "
+        f"safe decel {vehicle_module.MOBIL_SAFE_DECEL_MPS2} m/s², keep-outer {vehicle_module.MOBIL_KEEP_OUTER_BIAS_MPS2} m/s²",
+        "", "Kesting, Treiber & Helbing (2007)")
+    add("Vehicles", "Lane-change duration", vehicle_module.LANE_CHANGE_DURATION_S, "s", "Toledo & Zohar (2007)")
+    add("Vehicles", "Standing threshold", vehicle_module.SLOW_VEHICLE_SPEED_MPS, "m/s")
+    add("Vehicles", "Emergency deceleration car / truck / bus",
+        " / ".join(str(v) for v in vehicle_module.EMERGENCY_DECEL_MPS2.values()), "m/s²",
+        "SUMO vType emergencyDecel defaults")
+
+    sat = "Saturation flow"
+    add(sat, "Method", "standing-queue discharge on one through lane", "",
+        "HCM 7th ed. Ch. 31 field procedure")
+    add(sat, "Approach", f"{CALIBRATION_APPROACH}, all straight, lane changes suspended")
+    add(sat, "Calibration seed", CALIBRATION_SEED_FALLBACK, "", "fixed: S describes the regime, not the run seed")
+    add(sat, "Heavy-vehicle share", cal.get("heavy_ratio"), "", "mean of the approach shares")
+    add(sat, "Vehicles standing at green onset", cal.get("queue_sample"), "veh",
+        f"target {CALIBRATION_TARGET_QUEUE}")
+    add(sat, "Start-up vehicles excluded", CALIBRATION_STARTUP_VEHICLES, "veh", "HCM: headways from the 5th vehicle")
+    add(sat, "Headways used", cal.get("headways_used"), "")
+    add(sat, "Headways excluded as interrupted", cal.get("excluded_headways"), "",
+        f"> {CALIBRATION_INTERRUPTION_FACTOR} x median")
+    add(sat, "Median headway", cal.get("median_headway_sec"), "s")
+    add(sat, "Mean saturation headway", cal.get("mean_headway_sec"), "s")
+    add(sat, "Saturation flow S", config.get("measured_saturation_flow"), "veh/h/lane",
+        "3600 / mean headway, measured once per regime; HCM base 1,900 pc/h/ln")
+    add(sat, "Start-up lost time l1", timing.get("startup_lost_sec"), "s",
+        "measured" if timing.get("startup_lost_source") == "measured" else "HCM default (first four interrupted)")
+
+    ch = "Change intervals"
+    method = config.get("signal_change_intervals", "ite")
+    add(ch, "Method", method, "", "ITE (2020) kinematic formulas, MUTCD 4D.26 bounds"
+        if method != "legacy" else "fixed 1 s + 1 s (comparison only)")
+    if method != "legacy":
+        v85, width = ite_inputs(config)
+        add(ch, "85th-percentile car speed v", round(v85 * 3.6, 1), "km/h")
+        add(ch, "Crossing distance W", round(width, 1), "m", "stop line to far box edge")
+        add(ch, "Perception-reaction t", webster.ITE_REACTION_SEC, "s", "ITE")
+        add(ch, "Deceleration a", webster.ITE_DECEL_MPS2, "m/s²", "ITE")
+        add(ch, "Vehicle length L", webster.ITE_VEHICLE_LENGTH_M, "m", "ITE")
+    add(ch, "Yellow Y", timing.get("yellow_sec"), "s", "t + v / 2a, bounded 3-6 s")
+    add(ch, "All-red AR", timing.get("all_red_sec"), "s", "(W + L) / v, at most 6 s")
+
+    extension = webster.HCM_EFFECTIVE_GREEN_EXTENSION_SEC
+    add("Lost time", "Extension of effective green e", extension, "s", "HCM default")
+    if timing.get("lost_time_sec") is not None:
+        add("Lost time", "Per phase t_L = l1 + Y + AR - e", round(timing["lost_time_sec"] / 2, 2), "s", "HCM 7th ed. Ch. 19")
+        add("Lost time", "Per cycle L (two phases)", timing["lost_time_sec"], "s")
+
+    offset = float(timing.get("startup_lost_sec") or webster.HCM_STARTUP_LOST_TIME_SEC) - extension
+    for index, (node_x, split) in enumerate(sorted(splits.items())):
+        section = f"Webster: node {'AB'[index] if index < 2 else index} (x={node_x})"
+        add(section, "Critical lane flow EW / NS",
+            f"{split.get('EW_critical_lane_flow_veh_hr')} / {split.get('NS_critical_lane_flow_veh_hr')}",
+            "veh/h/lane", "heaviest lane per phase, movement matrix")
+        add(section, "Flow ratio y EW / NS", f"{split.get('y_ew')} / {split.get('y_ns')}", "", "y = v / S")
+        add(section, "Critical flow ratio Y", split.get("Y"), "")
+        optimal = split.get("webster_optimal_cycle_sec")
+        add(section, "Webster optimum C0", optimal if optimal is not None else "undefined (Y >= 1)",
+            "s", "C0 = (1.5 L + 5) / (1 - Y)")
+        if "node_webster_cycle_sec" in split:
+            add(section, "Node's own cycle", split["node_webster_cycle_sec"], "s")
+        add(section, "Cycle used", split.get("cycle_time_sec"), "s")
+        add(section, "Cycle source", split.get("cycle_source"), "",
+            "Webster optimum, or the minimum/maximum cycle when it falls outside them")
+        green_ew, green_ns = split.get("EW_green_sec"), split.get("NS_green_sec")
+        add(section, "Displayed green EW / NS", f"{green_ew} / {green_ns}", "s",
+            "G = g + l1 - e (HCM), g split by y")
+        cycle = split.get("cycle_time_sec")
+        if cycle and green_ew and green_ns:
+            ratios = [
+                round(float(y) * cycle / max(float(green) - offset, 1e-6), 2)
+                for y, green in ((split.get("y_ew", 0), green_ew), (split.get("y_ns", 0), green_ns))
+            ]
+            add(section, "Degree of saturation X EW / NS", f"{ratios[0]} / {ratios[1]}", "",
+                "X = y C / g; above 1 cannot clear")
+    add("Webster", "Minimum cycle", webster.MIN_CYCLE_SEC, "s")
+    add("Webster", "Maximum cycle", timing.get("max_cycle_sec"), "s", "NCHRP Report 812")
+
+    co = "Coordination"
+    add(co, "Mode", timing.get("coordination"), "", "NCHRP Report 812: one common cycle")
+    if timing.get("coordination") == "coordinated":
+        add(co, "Progression direction", config.get("coordination_direction", "EB"))
+        add(co, "Common cycle", timing.get("common_cycle_sec"), "s", "longest node's cycle")
+        add(co, "Link travel time", round(link_travel_frames(config) / fps, 1), "s", "at mean car desired speed")
+        for node_x, seconds in (timing.get("offsets_sec") or {}).items():
+            add(co, f"Offset, node x={node_x}", seconds, "s", "EW-green start vs master")
+        add(co, "Correction per cycle", f"{COORDINATION_MAX_ADJUST_FRACTION:.0%}", "of green")
+
+    pr = "Priority and run"
+    add(pr, "TSP eligibility zone", round(float(config.get("priority_eligibility_px", 0)) * m_px), "m",
+        "clamped to the link")
+    add(pr, "TSP maximum adjustment", f"{TSP_MAX_ADJUST_FRACTION:.0%}", "of green")
+    add(pr, "Minimum green", MIN_GREEN_FRAMES / 60.0, "s")
+    add(pr, "Decision interval", (config.get("ai_runtime") or {}).get("tick_seconds"), "s")
+    add(pr, "Warm-up discarded", warmup_discard_frames() / 60.0, "s")
+    dwell = config.get("bus_dwell") or {}
+    if dwell:
+        add(pr, "Bus dwell", f"door {dwell.get('door_time_sec')} s + max({dwell.get('mean_boardings')} x "
+            f"{dwell.get('board_sec_per_pax')} s, {dwell.get('mean_alightings')} x {dwell.get('alight_sec_per_pax')} s)",
+            "", "TCQSM 3rd ed. Ch. 6")
+    return rows
+
+
+def write_calibration_sheet(sheet):
+    sheet.append(list(CALIBRATION_COLUMNS))
+    for row in calibration_rows():
+        sheet.append([value if isinstance(value, (int, float, str, bool)) or value is None
+                      else str(value) for value in row])
+    for column, width in zip("ABCDE", (22, 38, 34, 12, 48)):
+        sheet.column_dimensions[column].width = width
 
 
 # Bumped whenever a column is added/removed/redefined. append_experiment_summary_row
@@ -3123,6 +3318,7 @@ def export_test_workbook(
         write_control_panel_inputs_sheet(
             workbook.create_sheet("Control Panel Inputs")
         )
+        write_calibration_sheet(workbook.create_sheet("Calibration"))
         write_bus_events_sheet(workbook.create_sheet("Bus Events"), bus_events)
         write_unit_conversions_sheet(workbook.create_sheet("Unit Conversions"))
         write_experiment_summary_sheet(workbook.create_sheet("Experiment Summary"))
@@ -3422,9 +3618,12 @@ def print_campaign_summary(campaign_id):
             f"ran faster than real time (> {1 + PACE_TOLERANCE:.2f}; decisions landed later "
             f"than their latency): {len(off_pace)} {off_pace}"
             if off_pace else
-            f"achieved pace: {min((p for _, p in paces), default=1.0):.2f}-"
-            f"{max((p for _, p in paces), default=1.0):.2f} sim-s per wall-s "
-            "(decisions are released on the sim clock; a slow pace only costs wall time)"
+            (
+                f"achieved pace: {min(p for _, p in paces):.2f}-{max(p for _, p in paces):.2f} "
+                "sim-s per wall-s (decisions are released on the sim clock; a slow pace only "
+                "costs wall time)"
+                if paces else "achieved pace: not measured (headless runs keep no wall clock)"
+            )
         ),
         (
             f"skipped > {SKIP_RATE_TOLERANCE:.0%} of decision points (tick below the arm's "
@@ -3456,6 +3655,12 @@ def print_campaign_summary(campaign_id):
         lines.append(f"seeds without a baseline row (not paired): {unpaired}")
     if mismatched:
         lines.append(f"REFUSED (differs from baseline, not paired): {mismatched}")
+    try:
+        from src.telemetry import calibration_report
+        report = calibration_report.write_campaign_report(campaign_id, summary_path.parent)
+        lines.append(f"calibration report -> {report}")
+    except Exception as exc:  # the readout above must still print
+        lines.append(f"calibration report not written: {exc}")
     print("\n" + "\n".join(lines) + "\n")
 
 
@@ -3466,6 +3671,7 @@ def print_campaign_summary(campaign_id):
 # volume acceptance target.
 LATENT_DEMAND_WARN_SHARE = 0.05
 NETWORK_S_WARN_RATIO = 0.9
+GEH_ACCEPT_SHARE = 0.85
 
 
 def _campaign_validity_flags(rows):
@@ -3488,8 +3694,8 @@ def _campaign_validity_flags(rows):
         f"in-network saturation flow < {NETWORK_S_WARN_RATIO:.0%} of calibrated S: "
         f"{len(s_low)} {s_low if s_low else ''}"
     )
-    geh = [f"{n} {v:.0%}" for n, v in floats("geh_entry_share_below_5") if v < 0.85]
-    lines.append(f"GEH<5 on fewer than 85 % of sources: {len(geh)} {geh if geh else ''}")
+    geh = [f"{n} {v:.0%}" for n, v in floats("geh_entry_share_below_5") if v < GEH_ACCEPT_SHARE]
+    lines.append(f"GEH<5 on fewer than {GEH_ACCEPT_SHARE:.0%} of sources: {len(geh)} {geh if geh else ''}")
     return lines
 
 
@@ -3574,6 +3780,44 @@ def write_paired_dv_csv(campaign_id, pairs):
     return path
 
 
+# A windowed batch started with this set joins that campaign instead of
+# opening a new one: the second phase of a two-phase campaign, whose non-LLM
+# arms ran headless in parallel (src/experiments/parallel_campaign.py).
+JOIN_CAMPAIGN_ENV = "TRAFFIC_JOIN_CAMPAIGN"
+
+
+def campaign_stamp_of(campaign_id):
+    """The date stamp of the summary CSV that already holds rows of
+    ``campaign_id`` (experiment_summary_<stamp>.csv), or None."""
+    if not campaign_id:
+        return None
+    pattern = f"{EXPERIMENT_SUMMARY_PATH.stem}_*{EXPERIMENT_SUMMARY_PATH.suffix}"
+    for path in sorted(EXPERIMENT_SUMMARY_PATH.parent.glob(pattern)):
+        stamp = path.stem[len(EXPERIMENT_SUMMARY_PATH.stem) + 1:]
+        if not (len(stamp) == 8 and stamp.isdigit()):
+            continue                      # a rotated _schema_ file, not a dataset
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                if any(row.get("campaign_id") == campaign_id for row in csv.DictReader(handle)):
+                    return stamp
+        except (OSError, csv.Error):
+            continue
+    return None
+
+
+def new_or_joined_campaign(config=None):
+    """(campaign_id, stamp) for a batch starting now: the campaign named by
+    ``config["join_campaign_id"]`` or the TRAFFIC_JOIN_CAMPAIGN environment
+    variable, with the stamp its rows already carry, else a new one."""
+    import os  # the one use in main; kept local (test_lifecycle_consolidation)
+
+    config = control_panel.global_config if config is None else config
+    joined = str(config.get("join_campaign_id") or os.environ.get(JOIN_CAMPAIGN_ENV, "")).strip()
+    if joined:
+        return joined, campaign_stamp_of(joined) or time.strftime("%Y%m%d")
+    return str(uuid.uuid4()), time.strftime("%Y%m%d")
+
+
 def poll_batch_runner():
     """Drive the Batch Benchmark Runner one tick at a time from inside the
     fixed simulation loop: batch progress can only be observed through the
@@ -3591,9 +3835,9 @@ def poll_batch_runner():
         _batch_engine["runner"] = runner
         _batch_engine["phase"] = "IDLE"
         # One campaign id for every run of this batch: what the summary
-        # rows, manifests and the end-of-batch checks group by.
-        runtime["campaign_id"] = str(uuid.uuid4())
-        runtime["campaign_stamp"] = time.strftime("%Y%m%d")
+        # rows, manifests and the end-of-batch checks group by -- a new one,
+        # or the campaign this batch joins (new_or_joined_campaign).
+        runtime["campaign_id"], runtime["campaign_stamp"] = new_or_joined_campaign(config)
         _, dirty = _git_info()
         if dirty:
             print(
@@ -4127,6 +4371,7 @@ def calibrate_saturation_flow(
     excluded = 0
     startup_source = "hcm_default"
     startup_lost = webster.HCM_STARTUP_LOST_TIME_SEC
+    median = mean_headway = None
     if not headways or sum(headways) <= 0:
         saturation = DEFAULT_SATURATION_FLOW
     else:
@@ -4162,6 +4407,12 @@ def calibrate_saturation_flow(
             "startup_lost_sec": round(startup_lost, 2),
             "startup_lost_source": startup_source,
             "excluded_headways": excluded,
+            # The sample behind S, for the calibration record.
+            "queue_sample": len(sample),
+            "vehicles_timed": len(crossing_frames),
+            "headways_used": len(headways) - excluded,
+            "median_headway_sec": round(median, 3) if median is not None else None,
+            "mean_headway_sec": round(mean_headway, 3) if mean_headway is not None else None,
         }
     return saturation
 
@@ -4199,12 +4450,25 @@ def signal_change_intervals(config):
     """
     if config.get("signal_change_intervals", "ite") == "legacy":
         return 60, 60
+    yellow, all_red = webster.ite_change_intervals(*ite_inputs(config))
+    return int(round(yellow * 60)), int(round(all_red * 60))
+
+
+def ite_inputs(config):
+    """(v85 m/s, W m): the car stream's 85th-percentile desired speed and the
+    stop line to far-side box edge distance the ITE intervals are set from."""
     lo, hi = CAR_DESIRED_SPEED_RANGE
     v85_px = (lo + 0.85 * (hi - lo)) * float(config.get("vehicle_speed_scale", 0.5) or 0.5)
     v85_mps = v85_px * vehicle_module.METERS_PER_PX * vehicle_module.FPS
     width_m = (canvas.ROAD_W + canvas.STOP) * vehicle_module.METERS_PER_PX
-    yellow, all_red = webster.ite_change_intervals(v85_mps, width_m)
-    return int(round(yellow * 60)), int(round(all_red * 60))
+    return v85_mps, width_m
+
+
+def link_travel_frames(config):
+    """Link travel time between the nodes at the mean car desired speed."""
+    lo, hi = CAR_DESIRED_SPEED_RANGE
+    speed_px = (lo + hi) / 2.0 * float(config.get("vehicle_speed_scale", 0.5) or 0.5)
+    return int(round(abs(canvas.INT_X[1] - canvas.INT_X[0]) / max(speed_px, 1e-6)))
 
 
 def coordination_offsets_frames(config, splits):
@@ -4215,10 +4479,7 @@ def coordination_offsets_frames(config, splits):
     desired speed, so a platoon released on its green arrives on green
     (NCHRP Report 812, time-space / offset design).
     """
-    lo, hi = CAR_DESIRED_SPEED_RANGE
-    speed_px = (lo + hi) / 2.0 * float(config.get("vehicle_speed_scale", 0.5) or 0.5)
-    link_px = abs(canvas.INT_X[1] - canvas.INT_X[0])
-    travel = int(round(link_px / max(speed_px, 1e-6)))
+    travel = link_travel_frames(config)
     cycle = max(split["cycle_time_frames"] for split in splits.values())
     first, second = (canvas.INT_X[0], canvas.INT_X[1])
     if config.get("coordination_direction", "EB") == "WB":
@@ -4268,10 +4529,12 @@ def calibrate_and_apply_webster(signals, force=False):
             yellow, all_red, startup_lost_sec=startup_lost, extension_sec=extension
         )
         coordinated = config.get("signal_coordination", "coordinated") == "coordinated"
+        max_cycle = float(config.get("max_cycle_sec") or webster.MAX_CYCLE_SEC)
         splits = webster.compute_all_nodes(
             control_panel.approach_configs,
             saturation,
             lost_time_sec=lost_time,
+            oversaturated_cycle_cap_sec=max_cycle,
             displayed_green_offset_sec=startup_lost - extension,
             common_cycle=coordinated,
         )
@@ -4293,7 +4556,14 @@ def calibrate_and_apply_webster(signals, force=False):
             "lost_time_sec": round(lost_time, 2),
             "coordination": "coordinated" if coordinated else "independent",
             "common_cycle_sec": round(cycle_frames / 60.0, 2) if cycle_frames else None,
+            "max_cycle_sec": round(max_cycle, 2),
             "offsets_sec": {str(k): round(v / 60.0, 2) for k, v in offsets.items()},
+        }
+        # The saturation-flow sample behind S, for calibration_rows (kept
+        # out of _signal_timing so the summary's signal_timing_json is unchanged).
+        config["_calibration"] = {
+            **(measured if isinstance(measured, dict) else {"saturation_flow": saturation}),
+            "heavy_ratio": round(representative_heavy_ratio(), 4),
         }
         cycle_summary = ", ".join(
             f"node {node_x}={split['cycle_time_sec']:.1f}s"
@@ -4311,8 +4581,13 @@ def calibrate_and_apply_webster(signals, force=False):
 
 def perform_full_reset(vehicles, signals, telemetry=None):
     """Restore all per-run simulation state and return the frame-zero value."""
-    global _run_exported_workbook
+    global _run_exported_workbook, _active_signal_controller
     _run_exported_workbook = False
+    # The run's controller, for its summary row (_controller_experiment_metrics).
+    # Set only by the windowed main() before, so every headless and parallel
+    # campaign row reported zero TSP/DBL requests, grants and denials while its
+    # bus event log showed the treatment (found 2026-09-24).
+    _active_signal_controller = signals
     gridlock_monitor.reset()
     vehicles.clear()
     signals.reset_all_state()
@@ -5826,24 +6101,7 @@ def main():
         # finish_timed_test just flipped above, so it is polled here.
         poll_batch_runner()
 
-        telemetry_exported = telemetry.export(
-            signal_controller=signals,
-            vehicles=vehicles,
-            frame_number=master_frame_count,
-            demand_state=get_demand_telemetry(),
-            throughput_state=network_throughput,
-        )
-        if telemetry_exported:
-            try:
-                with TELEMETRY_PATH.open("r", encoding="utf-8") as telemetry_file:
-                    exported_payload = json.load(telemetry_file)
-                log_telemetry_sample(
-                    exported_payload.get("frame_number", master_frame_count),
-                    exported_payload,
-                )
-                gridlock_monitor.sample(exported_payload)
-            except (OSError, json.JSONDecodeError, AttributeError, TypeError):
-                pass
+        record_telemetry(telemetry, signals, vehicles, master_frame_count)
 
         # Render only on a due tick (build_simulation_canvas.frame_is_due):
         # the network draw, the DBL-state scan and the push all hang off the

@@ -2,6 +2,7 @@ import copy
 import os
 import sys
 import tkinter
+from pathlib import Path
 
 import pytest
 
@@ -77,6 +78,9 @@ def isolate_runtime_files(tmp_path_factory, monkeypatch):
         (telemetry_dashboard, "DASHBOARD_EXPORT_DIR", results),
     ):
         monkeypatch.setattr(module, name, path)
+    # Progress files (src/experiments/progress.py) too -- inherited by any
+    # worker process a test launches.
+    monkeypatch.setenv("TRAFFIC_PROGRESS_DIR", str(root / "progress"))
 
 
 @pytest.fixture(autouse=True)
@@ -124,3 +128,43 @@ def restore_shared_configuration():
     control_panel.approach_configs.clear()
     control_panel.approach_configs.update(approaches_snapshot)
     _main._saturation_cache.clear()
+
+
+# The session's progress for run_monitor.py: one "tests" row while the suite
+# runs, removed when it ends. Built at collection, before any test's
+# isolate_runtime_files points TRAFFIC_PROGRESS_DIR at a temp directory, so
+# it lands in the real runtime/progress. Progress is a courtesy: nothing here
+# can fail a test.
+_suite_progress = {}
+
+
+def pytest_collection_finish(session):
+    if session.config.option.collectonly or not session.items:
+        return
+    from src.experiments.progress import ProgressReporter
+    targets = ", ".join(Path(str(arg)).name for arg in session.config.args) or "tests"
+    _suite_progress.update(
+        reporter=ProgressReporter(
+            f"pytest {targets}", len(session.items), kind="tests", every_frames=1,
+            mean_rate=True, stale_after_sec=600,   # one test can run ~2 min
+        ),
+        done=0, failed=set(),
+    )
+
+
+def pytest_runtest_logreport(report):
+    reporter = _suite_progress.get("reporter")
+    if reporter is None:
+        return
+    if report.failed:
+        _suite_progress["failed"].add(report.nodeid)
+    if report.when == "teardown":   # every test reports a teardown, skipped or not
+        _suite_progress["done"] += 1
+        reporter.meta["failed"] = len(_suite_progress["failed"])
+        reporter.update(_suite_progress["done"])
+
+
+def pytest_sessionfinish(session):
+    reporter = _suite_progress.pop("reporter", None)
+    if reporter is not None:
+        reporter.remove()

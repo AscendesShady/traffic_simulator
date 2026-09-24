@@ -1086,9 +1086,10 @@ class Vehicle:
     def step_lane_vacate(self, int_x_list, h_y, road_w, lane_w, all_vehicles):
         """Advance an in-progress cooperative lane change by one small step.
 
-        The move pauses (never reverses, never jumps) while the corridor is
-        occupied or the vehicle is inside an intersection box, and resumes
-        once it is clear again, so a started change always completes.
+        The move pauses (never jumps) while the corridor is occupied or the
+        vehicle is inside an intersection box, and resumes once it is clear
+        again, so a started change always completes -- unless the target is
+        changed, as for a left-turner sent back to lane 2 (step 1d).
         """
         if self.lane_vacate_target is None:
             return
@@ -1342,19 +1343,19 @@ class Vehicle:
                 dist_to_stop = self.distance_to_node_stop_bar(target_node_x, h_y, road_w, stop_offset)
                 eligibility_px = signal_controller.get_priority_eligibility_px()
                 if 0.0 <= dist_to_stop <= eligibility_px:
-                    priority_bus = next(
-                        (
-                            other
-                            for other in all_vehicles
-                            if isinstance(other, Bus)
-                            and other.bus_id == dbl_request["bus_id"]
-                        ),
-                        None,
-                    )
+                    # Several buses can hold one approach's lane at once: a
+                    # car is clearing the way if it is ahead of any of them.
+                    dbl_buses = [
+                        bus
+                        for bus in signal_controller.dbl_buses_for_approach(target_node_x, self.direction)
+                        if bus in all_vehicles
+                    ]
                     if (
                         self.lane_vacate_target is None
                         and self.lane_index == DBL_LANE_INDEX
                         and not self.needs_turn_lane(dist_to_stop)
+                        # A commanded lane is shared with left-turners.
+                        and not (dbl_request.get("commanded") and self.target_turn == "LEFT")
                     ):
                         # Only start a change that can finish before the stop
                         # bar, so the car never enters the box mid-lane.
@@ -1365,9 +1366,8 @@ class Vehicle:
                             )
                     # A commanded lane (AI Configured) has no bus to hold
                     # for: a car that cannot vacate drives on.
-                    if self.lane_vacate_target is None and not dbl_request.get("commanded") and (
-                        priority_bus is None
-                        or not _is_ahead_on_approach(priority_bus, self)
+                    if self.lane_vacate_target is None and not dbl_request.get("commanded") and not any(
+                        _is_ahead_on_approach(bus, self) for bus in dbl_buses
                     ):
                         should_stop = True
 
@@ -1422,10 +1422,17 @@ class Vehicle:
         #     turners at the source for the same reason).
         if not isinstance(self, Bus):
             self.must_hold_for_lane = False
+            # In lane 2 means there, not only labelled there: a slide out of
+            # lane 2 (a DBL eviction) keeps lane_index 2 until it completes.
+            # A turner frozen half-way used to pass as in lane 2 and pivot from
+            # the straddle, across the lane beside it (a configured-mode soak,
+            # 2026-09-24); now it is held and, unless a bus's DBL keeps it out,
+            # slides back.
+            leaving_lane_2 = self.lane_vacate_target not in (None, DBL_LANE_INDEX)
             if (
                 self.target_turn == "LEFT"
                 and self.direction in ("EB", "WB")
-                and self.lane_index != DBL_LANE_INDEX
+                and (self.lane_index != DBL_LANE_INDEX or leaving_lane_2)
                 and upstream
                 and self.positions_for_turn(
                     self.distance_to_node_stop_bar(target_node_x, h_y, road_w, stop_offset)

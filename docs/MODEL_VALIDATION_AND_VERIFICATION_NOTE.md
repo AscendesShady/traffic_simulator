@@ -74,8 +74,11 @@ and filter arrows are not modelled; bus stops are in-lane (no
 bays); bus occupancy is fixed at 45 (boardings equal alightings in
 expectation); dwell parameters are TCQSM-range defaults, not calibrated to a
 corridor; model parameters (IDM, MOBIL, dwell, change-interval inputs) are
-literature values, not fitted to a site; Webster's formula is undefined when
-the flow-ratio sum Y ≥ 1, and the cycle is then held at its 120 s cap; the
+literature values, not fitted to a site; Webster's optimum diverges as the
+flow-ratio sum Y approaches 1 and is undefined at Y ≥ 1, so the cycle is
+bounded at a 150 s maximum (the Signal Timing Manual's range for large
+intersections, chosen by a 120/150/180 s sensitivity run) in both
+cases; the
 legacy movement engine (§4.2) remains selectable for comparison but is not a
 valid engine for results.
 
@@ -171,6 +174,15 @@ crossing: about 2 s more lost time per cycle, identical for every arm.
   than real time, which would land decisions late, is flagged.
 - **Baseline integrity.** A baseline row that shows any decision or TSP
   treatment is refused (`BaselineContaminationError`).
+- **Parallel execution of the non-LLM arms.** Baseline and rule arms run as
+  parallel headless processes; the LLM arms run afterwards, one at a time,
+  in the same campaign. Every run goes through the same per-run code as a
+  windowed run, and execution is deterministic: eight runs gave end states
+  bit-identical to the same runs executed one at a time, at four and at
+  eight in parallel, and parallel and sequential campaigns produce
+  identical summary rows (all measurement columns; pinned by a test). The
+  LLM arms are not run beside other work, so every model is measured under
+  the same conditions.
 
 ### 4.2 Defects found in the 2026-09-22 campaign and corrected
 
@@ -260,6 +272,56 @@ each is now covered by a test.
     10 s, and neither leak survives. Afterwards, at the same demand and
     seed: 0 of 124 near-side turns entered on red, and admission at the
     sources rose from 48–79 % to 85–98 %.
+12. **The maximum cycle bound only at Y ≥ 1.** Webster's optimum diverges as
+    Y → 1: on the 500 m network it ran 371 s at Y = 0.94 and a 68-minute
+    cycle at Y = 0.99, then dropped back to the cap at Y = 1.05. *Corrected:*
+    the maximum bounds the optimum at every Y (`cycle_source`
+    `max_cycle_cap`), and a 120 / 150 / 180 s sensitivity run set it to 150 s
+    (§8a).
+13. **DBL waited for the node's TSP slot.** Found by the 2026-09-24 scenario
+    matrix: in the TSP+DBL arm lane 2 was reserved 44–318 s per 15-minute
+    run against 3,000–4,800 s DBL-only. DBL was granted only to the node's
+    one armed request; buses that had given DBL up kept raising TSP requests
+    that held that slot for up to 120 s, left-turners refilled the
+    unprotected lane and the next bus gave DBL up too. *Corrected:* DBL is
+    granted when requested and holds the lane on the bus's own approach
+    whether its request is armed or queued; TSP keeps one action per node
+    (`docs/audits/2026-09-24-tsp-dbl-scenario-matrix.md`).
+14. **A turner could pivot from between two lanes.** Found by the test
+    suite's AI Configured soak when the bus headway defaults changed: a
+    left-turner told to leave a commanded lane froze half-way into lane 1,
+    still labelled lane 2 (a slide changes the label only when it
+    completes), passed the "in the turn lane" check, and turned across
+    lane 1 into a through car inside the box. *Corrected:* a vehicle still
+    sliding out of lane 2 counts as out of it, is held at the stop line and
+    slides back; a commanded lane, which is shared with left-turners, no
+    longer evicts them.
+15. **Headless rule arms decided on another run's telemetry.** Found by the
+    pre-experiment smoke campaign: in the parallel runner the rule and
+    pressure arms issued a decision every 10 s, but the guard held all 60
+    per run all-off (`guard_reject_rate` 1.0, `decisions_effective` 0), so
+    every paired difference was exactly zero. The agent's telemetry and
+    control readers took their file paths as default arguments, bound at
+    import, so the worker's redirected paths were ignored and every turn
+    read the repository's stale snapshot of an earlier run. No stored
+    result was affected (the only rule-arm rows ran in the windowed app,
+    which never redirects the paths). *Corrected:* the paths resolve when
+    called, and the campaign test asserts a rule arm the guard accepts.
+16. **Headless summary rows reported no priority.** Found by the same smoke
+    campaign once the rule arms worked: the per-bus event log showed DBL
+    served at 8 node crossings and a TSP early green, yet the summary row
+    reported zero TSP and DBL requests. The row read the run's controller
+    from a reference only the windowed application set; headless runs fell
+    back to zeros. *Corrected:* the full reset every run goes through
+    registers its controller, and a test checks the row against the
+    controller after a headless run with priority.
+17. **Rule arms were not deterministic under load.** Once the rule turns
+    were accepted, the parallel = sequential test failed two runs in four: a
+    rule turn carried its measured compute time as its latency, and a
+    decision is released that many frames after its snapshot, so under CPU
+    load some turns landed a frame later. *Corrected:* a rule turn carries
+    zero latency, as the design always stated; the test passed three runs
+    in three afterwards.
 
 The export-time self-checks (§4.3) and pairing contract are why several of
 these surfaced as refused rows rather than wrong numbers.
@@ -484,6 +546,30 @@ p95 0.89–1.94 s (50 turns each, 200 of 200 valid, running on the GPU
 beside the simulation), at least 5× inside the 10 s decision interval.
 Each decision's control delay — snapshot to effect — is measured on the
 simulation clock and reported per run.
+
+## 8a. Calibration on the 500 m network (scenario matrix, 2026-09-24)
+
+Sixty 15-minute headless runs (demand 0.4–1.0× the campaign rates, seeds
+234 and 764, four arms, maximum cycle 120 / 150 / 180 s; full record in
+`docs/audits/2026-09-24-tsp-dbl-scenario-matrix.md` and each regime's
+Calibration sheet):
+
+- S = 1,396 veh/h/lane from 25 uninterrupted headways (median 2.30 s, mean
+  2.58 s, 13 % heavy vehicles); l1 = 1.79 s measured; yellow 3.0 s and
+  all-red 3.5 s; lost time 12.58 s per cycle.
+- Webster: Y = 0.47 / 0.70 / 0.82 / 0.94 / 1.17 at 0.4 / 0.6 / 0.7 / 0.8 /
+  1.0× (Node A), cycles 45 s and 80 s at the optimum and the maximum above.
+- In-network saturation flow was 0.93–1.04 of the calibrated S on all 60
+  runs. Latent demand above 5 % occurred only at 0.8× and 1.0× (and one 0.7×
+  run at a 120 s cap): demand beyond practical capacity, not
+  miscalibration.
+- Maximum cycle: against 120 s, 150 s cut total person-hours by 10 / 7 / 3 %
+  at 0.7 / 0.8 / 1.0×; 180 s added under 1 %.
+
+Bus headways in these runs were the former 30 / 45 / 90 s and DBL was still
+coupled to the TSP slot (item 13), so the matrix's TSP and DBL effect
+figures are not results for the current model; the calibration figures
+above do not depend on either.
 
 ## 9. Summary argument
 

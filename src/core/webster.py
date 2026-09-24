@@ -32,7 +32,20 @@ used cycle is floored at MIN_CYCLE_SEC, the usual practical minimum.
 from src.ui.canvas_gemini import INT_X
 
 FPS = 60
-OVERSATURATED_CYCLE_CAP_SEC = 120.0
+# Longest cycle the controller runs. Webster's optimum (1.5L + 5)/(1 - Y)
+# diverges as Y -> 1 -- 371 s at Y = 0.94 and 4,111 s at Y = 0.99 on the
+# 500 m network -- and is undefined at Y >= 1, so practice bounds the cycle
+# (Signal Timing Manual, NCHRP Report 812: typically 60-120 s, up to
+# 150-180 s at large intersections). It used to bind only at Y >= 1, which
+# ran a 68-minute cycle at Y = 0.99 and dropped back to 120 s at Y = 1.05.
+# 150 s, the manual's large-intersection range: on the 500 m network (seeds
+# 234/764, 15 min, baseline) it cut total person-hours against 120 s by 10 %
+# at 0.7x campaign demand (which then runs its own 132 s optimum), 7 % at
+# 0.8x and 3 % at 1.0x; 180 s added under 1 % while buses waited longer reds
+# (2026-09-24). It keeps a node below capacity up to Y = (C - L)/C = 0.916.
+# main passes global_config["max_cycle_sec"] when set.
+MAX_CYCLE_SEC = 150.0
+OVERSATURATED_CYCLE_CAP_SEC = MAX_CYCLE_SEC   # the earlier name, kept for callers
 MIN_CYCLE_SEC = 40.0
 STRAIGHT_LANES = (0, 1)   # share the straight movement evenly
 LEFT_LANE = 2
@@ -185,6 +198,9 @@ def compute_node_green_splits(
     elif float(optimal_cycle) < float(min_cycle_sec):
         used_cycle = max(float(min_cycle_sec), lost_time_sec + 1.0)
         cycle_source = "min_cycle_floor"
+    elif float(optimal_cycle) > float(oversaturated_cycle_cap_sec):
+        used_cycle = max(float(oversaturated_cycle_cap_sec), lost_time_sec + 1.0)
+        cycle_source = "max_cycle_cap"
     else:
         used_cycle = max(float(optimal_cycle), lost_time_sec + 1.0)
         cycle_source = "webster_optimal"

@@ -840,3 +840,49 @@ def test_the_eligibility_slider_reaches_350_m():
     assert control_panel.set_priority_eligibility_px(99999) == control_panel.PRIORITY_ELIGIBILITY_UI_MAX_PX
     assert control_panel.PRIORITY_ELIGIBILITY_UI_MAX_PX <= PRIORITY_ELIGIBILITY_MAX_PX
     assert control_panel.set_priority_eligibility_px(400) == 400     # the 100 m default
+
+
+def test_a_tsp_request_takes_on_dbl_when_its_bus_reaches_lane_2():
+    """TSP and DBL both on: a bus inside the zone before reaching lane 2 checks
+    in for TSP alone and becomes DBL-eligible only in lane 2. Its one request
+    must then take DBL and move its entry lane, or that bus never reserves the
+    lane and its TSP grant is unusable from lane 2 (_bus_can_use_grant)."""
+    config = control_panel.bus_routes_config["R2_EB_B_NB"]
+    config["tsp_enabled"] = config["dbl_enabled"] = True
+    bus = make_bus_for_leg("R2_EB_B_NB", NODE_A)
+    bus.x = NODE_A - 200
+    controller = make_controller()
+
+    controller.update([bus])
+    request = controller.nodes[NODE_A].active_request
+    assert request.tsp_requested and not request.dbl_requested
+    assert request.entry_lane == 1
+
+    bus.lane_index, bus.y = DBL_LANE_INDEX, H_Y - 2.5 * LANE
+    controller.update([bus])
+    assert controller.nodes[NODE_A].active_request is request
+    assert request.dbl_requested and request.dbl_granted
+    assert request.entry_lane == DBL_LANE_INDEX
+    assert controller.experiment_metrics["dbl_requests_raised"] == 1
+    assert controller.is_dbl_active_for_approach(NODE_A, "EB")
+
+
+def test_dbl_holds_its_lane_while_another_bus_holds_the_tsp_slot():
+    """DBL reserves lane 2 on the bus's own approach and touches no signal
+    timing, so it never waits for the node's one TSP slot: a WB bus's lane is
+    reserved while an EB bus's TSP-only request is the armed one."""
+    control_panel.bus_routes_config["R1_EB_A_NB"]["tsp_enabled"] = True
+    control_panel.bus_routes_config["R4_WB_A_SB"]["dbl_enabled"] = True
+    eb = make_bus_for_leg("R1_EB_A_NB", NODE_A, "BUS_A")
+    wb = make_bus_for_leg("R4_WB_A_SB", NODE_A, "BUS_B")
+    controller = make_controller()
+
+    controller.update([eb, wb])
+    node = controller.nodes[NODE_A]
+    assert node.active_request.bus is eb and not node.active_request.dbl_requested
+    queued = node.request_queue[0]
+    assert queued.bus is wb and queued.state == REQUESTED and queued.dbl_granted
+    assert controller.is_dbl_active_for_approach(NODE_A, "WB")
+    assert not controller.is_dbl_active_for_approach(NODE_A, "EB")
+    assert controller.get_all_dbl_states()[NODE_A]["WB"] == "ACTIVE"
+    assert controller.dbl_buses_for_approach(NODE_A, "WB") == [wb]

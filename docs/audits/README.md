@@ -6,6 +6,7 @@ general project documentation.
 
 ## Current reports
 
+- [TSP/DBL Scenario Matrix on the 500 m Network — 2026-09-24](2026-09-24-tsp-dbl-scenario-matrix.md)
 - [Priority-Green Gridlock Incident — 2026-09-07](GRIDLOCK_PRIORITY_STARVATION_INCIDENT_2026-09-07.md)
 - [DBL + TSP Simultaneous Activation — Blocked Middle Lane Check — 2026-09-07](DBL_TSP_MIDDLE_LANE_BLOCK_CHECK_2026-09-07.md)
 - [Audit and Step-by-Step Fix Report](TRAFFIC_SIMULATOR_AUDIT_AND_STEP_BY_STEP_FIX_REPORT.md)

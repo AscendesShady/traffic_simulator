@@ -18,6 +18,7 @@ from pathlib import Path
 
 from src.core import main
 from src.core.signal_controller import SignalController
+from src.experiments.progress import ProgressReporter
 from src.telemetry.telemetry_exporter import TelemetryExporter
 from src.ui import canvas_gemini as canvas
 from src.ui import control_panel
@@ -47,7 +48,8 @@ def apply_benchmark_regime():
 LANE_OPTIONS = main.LANE_OPTIONS
 
 
-def run(seed, frames, tsp=True, dbl=False, decide=None, decide_every_frames=300, on_finish=None):
+def run(seed, frames, tsp=True, dbl=False, decide=None, decide_every_frames=300, on_finish=None,
+        progress_label=None):
     """One seeded run through main.step_simulation -- the same frame the
     Tk loop runs, so counters, bus events and metrics are production's.
     Returns the completed bus-event records.
@@ -58,6 +60,9 @@ def run(seed, frames, tsp=True, dbl=False, decide=None, decide_every_frames=300,
     frame where production merges its guarded decision -- the hook a
     learner trains through. Without it the route flags stay as ``tsp``/
     ``dbl`` set them at the start.
+
+    ``progress_label``, when given, publishes the run's progress for
+    run_monitor.py (src/experiments/progress.py).
     """
     for route_id, cfg in control_panel.bus_routes_config.items():
         on = route_id in TSP_ROUTES
@@ -87,8 +92,21 @@ def run(seed, frames, tsp=True, dbl=False, decide=None, decide_every_frames=300,
                         decide(exporter.build_payload(signals, vehicles, frame), frame)
                     )
 
-            for frame in range(1, frames + 1):
-                main.step_simulation(vehicles, signals, frame, decide=decision_source)
+            reporter = (
+                ProgressReporter(progress_label, frames, meta={"seed": seed, "tsp": tsp, "dbl": dbl})
+                if progress_label else None
+            )
+            try:
+                for frame in range(1, frames + 1):
+                    main.step_simulation(vehicles, signals, frame, decide=decision_source)
+                    if reporter is not None:
+                        reporter.update(frame)
+            except BaseException:
+                if reporter is not None:
+                    reporter.finish("failed", done=frame)
+                raise
+            if reporter is not None:
+                reporter.finish()
             if on_finish is not None:
                 on_finish(vehicles, signals)  # end-of-run state, for equivalence checks
         finally:

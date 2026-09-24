@@ -572,3 +572,22 @@ def test_the_maximum_cycle_bounds_webster_below_saturation_too():
     assert wider["cycle_time_sec"] == 150.0
     moderate = webster.compute_node_green_splits({"EW": 0.40 * s, "NS": 0.28 * s}, s, lost_time_sec=12.6)
     assert moderate["cycle_source"] == "webster_optimal" and moderate["cycle_time_sec"] < webster.MAX_CYCLE_SEC
+
+
+def test_a_node_held_at_the_maximum_cycle_is_shown_capped(monkeypatch):
+    """Under capacity but capped: shown as such with Webster's own optimum,
+    not as "optimal", or every recalculation near capacity reads as the same
+    150 s and looks like nothing changed."""
+    monkeypatch.setitem(control_panel.global_config, "calibrating", False)
+    monkeypatch.setitem(control_panel.global_config, "measured_saturation_flow", 1408)
+    monkeypatch.setitem(control_panel.global_config, "webster_splits", {
+        NODE_A: {"cycle_time_sec": 150.0, "EW_green_sec": 77.0, "NS_green_sec": 60.0, "y_ew": 0.53,
+                 "y_ns": 0.36, "Y": 0.89, "oversaturated": False, "webster_optimal_cycle_sec": 228.0,
+                 "cycle_source": "common_cycle (max_cycle_cap)"},
+        NODE_B: {"cycle_time_sec": 150.0, "EW_green_sec": 80.0, "NS_green_sec": 57.0, "y_ew": 0.5,
+                 "y_ns": 0.3, "Y": 0.8, "oversaturated": False, "webster_optimal_cycle_sec": 119.0,
+                 "cycle_source": "common_cycle (webster_optimal)"},
+    })
+    node_a, node_b = control_panel.get_webster_timing_summary()["nodes"]
+    assert (node_a["status"], node_a["capped"], node_a["webster_optimal_cycle_sec"]) == ("At maximum cycle", True, 228.0)
+    assert (node_b["status"], node_b["capped"]) == ("Optimal", False)

@@ -2306,15 +2306,20 @@ class TelemetryDashboard:
                 refs["note"].pack_forget()
                 continue
             oversaturated = bool(node.get("oversaturated"))
+            capped = bool(node.get("capped"))
             refs["state"].config(
                 text=node["status"],
-                fg=COLOR_DANGER if oversaturated else COLOR_SUCCESS,
+                fg=COLOR_DANGER if oversaturated else COLOR_WARNING if capped else COLOR_SUCCESS,
+            )
+            optimum = node.get("webster_optimal_cycle_sec")
+            basis = (
+                "capped" if oversaturated
+                else f"capped · Webster {optimum:.0f} s" if capped and optimum
+                else "capped" if capped
+                else "optimal"
             )
             refs["cycle"].config(
-                text=(
-                    f"Cycle length: {node['cycle_time_sec']:.0f} s  ·  "
-                    f"{'capped' if oversaturated else 'optimal'}"
-                )
+                text=f"Cycle length: {node['cycle_time_sec']:.0f} s  ·  {basis}"
             )
             refs["ratio"].config(
                 text=(
@@ -2323,9 +2328,10 @@ class TelemetryDashboard:
                     f"Total {node['total_ratio']:.2f}"
                 )
             )
-            if oversaturated:
+            if oversaturated or capped:
                 refs["note"].config(
-                    text="Reduce demand or increase vehicle speed."
+                    text="Reduce demand or increase vehicle speed." if oversaturated
+                    else "Demand changes move the green split, not the cycle."
                 )
                 if not refs["note"].winfo_manager():
                     refs["note"].pack(fill="x", padx=8, pady=(0, 4))

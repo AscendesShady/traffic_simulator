@@ -386,12 +386,18 @@ def get_webster_timing_summary():
         oversaturated = bool(split.get("oversaturated", False))
         if oversaturated:
             has_oversaturated_node = True
+        # Under capacity but held at the maximum cycle: Webster wants longer.
+        # Shown apart, or the cycle reads "150 s, optimal" at every demand
+        # near capacity and a recalculation looks like nothing changed.
+        capped = not oversaturated and "max_cycle_cap" in str(split.get("cycle_source", ""))
         nodes.append({
             "position": node_x,
             "name": node_name,
             "available": True,
-            "status": "Oversaturated" if oversaturated else "Optimal",
+            "status": "Oversaturated" if oversaturated else ("At maximum cycle" if capped else "Optimal"),
             "oversaturated": oversaturated,
+            "capped": capped,
+            "webster_optimal_cycle_sec": split.get("webster_optimal_cycle_sec"),
             "cycle_time_sec": float(split.get("cycle_time_sec") or 0.0),
             "total_ratio": float(split.get("Y") or 0.0),
             "ew_ratio": float(split.get("y_ew") or 0.0),

@@ -318,10 +318,15 @@ def test_poll_batch_runner_end_to_end(monkeypatch):
     main.poll_batch_runner()  # AWAITING_START -> RUN_ACTIVE
     fake_stop()
     main.poll_batch_runner()  # RUN_ACTIVE -> COMPLETED; queue empty -> DONE
-
     runtime = control_panel.global_config["batch_runtime"]
+    campaign_id = runtime["campaign_id"]
+    summaries = []
+    monkeypatch.setattr(main, "print_campaign_summary", summaries.append)
+    main.poll_batch_runner()  # DONE -> campaign summary (paired DV, calibration report)
+
     assert [row["status"] for row in runtime["results"]] == ["COMPLETED", "COMPLETED"]
     assert runtime["active"] is False
+    assert summaries == [campaign_id] and campaign_id
 
 
 def test_model_picker_lists_local_api_rule_and_none(monkeypatch):
@@ -437,3 +442,14 @@ def test_batch_choices_group_by_control_strategy(monkeypatch):
     ]
     assert "llama3.1:8b" in by_strategy[control_panel.STRATEGY_LLM_ASSISTED]
     assert any(m.startswith("gemini") for m in by_strategy[control_panel.STRATEGY_LLM_ASSISTED])
+
+
+def test_a_batch_run_records_the_tick_it_ran_on(monkeypatch):
+    """The input sheet's llm_tick_seconds is the Batch card's slider during a
+    timed run -- the one the agent reads -- not the Single Run slider's."""
+    cfg = control_panel.global_config
+    monkeypatch.setitem(cfg["ai_runtime"], "tick_seconds", 10)
+    monkeypatch.setitem(cfg, "batch_runtime", {**cfg.get("batch_runtime", {}), "tick_seconds": 20})
+    monkeypatch.setitem(cfg, "test_running", True)
+    rows = {param: value for _section, param, value in main.control_panel_input_rows()}
+    assert rows["llm_tick_seconds"] == 20

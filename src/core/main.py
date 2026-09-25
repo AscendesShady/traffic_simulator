@@ -1587,7 +1587,8 @@ def control_panel_input_rows():
         ("Global", "warmup_discard_frames", warmup_discard_frames()),
         ("Global", "discharge_selection", config.get("discharge_selection")),
         ("Global", "llm_model", ai_runtime.get("model", "None")),
-        ("Global", "llm_tick_seconds", ai_runtime.get("tick_seconds")),
+        # The tick the agent actually uses: a batch runs on the Batch card slider.
+        ("Global", "llm_tick_seconds", control_panel._effective_tick_seconds()),
         ("Global", "llm_armed", bool(ai_runtime.get("armed", False))),
         # Signal timing is derived output rather than an operator input. It is
         # recorded here so the exported run remains fully reproducible.
@@ -3957,9 +3958,11 @@ def poll_batch_runner():
             runtime["results"] = list(runner.results)
             runtime["current"] = dict(runner.current) if runner.current else None
             _batch_engine["phase"] = "IDLE"
-            if not runner.is_active():
-                runtime["active"] = False
-                _batch_engine["runner"] = None
+            # A finished runner is closed out on the next tick by the branch
+            # at the top, the one that writes the campaign summary. Dropping
+            # it here skipped that branch, so no batch that ended normally
+            # wrote paired_dv_*.csv or its calibration report (campaigns
+            # 3e9df990 and 67b47f25, 2026-09-24/25).
 
     if runner.current is not None:
         runtime["current"] = dict(runner.current)

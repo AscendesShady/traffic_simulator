@@ -164,8 +164,8 @@ _OLLAMA_CALL_LOCK = threading.Lock()
 OUTPUT_SCHEMA = json.dumps(
     {
         "reason": (
-            "<one sentence: why this turn's grants are worth the "
-            "cross-traffic delay they cause, or why none was justified>"
+            "<one sentence: which routes passed the TSP test and which "
+            "passed the DBL test, or why none did>"
         ),
         "tsp": [False for _ in guard.ROUTE_ORDER],
         "dbl": [False for _ in guard.ROUTE_ORDER],
@@ -319,8 +319,15 @@ which bus routes get TSP and DBL. You never set a signal.
 OBJECTIVE: the fewest person-hours of delay across everyone in the network,
 bus riders and cross-street drivers alike, and the most passengers moved
 through the nodes per minute. A bus carries 45 passengers, a car 4, a truck 1.
-A grant helps only when the bus riders it saves outnumber the cross-street
-passengers it holds.
+A TSP grant helps only when the bus riders it saves outnumber the
+cross-street passengers it holds. DBL holds no cross street, so it is never
+weighed against cross_pax.
+
+DECIDE FAST: this is a real-time controller. Your answer takes effect only
+when you finish, and the buses keep moving while you think. Decide in one
+pass: set both flags false on every route with approaching_buses=0, apply
+THE TSP TEST and THE DBL TEST to the rest, and answer. Do not think step by
+step, restate the data or explain beyond the one-sentence reason.
 
 WHAT THE KNOBS DO:
 - TSP on a route asks the controller to serve that route's nearest
@@ -336,9 +343,11 @@ WHAT THE KNOBS DO:
   cannot use it.
 - DBL on a route reserves the left-most approach lane (lane 2) at that bus's
   target node for the bus alone: every car in that lane is ordered out and the
-  bus merges into it. It helps only when the bus is queued behind cars it can
-  pass; it costs the cars a lane. DBL and TSP are independent: a route can
-  have either, both or neither.
+  bus merges into it, so it passes the general queue to the stop bar. It
+  never changes a signal and never holds the cross street; its cost is the
+  lane itself, which is small when the lane is clear -- what THE DBL TEST
+  checks. DBL and TSP are independent: a route can have either, both or
+  neither.
 - A grant applies to the whole route (all its buses). You decide it for a
   bus the controller has not yet taken a request for; once it has (LOCKED),
   the grant stays in force until that bus is served.
@@ -363,15 +372,20 @@ route's ROUTES line):
 
 THE DBL TEST, for each route with an approaching bus:
   grant dbl when dbl_lane_queue_ahead=0 AND dbl_lane_obstructed=false.
+This test is separate from THE TSP TEST: cross_pax, would_stop, actionable
+and the one-route-per-node limit do not apply to DBL. Check it on EVERY route
+with an approaching bus and set dbl=true on each one that passes -- also when
+its tsp is false, when its bus is not yet in lane 2, and when several routes
+pass at one node.
 DBL reserves the left-most approach lane exclusively for its target bus. Once
 DBL is activated, ALL other vehicles in that lane must clear it immediately;
 this clearance rule is unconditional. Therefore you MUST NOT enable DBL when
 the lane cannot already be cleared. If dbl_lane_queue_ahead is greater than 0,
 or dbl_lane_obstructed=true, set dbl=false: a stopped/crawling vehicle is in
 front of the bus or its merge is blocked, so the bus would only sit in the
-queue. This remains true when nearest_bus_in_dbl_lane=true. A route showing
-dbl=true with nearest_bus_in_dbl_lane=false is evidence the DBL you enabled is
-not working.
+queue. This remains true when nearest_bus_in_dbl_lane=true.
+nearest_bus_in_dbl_lane=false is normal before a grant: a bus that goes
+straight through the node merges into lane 2 once its route has dbl=true.
 
 TIMING: DECISION_LAG_SEC is how long your decision takes to apply;
 eta_at_decision_land_sec is where each bus will be when it does. Decide for
@@ -395,14 +409,16 @@ on. Never write route IDs as JSON keys. Use strict JSON booleans and do not add
 markdown, analysis, or extra keys:
 {OUTPUT_SCHEMA}
 
-"reason" must be one sentence under about 40 words naming the passengers vs
-cross_pax comparison behind this turn's grants, or why none qualified. Keep it
-on one line, with no line breaks and no quotation marks. Each array must
+"reason" must be one sentence under about 40 words naming the routes that
+passed THE TSP TEST (their passengers vs cross_pax) and those that passed THE
+DBL TEST (lane clear), or why none did. Keep it on one line, with no line
+breaks and no quotation marks. Each array must
 contain exactly {len(guard.ROUTE_ORDER)} booleans.
 
-Example: only route 1 has a qualifying bus, so the correct output is
-tsp=[true,false,false,false,false,false] and
-dbl=[false,false,false,false,false,false].
+Example: route 1's bus passes both tests, route 4's bus passes only THE DBL
+TEST (its cross_pax is higher than its passengers) and no other route has a
+bus, so the correct output is tsp=[true,false,false,false,false,false] and
+dbl=[true,false,false,true,false,false].
 """
 
 

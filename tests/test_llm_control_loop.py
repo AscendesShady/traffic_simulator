@@ -1028,6 +1028,13 @@ def test_prompt_frames_objective_and_arrival_test():
     assert "approaching_buses=0 must have tsp=false and dbl=false" in prompt
     # DBL has a positive trigger, not only vetoes.
     assert "grant dbl when dbl_lane_queue_ahead=0 AND dbl_lane_obstructed=false" in prompt
+    # ...and is its own test: until 2026-09-25 the objective, a TSP-only
+    # example and a cross_pax-only reason led Gemini to weigh DBL against
+    # cross_pax and grant it on 1 of 230 bus-turns its test passed.
+    assert "DBL holds no cross street, so it is never weighed against cross_pax" in prompt
+    assert "This test is separate from THE TSP TEST" in prompt
+    assert "dbl=[true,false,false,true,false,false]" in prompt  # the example grants DBL
+    assert "DECIDE FAST" in prompt
     # The positional schema is untouched by the reframing: same keys, same
     # array lengths, same types.
     schema = json.loads(agent.OUTPUT_SCHEMA)

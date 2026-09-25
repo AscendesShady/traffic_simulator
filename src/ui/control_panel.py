@@ -74,6 +74,9 @@ API_MODEL_REGISTRY = {
     "GEMINI_API_KEY": [
         "gemini-2.5-flash",
         "gemini-3.5-flash-lite",
+        # Follows both prompt tests exactly (replay 2026-09-25: DBL and TSP
+        # 100 %, p50 5.9 s); flash-lite reached 78 % on DBL.
+        "gemini-3.5-flash",
         "gemini-2.5-pro",
     ],
     "OPENAI_API_KEY": [

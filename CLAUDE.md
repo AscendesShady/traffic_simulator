@@ -183,7 +183,7 @@ The Single Run card picks the decider in two levels (`control_panel.CONTROL_STRA
 
 ### Rule-based comparator (`rule_controller.py`)
 
-Selecting the rule model name (`control_panel.RULE_BASED_MODEL`) in the same `ai_runtime["model"]` slot the LLMs use runs a deterministic conditional-actuated TSP/DBL rule instead of a model, through the exact same guard/decision/telemetry/export path — this makes rule-vs-LLM a clean paired comparison of decision quality, not mechanism. Keep any change to the LLM-facing schema mirrored here if it must stay a fair comparator.
+Selecting the rule model name (`control_panel.RULE_BASED_MODEL`) in the same `ai_runtime["model"]` slot the LLMs use runs a deterministic conditional-actuated TSP/DBL rule instead of a model, through the exact same guard/decision/telemetry/export path — this makes rule-vs-LLM a clean paired comparison of decision quality, not mechanism. Keep any change to the LLM-facing schema mirrored here if it must stay a fair comparator. The assisted prompt states the rule's two tests as independent -- DBL is never weighed against `cross_pax`, `would_stop` or `actionable`, and goes on every route whose lane is clear -- and asks for a one-pass answer (DECIDE FAST). Until 2026-09-25 its objective sentence, TSP-only worked example and passenger-only reason field led every LLM but grok-4 to skip DBL on nearly every bus-turn its own test granted (Gemini flash-lite 1 of 230, seed 987). Replayed on 40 real bus-turn minimaps (57 DBL-qualifying routes) the fix took gemini-3.5-flash to 100 % on both tests and grok-4 to 99 %, and cut their p50 latency 8.6 -> 5.9 s and 8.6 -> 5.1 s; flash-lite reached 78 % and the local models stayed near 50 % on DBL.
 
 ### Max-pressure comparator
 

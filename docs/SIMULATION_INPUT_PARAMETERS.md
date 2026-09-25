@@ -56,12 +56,12 @@ Drives per-source arrival generation each frame, independently (Poisson, Binomia
 
 | Approach | Node / direction | Active | Arrival model | Rate (veh/min) | Straight | First left | Second left | Heavy-vehicle ratio |
 |---|---|---|---|---|---|---|---|---|
-| `EB` | EB Corridor | Yes | Binomial | 34 | 75% | 14% (left @A) | 11% (left @B) | 10% |
-| `WB` | WB Corridor | Yes | Binomial | 32 | 80% | 10% (left @B) | 10% (left @A) | 10% |
-| `A_NB` | Node A (NB) | Yes | Poisson | 24 | 75% | 25% (left @A) | — | 15% |
-| `A_SB` | Node A (SB) | Yes | Poisson | 27 | 75% | 15% (left @A) | 10% (left @A then @B) | 15% |
-| `B_NB` | Node B (NB) | Yes | Poisson | 25 | 75% | 15% (left @B) | 10% (left @B then @A) | 15% |
-| `B_SB` | Node B (SB) | Yes | Poisson | 22 | 75% | 25% (left @B) | — | 15% |
+| `EB` | EB Corridor | Yes | Binomial | 24 | 75% | 14% (left @A) | 11% (left @B) | 10% |
+| `WB` | WB Corridor | Yes | Binomial | 22 | 80% | 10% (left @B) | 10% (left @A) | 10% |
+| `A_NB` | Node A (NB) | Yes | Poisson | 14 | 75% | 25% (left @A) | — | 15% |
+| `A_SB` | Node A (SB) | Yes | Poisson | 13 | 75% | 15% (left @A) | 10% (left @A then @B) | 15% |
+| `B_NB` | Node B (NB) | Yes | Poisson | 12 | 75% | 15% (left @B) | 10% (left @B then @A) | 15% |
+| `B_SB` | Node B (SB) | Yes | Poisson | 15 | 75% | 25% (left @B) | — | 15% |
 
 Field definitions:
 - **rate** — vehicles/minute spawned on that approach; inter-arrival times drawn from a Poisson process. Adjustable 0–60 v/min in the panel.
@@ -83,12 +83,12 @@ Field definitions:
 <!-- BEGIN GENERATED ROUTES -->
 | Route ID | Name | Origin to destination | Waypoints | Lanes | Stops | Active | Headway | TSP | DBL | Manual dispatch |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `R1_EB_A_NB` | EB → Node A (NB) | EB to NODE_A_NB | 1400: LEFT | 1400: 2 | 1400: far-side | Yes | 180s | No | No | No |
-| `R2_EB_B_NB` | EB → Node B (NB) | EB to NODE_B_NB | 1400: STRAIGHT, 3400: LEFT | 1400: 1, 3400: 2 | 1400: far-side | Yes | 240s | No | No | No |
-| `R3_EB_ONLY` | EB Corridor (Straight) | EB to EB_CORRIDOR | 1400: STRAIGHT, 3400: STRAIGHT | 1400: 1, 3400: 1 | 1400: far-side | Yes | 300s | No | No | No |
-| `R4_WB_A_SB` | WB → Node A (SB) | WB to NODE_A_SB | 3400: STRAIGHT, 1400: LEFT | 3400: 1, 1400: 2 | 3400: far-side | Yes | 240s | No | No | No |
-| `R5_WB_B_SB` | WB → Node B (SB) | WB to NODE_B_SB | 3400: LEFT | 3400: 2 | 3400: far-side | Yes | 240s | No | No | No |
-| `R6_WB_ONLY` | WB Corridor (Straight) | WB to WB_CORRIDOR | 3400: STRAIGHT, 1400: STRAIGHT | 3400: 1, 1400: 1 | 3400: far-side | No | 180s | No | No | No |
+| `R1_EB_A_NB` | EB → Node A (NB) | EB to NODE_A_NB | 1400: LEFT | 1400: 2 | 1400: far-side | Yes | 60s | No | No | No |
+| `R2_EB_B_NB` | EB → Node B (NB) | EB to NODE_B_NB | 1400: STRAIGHT, 3400: LEFT | 1400: 1, 3400: 2 | 1400: far-side | Yes | 120s | No | No | No |
+| `R3_EB_ONLY` | EB Corridor (Straight) | EB to EB_CORRIDOR | 1400: STRAIGHT, 3400: STRAIGHT | 1400: 1, 3400: 1 | 1400: far-side | Yes | 180s | No | No | No |
+| `R4_WB_A_SB` | WB → Node A (SB) | WB to NODE_A_SB | 3400: STRAIGHT, 1400: LEFT | 3400: 1, 1400: 2 | 3400: far-side | Yes | 150s | No | No | No |
+| `R5_WB_B_SB` | WB → Node B (SB) | WB to NODE_B_SB | 3400: LEFT | 3400: 2 | 3400: far-side | Yes | 120s | No | No | No |
+| `R6_WB_ONLY` | WB Corridor (Straight) | WB to WB_CORRIDOR | 3400: STRAIGHT, 1400: STRAIGHT | 3400: 1, 1400: 1 | 3400: far-side | No | 150s | No | No | No |
 <!-- END GENERATED ROUTES -->
 
 Field definitions:

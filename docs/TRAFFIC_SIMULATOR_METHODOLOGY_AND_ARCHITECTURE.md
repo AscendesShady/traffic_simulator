@@ -243,12 +243,12 @@ with the movement and lane the bus uses at every node it meets:
 
 | Route | Path | Node movements (lane) | Headway | Default |
 |---|---|---|---|---|
-| R1_EB_A_NB | EB, left at A to NB | A: LEFT (2) | 180 s | active |
-| R2_EB_B_NB | EB through A, left at B to NB | A: STRAIGHT (1), B: LEFT (2) | 240 s | active |
-| R3_EB_ONLY | EB through both | A, B: STRAIGHT (1) | 300 s | active |
-| R4_WB_A_SB | WB through B, left at A to SB | B: STRAIGHT (1), A: LEFT (2) | 240 s | active |
-| R5_WB_B_SB | WB, left at B to SB | B: LEFT (2) | 240 s | active |
-| R6_WB_ONLY | WB through both | B, A: STRAIGHT (1) | 180 s | inactive |
+| R1_EB_A_NB | EB, left at A to NB | A: LEFT (2) | 60 s | active |
+| R2_EB_B_NB | EB through A, left at B to NB | A: STRAIGHT (1), B: LEFT (2) | 120 s | active |
+| R3_EB_ONLY | EB through both | A, B: STRAIGHT (1) | 180 s | active |
+| R4_WB_A_SB | WB through B, left at A to SB | B: STRAIGHT (1), A: LEFT (2) | 150 s | active |
+| R5_WB_B_SB | WB, left at B to SB | B: LEFT (2) | 120 s | active |
+| R6_WB_ONLY | WB through both | B, A: STRAIGHT (1) | 150 s | inactive |
 
 Each route has stops (`stops`, default one far-side stop at the route's
 first node — the placement transit-priority guidance pairs with TSP). A bus

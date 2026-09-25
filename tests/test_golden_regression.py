@@ -34,7 +34,7 @@ from tests.test_step_equivalence import _fingerprint
 GOLDEN_PATH = Path(__file__).parent / "golden" / "scenarios.json"
 SCENARIOS = {
     # name: (seed, frames, tsp, dbl) on the default configuration, except the
-    # bus headways (GOLDEN_HEADWAYS)
+    # bus headways (GOLDEN_HEADWAYS) and approach rates (GOLDEN_RATES)
     "baseline_seed234": (234, 7600, False, False),
     "tsp_dbl_seed234": (234, 7600, True, True),
 }
@@ -47,6 +47,9 @@ GOLDEN_HEADWAYS = {
     "R1_EB_A_NB": 30, "R2_EB_B_NB": 45, "R3_EB_ONLY": 90,
     "R4_WB_A_SB": 30, "R5_WB_B_SB": 45, "R6_WB_ONLY": 90,
 }
+# The approach rates (veh/min) that were the defaults until 2026-09-25, which
+# the golden outputs were pinned on.
+GOLDEN_RATES = {"EB": 34, "WB": 32, "A_NB": 24, "A_SB": 27, "B_NB": 25, "B_SB": 22}
 
 
 def _canonical(value):
@@ -64,6 +67,8 @@ def _canonical(value):
 def _run(seed, frames, tsp, dbl):
     for route_id, headway in GOLDEN_HEADWAYS.items():
         control_panel.bus_routes_config[route_id]["headway_sec"] = headway
+    for approach, rate in GOLDEN_RATES.items():
+        control_panel.approach_configs[approach]["rate"] = rate
     state = {}
     headless_run.run(
         seed, frames, tsp=tsp, dbl=dbl,

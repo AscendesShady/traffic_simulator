@@ -350,6 +350,56 @@ def set_vehicle_speed_scale(value):
     return normalized
 
 
+# Optional named regimes -- proposed for the paper, not adopted: the
+# reported campaign 9afdd49d ran the defaults (see the methodology, sec. 12).
+# Applied over the defaults by
+# parallel_campaign --regime (the headless non-LLM phase) and by main.main()
+# when TRAFFIC_REGIME is set (the windowed LLM phase), so both phases of a
+# campaign run one config_hash -- a slider moved by hand is refused at
+# pairing. Every value is pinned here, not inherited, so a later change of
+# default cannot move a regime. Proposed 2026-09-26 from the one-lever sweep
+# (docs/audits/2026-09-26-regime-selection.md): 50 km/h mean car desired
+# speed (scale 0.772 x 64.8 km/h, the urban limit), a 200 m priority zone and
+# 164 buses/h; the two differ only in demand. The warm-up is the regime's
+# own: MSER-5 on the pilot's per-minute vehicles in the network ended the
+# fill at 15-25 min in all twelve pilot runs (the 600 s default was measured
+# on a higher-demand, less bus-heavy network).
+REGIME_ENV = "TRAFFIC_REGIME"
+_REGIME_COMMON = {
+    "vehicle_speed_scale": 0.772,
+    "priority_eligibility_px": 800,
+    "warmup_discard_frames": 25 * 60 * 60,
+    "headways": {"R1_EB_A_NB": 60, "R2_EB_B_NB": 120, "R3_EB_ONLY": 180,
+                 "R4_WB_A_SB": 150, "R5_WB_B_SB": 120, "R6_WB_ONLY": 150},
+    "route_active": {"R6_WB_ONLY": False},
+}
+REGIMES = {
+    # v/c 0.79, Y 0.61, 66 s Webster cycle
+    "moderate": {**_REGIME_COMMON,
+                 "rates": {"EB": 24, "WB": 22, "A_NB": 14, "A_SB": 13, "B_NB": 12, "B_SB": 15}},
+    # 1.25x demand: v/c 0.89, Y 0.77, 113 s Webster cycle (under the cap)
+    "near-capacity": {**_REGIME_COMMON,
+                      "rates": {"EB": 30, "WB": 28, "A_NB": 18, "A_SB": 16, "B_NB": 15, "B_SB": 19}},
+}
+
+
+def apply_regime(name):
+    """Set regime ``name``'s values over the live configuration."""
+    if name not in REGIMES:
+        raise ValueError(f"unknown regime {name!r}; known: {', '.join(REGIMES)}")
+    regime = REGIMES[name]
+    set_vehicle_speed_scale(regime["vehicle_speed_scale"])
+    global_config["priority_eligibility_px"] = regime["priority_eligibility_px"]
+    global_config["warmup_discard_frames"] = regime["warmup_discard_frames"]
+    for approach, rate in regime["rates"].items():
+        approach_configs[approach]["rate"] = rate
+    for route, headway in regime["headways"].items():
+        bus_routes_config[route]["headway_sec"] = headway
+    for route, active in regime["route_active"].items():
+        bus_routes_config[route]["active"] = active
+    return regime
+
+
 def get_webster_timing_summary():
     """Return presentation-ready Webster timing data for the control panel.
 
@@ -1380,11 +1430,12 @@ BASELINE_NO_MODEL = "BASELINE_NO_MODEL"
 # selector and written to the same ai_control.json field, because it produces
 # the same decision through the same path -- only the decider differs.
 RULE_BASED_MODEL = "rule-based"
-# Max-pressure TSP gate: grant when the bus approach's passenger pressure
-# beats the cross street's (rule_controller.max_pressure_decision).
-MAX_PRESSURE_MODEL = "passenger-pressure-tsp"
+# Passenger-pressure TSP heuristic: grant when the bus approach's passenger
+# pressure beats the cross street's (rule_controller.passenger_pressure_decision).
+# A TSP gate over Webster, not a phase-selecting max-pressure controller.
+PASSENGER_PRESSURE_MODEL = "passenger-pressure-tsp"
 # Every non-LLM decider: no inference latency, no sampling, no tokens.
-NON_LLM_MODELS = (RULE_BASED_MODEL, MAX_PRESSURE_MODEL)
+NON_LLM_MODELS = (RULE_BASED_MODEL, PASSENGER_PRESSURE_MODEL)
 
 # Control strategy: the operator-facing family a decider belongs to. The
 # selector is two-level (strategy, then the concrete decider within it);
@@ -1428,7 +1479,7 @@ def strategy_for(model, control_mode=CONTROL_MODE_ASSISTED):
     """Which control strategy a model string runs under ``control_mode``."""
     if model in ("None", BATCH_BASELINE_LABEL):
         return STRATEGY_BASELINE
-    if model in (RULE_BASED_MODEL, MAX_PRESSURE_MODEL):
+    if model in (RULE_BASED_MODEL, PASSENGER_PRESSURE_MODEL):
         return STRATEGY_RULE
     return STRATEGY_LLM_DECIDED if control_mode == CONTROL_MODE_CONFIGURED else STRATEGY_LLM_ASSISTED
 
@@ -1456,7 +1507,7 @@ def strategy_models(strategy):
     if strategy == STRATEGY_BASELINE:
         return ["None"]
     if strategy == STRATEGY_RULE:
-        return [RULE_BASED_MODEL, MAX_PRESSURE_MODEL]
+        return [RULE_BASED_MODEL, PASSENGER_PRESSURE_MODEL]
     if not is_llm_strategy(strategy):
         return []
     return [

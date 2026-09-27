@@ -548,6 +548,17 @@ before the context was fixed, phi3:3.8b ran 81 % on the CPU at 16.7 s while
 the older 8B llama3 ran on the GPU at 1.5 s. Re-run the selection if the
 GPU, the Ollama version or the prompt changes.
 
+**Arms in the reported campaign (9afdd49d).** It ran orca-mini:7b and
+nemotron-3-nano:4b despite the selection above, and two API models.
+Skipped decision points (of 360; a skip leaves the previous decision in
+force): nemotron-3-nano:4b 143–157 (40–44 %, p95 latency at the 45 s
+timeout), llama3.2:3b 48–69 (13–19 %), grok-4 22 (6 %), orca-mini:7b
+12–21 (3–6 %) -- above the 5 % the campaign summary flags -- and at most 18
+(5 %) for every other arm. gemini-2.5-pro returned HTTP 404 ("no longer
+available to new users") on every call: every turn was held all-off, no
+decision took effect, and its runs equal the baseline's (every paired
+difference 0.0), so that arm measures no model.
+
 | Arm (`ai_runtime["model"]`) | Decision rule |
 |---|---|
 | **Baseline** (`None`) | No decisions and no treatment: `agent.guard_baseline` turns every turn into `OBSERVATION_ONLY`, the reset clears all route flags, and a summary row showing any decision or TSP treatment raises `BaselineContaminationError` (row refused, batch marked `FAILED`). |
@@ -589,6 +600,24 @@ All counters are accumulated once per simulated frame in
 
 ### 12. Experimental design and statistical treatment
 
+- **The reported campaign (9afdd49d, 2026-09-26/27).** Read from its
+  summary rows and each workbook's Calibration sheet. Code at commit 8dca3dc
+  (the working tree differed only by identifier renames and unused
+  configuration presets, so every row carries `git_dirty`); one
+  `config_hash` (3bf53562d7ed) on all 23 final rows. The default
+  configuration except two bus headways: speed scale 0.5 (car desired speed
+  27.0–37.8 km/h, bus 27 km/h), a 100 m priority zone, demand 1,440 / 1,320 /
+  840 / 780 / 720 / 900 veh/h (EB / WB / A_NB / A_SB / B_NB / B_SB), bus
+  headways 60 / 120 / 45 / 90 / 120 s on R1–R5 with R6 off (240 buses/h),
+  a 10 s decision tick, 60-minute runs, a 600 s warm-up and seeds 567 and
+  876. Calibrated regime: S 1,278 veh/h/lane (start-up lost time 0.98 s),
+  yellow 3.0 s, all-red 4.2 s, lost time 12.36 s per cycle, Y 0.731 / 0.729
+  at nodes A / B, one Webster cycle of 87.5 s with node B offset 55.6 s,
+  degree of saturation 0.85 on every phase. Arms: baseline, rule-based,
+  passenger-pressure-tsp, gemini-3.5-flash-lite, gemini-2.5-pro, grok-4
+  (seed 567 only), llama3.1:8b, llama3.2:3b, llama3:latest, phi3:3.8b,
+  orca-mini:7b and nemotron-3-nano:4b (§10 notes the arms that did not
+  decide as intended).
 - **Common random numbers.** Paired arms run on identical seeds; the
   offered demand (§7) is provably identical across arms
   (`demand_draw_hash`), as are each vehicle's behavioural draws and each
@@ -610,11 +639,19 @@ All counters are accumulated once per simulated frame in
   N = (t₀.₉₇₅,ₙ₋₁ · s / e)² (FHWA Traffic Analysis Toolbox Vol. III), and
   flags an under-replicated arm.
 - **Warm-up.** Every steady-state DV (`*_steady`, `converged`) discards the
-  first 600 s (`warmup_discard_frames` = 36,000) via a snapshot taken once per
-  run. The value is measured: MSER-5 (White, 1997) on the per-minute
-  vehicles in the network ends the fill at minute 10 in all nine runs of
-  campaign 3e9df990 (served pax/min settles by minute 5); the former 300 s
-  left the steady window loading. `time_to_converge_sec` is not a warm-up
+  first 600 s (`warmup_discard_frames` = 36,000) via a snapshot taken once
+  per run; the reported campaign used this value. It was set from MSER-5
+  (White, 1997) on the per-minute vehicles in the network of campaign
+  3e9df990 (v/c 0.99, 77 buses/h), where the fill ended at minute 10 and
+  served pax/min settled by minute 5; the former 300 s left the steady
+  window loading. On the reported campaign's own runs MSER-5 places the end
+  of the fill later, at 15–25 min (median 25) in all 23 runs -- the
+  lower-demand, bus-heavier configuration fills more slowly -- so its steady
+  window (minutes 10–60) includes part of the fill. Recomputed over minutes
+  30–60 (the 60-minute steady value minus the 30-minute one, both taken
+  after the same snapshot, so the fill is excluded), every paired difference
+  keeps its sign except two that lie within ±25 pax-h of zero (llama3.1:8b on
+  seed 567, rule-based on seed 876). `time_to_converge_sec` is not a warm-up
   estimate -- it follows the cumulative pax/min, which includes the fill
   from t = 0, and read ~1,100 s on the same runs. A checkpoint inside the
   warm-up has no steady window; cumulative columns are kept alongside. `converged` requires the
@@ -685,7 +722,7 @@ spillback, reservations), `test_signal_priority.py` and
 veto and fallback), `test_step_equivalence.py` (one frame, one code path),
 `test_baseline_arm.py` and `test_experiment_summary.py` (baseline
 integrity, pairing contract, DV definitions), `test_rule_controller.py`,
-`test_max_pressure_and_rl.py`, `test_llm_control_loop.py` and
+`test_passenger_pressure.py`, `test_llm_control_loop.py` and
 `test_ai_configured.py` (every decision arm through the real guard and
 merge), `test_gridlock_monitor.py`, `test_turn_options.py`,
 `test_lane_change.py`, `test_motion_tuning.py`, and
@@ -885,7 +922,7 @@ py -m venv .venv
 
 # A campaign (commit first: rows pair only on one git_sha).
 # Phase one, the non-LLM arms in parallel headless workers; prints the campaign id:
-.\.venv\Scripts\python.exe -m src.experiments.parallel_campaign --arms baseline rule-based passenger-pressure-tsp --seeds 234 764 101 --minutes 60
+.\.venv\Scripts\python.exe -m src.experiments.parallel_campaign --arms baseline rule-based passenger-pressure-tsp --seeds 567 876 --minutes 60
 # Phase two, the LLM arms in the windowed app, joining that campaign:
 $env:TRAFFIC_JOIN_CAMPAIGN = '<campaign id>'; .\.venv\Scripts\python.exe run.py
 # Live progress of headless runs, campaigns and pytest sessions:

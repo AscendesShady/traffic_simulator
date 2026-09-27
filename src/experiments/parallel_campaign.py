@@ -139,7 +139,7 @@ def _rule_decider(model, vehicles, signals, telemetry):
     return decide
 
 
-def run_worker(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec=None):
+def run_worker(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec=None, regime=None):
     """One timed run of ``arm`` at ``seed`` in ``workdir``; writes result.json."""
     workdir = pathlib.Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -155,6 +155,8 @@ def run_worker(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec=None)
 
         model = resolve_arm(arm)
         config = control_panel.global_config
+        if regime:
+            control_panel.apply_regime(regime)
         if warmup_sec is not None:
             config["warmup_discard_frames"] = int(round(float(warmup_sec) * 60))
         runtime = config.setdefault("batch_runtime", dict(control_panel.DEFAULT_BATCH_RUNTIME))
@@ -216,7 +218,7 @@ def run_worker(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec=None)
 
 # ----------------------------------------------------------- coordinator
 
-def _launch(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec):
+def _launch(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec, regime=None):
     command = [
         sys.executable, "-m", "src.experiments.parallel_campaign", "--worker",
         "--arm", str(arm), "--seed", str(seed), "--minutes", str(minutes),
@@ -224,6 +226,8 @@ def _launch(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec):
     ]
     if warmup_sec is not None:
         command += ["--warmup-sec", str(warmup_sec)]
+    if regime:
+        command += ["--regime", regime]
     env = dict(os.environ, PYTHONPATH=str(REPO))
     return subprocess.Popen(
         command, cwd=REPO, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -232,7 +236,7 @@ def _launch(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec):
 
 
 def run_campaign(arms, seeds, minutes, workers=None, campaign=None, warmup_sec=None,
-                 workroot=None, echo=print):
+                 workroot=None, echo=print, regime=None):
     """Run every (arm, seed) at most ``workers`` at a time, fold the rows and
     workbooks into the campaign, pair them, and return the outcomes."""
     from src.core import main
@@ -244,8 +248,10 @@ def run_campaign(arms, seeds, minutes, workers=None, campaign=None, warmup_sec=N
     stamp = main.campaign_stamp_of(campaign_id) or time.strftime("%Y%m%d")
     workroot = pathlib.Path(workroot or (main.RESULTS_DIR / "parallel" / campaign_id))
     jobs = [(arm, int(seed)) for arm in arms for seed in seeds]
+    if regime and regime not in control_panel.REGIMES:
+        raise ValueError(f"unknown regime {regime!r}; known: {', '.join(control_panel.REGIMES)}")
     echo(f"campaign {campaign_id} ({stamp}): {len(jobs)} run(s), {workers} at a time, "
-         f"{minutes} sim-min each, arms {models}")
+         f"{minutes} sim-min each, arms {models}, regime {regime or 'defaults'}")
     from src.experiments.progress import ProgressReporter
     campaign_progress = ProgressReporter(
         f"campaign {campaign_id[:8]}", len(jobs), kind="campaign", every_frames=1,
@@ -256,7 +262,7 @@ def run_campaign(arms, seeds, minutes, workers=None, campaign=None, warmup_sec=N
         while queue and len(running) < workers:
             arm, seed = queue.pop(0)
             workdir = workroot / f"{arm.replace(':', '_')}_seed{seed}"
-            running.append((_launch(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec), workdir))
+            running.append((_launch(arm, seed, minutes, campaign_id, stamp, workdir, warmup_sec, regime), workdir))
         for process, workdir in list(running):
             if process.poll() is None:
                 continue
@@ -296,7 +302,8 @@ def run_campaign(arms, seeds, minutes, workers=None, campaign=None, warmup_sec=N
         f"\nTo add the LLM arms to this campaign, start the app with "
         f"{main.JOIN_CAMPAIGN_ENV}={campaign_id} and queue them with the same seeds, "
         f"duration and settings (PowerShell: $env:{main.JOIN_CAMPAIGN_ENV}='{campaign_id}'; "
-        r".\.venv\Scripts\python.exe run.py)."
+        + (f"$env:{control_panel.REGIME_ENV}='{regime}'; " if regime else "")
+        + r".\.venv\Scripts\python.exe run.py)."
     )
     return campaign_id, outcomes
 
@@ -314,6 +321,8 @@ def main_cli(argv=None):
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--campaign", default=None, help="join this campaign id")
     parser.add_argument("--warmup-sec", type=float, default=None)
+    parser.add_argument("--regime", default=None,
+                        help="a named regime from control_panel.REGIMES")
     # worker mode (internal)
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--arm")
@@ -323,10 +332,11 @@ def main_cli(argv=None):
     args = parser.parse_args(argv)
     if args.worker:
         outcome = run_worker(args.arm, args.seed, args.minutes, args.campaign, args.stamp,
-                             args.workdir, args.warmup_sec)
+                             args.workdir, args.warmup_sec, args.regime)
         return 0 if outcome["status"] == "COMPLETED" else 1
     try:
-        run_campaign(args.arms, args.seeds, args.minutes, args.workers, args.campaign, args.warmup_sec)
+        run_campaign(args.arms, args.seeds, args.minutes, args.workers, args.campaign, args.warmup_sec,
+                     regime=args.regime)
     except ValueError as exc:
         parser.error(str(exc))
     return 0

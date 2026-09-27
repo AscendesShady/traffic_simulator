@@ -61,21 +61,15 @@ APPROACHES = ("EB", "WB", "NB", "SB")
 
 
 def is_rule_model(model) -> bool:
-    """True when the operator selected a non-LLM decider (the rule, the
-    passenger-pressure gate or the trained RL policy) instead of a model. All
-    three share what this flag gates: no inference latency, no sampling,
-    no tokens, and a decision that lands on the very next merge tick."""
-    return (
-        isinstance(model, str)
-        and model.strip().lower() in (*control_panel.NON_LLM_MODELS, "max-pressure")
-    )
+    """True when the operator selected a non-LLM decider (the rule or the
+    passenger-pressure heuristic) instead of a model. Both share what this
+    flag gates: no inference latency, no sampling, no tokens, and a decision
+    that lands on the very next merge tick."""
+    return isinstance(model, str) and model.strip().lower() in control_panel.NON_LLM_MODELS
 
 
-def is_max_pressure_model(model) -> bool:
-    return (
-        isinstance(model, str)
-        and model.strip().lower() in (control_panel.MAX_PRESSURE_MODEL, "max-pressure")
-    )
+def is_passenger_pressure_model(model) -> bool:
+    return isinstance(model, str) and model.strip().lower() == control_panel.PASSENGER_PRESSURE_MODEL
 
 
 def _agent_module():
@@ -326,15 +320,15 @@ def rule_based_decision(
     return _decide(telemetry, decision_lag_sec, "rule", score, max_tsp_grants_per_node)
 
 
-# --- max-pressure comparator ---------------------------------------------------
+# --- passenger-pressure TSP heuristic -------------------------------------------
 #
 # This passenger-pressure comparator gates bus TSP; it does not select the
 # network's phases. The arms here differ only in who sets the TSP/DBL flags -- Webster and the
-# SignalController stay the mechanism -- so max-pressure is applied as the
+# SignalController stay the mechanism -- so the pressure comparison is the
 # TSP gate: the bus approach is served when its passenger pressure beats the
 # pressure of the cross street a grant would hold. A movement whose
 # downstream is blocked carries no pressure (serving it releases nothing),
-# which is the spillback term of the original.
+# which is the spillback term of max-pressure control, the idea it borrows.
 #
 # ponytail: downstream is a blocked/not-blocked veto from telemetry rather
 # than a pax-weighted downstream queue; use downstream_space_m if the arm
@@ -367,7 +361,7 @@ def cross_street_pressure(telemetry, node_key, approach):
     )
 
 
-def max_pressure_decision(
+def passenger_pressure_decision(
     telemetry, decision_lag_sec=None, max_tsp_grants_per_node=MAX_TSP_GRANTS_PER_NODE
 ):
     """Grant TSP where the bus approach's pressure exceeds the cross street's."""
@@ -386,5 +380,5 @@ def max_pressure_decision(
         return pressure, f"TSP {where} pressure {own}-{cross}={pressure}"
 
     return _decide(
-        telemetry, decision_lag_sec, control_panel.MAX_PRESSURE_MODEL, score, max_tsp_grants_per_node
+        telemetry, decision_lag_sec, control_panel.PASSENGER_PRESSURE_MODEL, score, max_tsp_grants_per_node
     )

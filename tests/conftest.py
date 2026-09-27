@@ -1,4 +1,5 @@
 import copy
+import gc
 import os
 import sys
 import tkinter
@@ -94,15 +95,20 @@ def destroy_leftover_tk_root():
     """
     yield
     root = getattr(tkinter, "_default_root", None)
-    if root is None:
-        return
-    try:
-        root.destroy()
-    except Exception:
-        # Already destroyed, or its interpreter is gone: nothing left to do
-        # but drop the reference so the next test starts clean.
-        pass
-    tkinter._default_root = None
+    if root is not None:
+        try:
+            root.destroy()
+        except Exception:
+            # Already destroyed, or its interpreter is gone: nothing left to
+            # do but drop the reference so the next test starts clean.
+            pass
+        tkinter._default_root = None
+    # Free this test's Tk objects here, on the main thread. Left in reference
+    # cycles they are collected by whichever thread next triggers the cyclic
+    # GC -- the dashboard's gpu-poll thread allocates in subprocess.run -- and
+    # Tcl aborts the process ("Tcl_AsyncDelete: async handler deleted by the
+    # wrong thread"; two full-suite runs crashed so, 2026-09-25/26).
+    gc.collect()
 
 
 @pytest.fixture(autouse=True)

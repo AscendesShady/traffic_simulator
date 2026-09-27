@@ -527,11 +527,11 @@ def test_control_strategy_selector_is_two_level_and_drives_the_model(monkeypatch
         strategy_box.event_generate("<<ComboboxSelected>>")
         assert control_panel.global_config["ai_runtime"]["model"] == control_panel.RULE_BASED_MODEL
         assert list(decider_box.cget("values")) == [
-            control_panel.RULE_BASED_MODEL, control_panel.MAX_PRESSURE_MODEL
+            control_panel.RULE_BASED_MODEL, control_panel.PASSENGER_PRESSURE_MODEL
         ]
-        decider_box.set(control_panel.MAX_PRESSURE_MODEL)
+        decider_box.set(control_panel.PASSENGER_PRESSURE_MODEL)
         decider_box.event_generate("<<ComboboxSelected>>")
-        assert control_panel.global_config["ai_runtime"]["model"] == control_panel.MAX_PRESSURE_MODEL
+        assert control_panel.global_config["ai_runtime"]["model"] == control_panel.PASSENGER_PRESSURE_MODEL
 
         strategy_box.set(control_panel.STRATEGY_LLM_ASSISTED)
         strategy_box.event_generate("<<ComboboxSelected>>")

@@ -438,7 +438,7 @@ def test_batch_choices_group_by_control_strategy(monkeypatch):
         by_strategy.setdefault(control_panel.strategy_of(choice), []).append(choice)
     assert by_strategy[control_panel.STRATEGY_BASELINE] == [control_panel.BATCH_BASELINE_LABEL]
     assert by_strategy[control_panel.STRATEGY_RULE] == [
-        control_panel.RULE_BASED_MODEL, control_panel.MAX_PRESSURE_MODEL
+        control_panel.RULE_BASED_MODEL, control_panel.PASSENGER_PRESSURE_MODEL
     ]
     assert "llama3.1:8b" in by_strategy[control_panel.STRATEGY_LLM_ASSISTED]
     assert any(m.startswith("gemini") for m in by_strategy[control_panel.STRATEGY_LLM_ASSISTED])

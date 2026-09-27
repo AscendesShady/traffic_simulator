@@ -117,3 +117,29 @@ def test_a_rule_turn_carries_no_latency(monkeypatch):
     monkeypatch.setattr(agent, "_call_rule", slow_rule)
     result = agent.ai_turn({"model": control_panel.RULE_BASED_MODEL, "telemetry": {}, "minimap": ""})
     assert result["call_metrics"]["latency_ms"] == 0.0
+
+
+def test_each_regime_pins_its_values_and_hashes_to_its_own_regime(tmp_path):
+    """Both phases of a paper campaign apply the same named regime: every value
+    it names is set, the same regime always hashes alike, and the two regimes
+    never share a config_hash (so they can never pair with each other)."""
+    import pytest
+    from src.core import main
+    from src.ui import control_panel
+
+    hashes = {}
+    for name, regime in control_panel.REGIMES.items():
+        control_panel.apply_regime(name)
+        assert control_panel.global_config["vehicle_speed_scale"] == regime["vehicle_speed_scale"]
+        assert control_panel.global_config["priority_eligibility_px"] == regime["priority_eligibility_px"]
+        assert main.warmup_discard_frames() == regime["warmup_discard_frames"] == 90000
+        assert {k: control_panel.approach_configs[k]["rate"] for k in regime["rates"]} == regime["rates"]
+        assert {r: control_panel.bus_routes_config[r]["headway_sec"] for r in regime["headways"]} == regime["headways"]
+        hashes[name] = main._config_regime_hash(control_panel.global_config)
+        control_panel.apply_regime(name)
+        assert main._config_regime_hash(control_panel.global_config) == hashes[name]
+    assert len(set(hashes.values())) == len(control_panel.REGIMES)
+    with pytest.raises(ValueError):
+        control_panel.apply_regime("no-such-regime")
+    with pytest.raises(ValueError):
+        pc.run_campaign(["baseline"], [1], 0.1, regime="no-such-regime", workroot=tmp_path)

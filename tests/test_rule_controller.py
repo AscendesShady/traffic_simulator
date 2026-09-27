@@ -340,7 +340,7 @@ def test_rule_selectable_in_control_panel(monkeypatch):
         ),
     )
     assert control_panel.get_decision_sources() == [
-        "None", "rule-based", control_panel.MAX_PRESSURE_MODEL, "model-a:latest"
+        "None", "rule-based", control_panel.PASSENGER_PRESSURE_MODEL, "model-a:latest"
     ]
     assert control_panel.RULE_BASED_MODEL == rc.RULE_MODEL_NAME
     # Persisted to ai_control.json through the ordinary path.

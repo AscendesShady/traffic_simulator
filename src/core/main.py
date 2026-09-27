@@ -5904,6 +5904,14 @@ def main():
     global _active_signal_controller, _instance_lock
     _instance_lock = acquire_instance_lock()
     raise_simulator_priority()
+    # A campaign's windowed LLM phase runs the regime its headless phase ran
+    # (parallel_campaign --regime); applied before the panel is built, so its
+    # sliders show it.
+    import os  # kept local (test_lifecycle_consolidation)
+    regime = os.environ.get(control_panel.REGIME_ENV, "").strip()
+    if regime:
+        control_panel.apply_regime(regime)
+        print(f"[REGIME] {regime}: {control_panel.REGIMES[regime]}")
     # Seeding makes traffic generation reproducible, not LLM inference. The
     # valid benchmark is the same seed with one ARMED and one DISARMED run;
     # same-seed ARMED runs may diverge because model decisions can differ.

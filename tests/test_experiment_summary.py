@@ -247,7 +247,7 @@ def test_filename_separates_the_two_llm_control_modes():
     assert name(control_panel.RULE_BASED_MODEL, "assisted") == (
         "rule-based_15min_42seed_13092026_120000.xlsx"
     )
-    assert name(control_panel.MAX_PRESSURE_MODEL, "assisted") == (
+    assert name(control_panel.PASSENGER_PRESSURE_MODEL, "assisted") == (
         "passenger-pressure-tsp_15min_42seed_13092026_120000.xlsx"
     )
 

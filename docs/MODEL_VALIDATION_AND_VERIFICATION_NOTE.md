@@ -149,8 +149,10 @@ crossing: about 2 s more lost time per cycle, identical for every arm.
 - **The primary DV counts all the delay.** `total_person_hours_delay_incl_entry_steady`
   is passenger-weighted time below each vehicle's own free-flow speed
   **plus** the time offered demand waited at the network boundary to enter,
-  after a 600 s warm-up (MSER-5 ends the fill at minute 10 in all nine
-  runs of campaign 3e9df990; the former 300 s left the window loading).
+  after a 600 s warm-up (set from MSER-5 on campaign 3e9df990, where the
+  fill ended at minute 10; on the reported campaign 9afdd49d MSER-5 gives
+  15–25 min, and the methodology §12 checks the result with the fill
+  excluded).
   FHWA TAT Vol. III asks that demand unable to enter
   be accounted for; without it an arm that holds traffic outside the model
   is credited for the delay it exported (§4.2 item 1).

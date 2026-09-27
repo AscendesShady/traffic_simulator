@@ -1354,7 +1354,7 @@ def _call_ollama(
 
 
 def _call_rule(state: AgentState) -> tuple[str, dict]:
-    """Decide with a non-LLM comparator (rule or max-pressure) instead of a
+    """Decide with a non-LLM comparator (rule or passenger-pressure heuristic) instead of a
     model.
 
     Serializes the rule's positional flags into the same JSON text an LLM is
@@ -1365,8 +1365,8 @@ def _call_rule(state: AgentState) -> tuple[str, dict]:
     rule has no decision lag where a model does.
     """
     model = state.get("model", "")
-    if rule_controller.is_max_pressure_model(model):
-        decide = rule_controller.max_pressure_decision
+    if rule_controller.is_passenger_pressure_model(model):
+        decide = rule_controller.passenger_pressure_decision
     else:
         decide = rule_controller.rule_based_decision
     decision = decide(

@@ -1,0 +1,53 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below and this software release."
+title: "traffic_simulator: microsimulator and guarded LLM decision agent for transit signal priority and dynamic bus lanes (ACAT-TP)"
+type: software
+authors:
+  - family-names: Chowdhury
+    given-names: "Md. Shadman Sakib"
+    email: shadmansakibchowdhury@gmail.com
+    affiliation: "Bangladesh University of Engineering and Technology (BUET)"
+  - family-names: Rahman
+    given-names: "Md. Mizanur"
+    email: mizanur@ce.buet.ac.bd
+    affiliation: "Bangladesh University of Engineering and Technology (BUET)"
+version: "v1.0-trc"
+date-released: "2026-09-27"
+license: MIT
+repository-code: "https://github.com/AscendesShady/traffic_simulator"
+keywords:
+  - large language model
+  - transit signal priority
+  - dynamic bus lane
+  - microsimulation
+  - agentic AI
+abstract: >-
+  Tick-based microsimulator of a two-intersection urban corridor with a
+  separate-process LangGraph decision agent. The agent (local or cloud LLM,
+  deterministic rule, or passenger-pressure heuristic) activates pre-coded
+  transit signal priority and dynamic bus lane actions through a fail-closed
+  guard; the signal controller alone grants right of way. This release is the
+  code behind the ACAT-TP evaluation campaign 9afdd49d.
+references:
+  - type: dataset
+    title: "ACAT-TP simulation campaign data"
+    authors:
+      - family-names: Chowdhury
+        given-names: "Md. Shadman Sakib"
+      - family-names: Rahman
+        given-names: "Md. Mizanur"
+    doi: "10.5281/zenodo.22986540"
+    publisher:
+      name: Zenodo
+    year: 2026
+preferred-citation:
+  type: article
+  title: "ACAT-TP: Guarded agentic context-aware control of transit signal priority and dynamic bus lanes in a validated microsimulation sandbox"
+  authors:
+    - family-names: Chowdhury
+      given-names: "Md. Shadman Sakib"
+    - family-names: Rahman
+      given-names: "Md. Mizanur"
+  journal: "Transportation Research Part C: Emerging Technologies"
+  status: submitted
+  year: 2026

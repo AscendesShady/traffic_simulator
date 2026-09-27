@@ -16,6 +16,13 @@ A desktop traffic and transit simulation of two connected signalized intersectio
 
 The AI controller runs in a separate process so model latency cannot block the 60 Hz simulation. It communicates through atomic JSON snapshots, and malformed model output is replaced with a complete all-off decision before it reaches the live route configuration.
 
+## Paper, data and citation
+
+- **Paper:** Chowdhury, M.S.S., Rahman, M.M., *ACAT-TP: Guarded agentic context-aware control of transit signal priority and dynamic bus lanes in a validated microsimulation sandbox*, submitted to *Transportation Research Part C: Emerging Technologies* (2026).
+- **Data:** run workbooks, trip records, calibration records and the full decision audit of campaign `9afdd49d` — Zenodo, [doi:10.5281/zenodo.22986540](https://doi.org/10.5281/zenodo.22986540).
+- **Code for the paper:** release `v1.0-trc` of this repository. The campaign rows record commit `8dca3dc` with `git_dirty = True`; the uncommitted differences were identifier renames and unused configuration presets, committed in `5183fd1`, which `v1.0-trc` contains. See [Methodology §12](TRAFFIC_SIMULATOR_METHODOLOGY_AND_ARCHITECTURE.md) for the campaign configuration.
+- **How to cite:** use GitHub's *Cite this repository* button or [`CITATION.cff`](../CITATION.cff).
+
 ## Signal-controller architecture
 
 The application creates one `SignalController`, which owns two distinct per-node state objects. Node A and Node B independently maintain their phase, timer, clearance, reservations, and TSP/DBL requests; they may start aligned but can diverge under node-local traffic or priority. The legacy `controller.phase` and `controller.timer` assignment properties broadcast setup values to both nodes, but normal production updates operate per node. Historical specifications that describe the shared-clock versus independent-clock choice as unresolved are superseded by the current implementation.
@@ -143,3 +150,7 @@ Compile-check the application modules:
 ## Scope
 
 This project is a simulation and experimentation tool. It is not a certified traffic-signal controller and must not be used to operate real infrastructure.
+
+## License
+
+Released under the [MIT License](../LICENSE). Files under `reverse_engineering/` describe the behaviour of Eclipse SUMO for cross-checking only; any SUMO material quoted there remains under its original licence (EPL-2.0 OR GPL-2.0-or-later).
